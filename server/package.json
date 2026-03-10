@@ -14,6 +14,8 @@
     "@anthropic-ai/sdk": "^0.52.0",
     "@modelcontextprotocol/sdk": "^1.16.0",
     "better-sqlite3": "^11.0.0",
+    "imapflow": "^1.2.1",
+    "mailparser": "^3.9.1",
     "telegram": "^2.26.0",
     "yaml": "^2.7.0",
     "zod": "^3.25.0"
@@ -21,6 +23,7 @@
   "devDependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
     "@types/better-sqlite3": "^7.6.0",
+    "@types/mailparser": "^3.4.6",
     "@types/node": "^22.15.0",
     "esbuild": "^0.27.3",
     "tsx": "^4.19.4",

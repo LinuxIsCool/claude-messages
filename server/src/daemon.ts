@@ -4,8 +4,10 @@ import { parse as parseYaml } from 'yaml';
 import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
 import { TelegramAdapter } from './adapters/telegram.js';
+import { SignalAdapter } from './adapters/signal.js';
+import { EmailAdapter } from './adapters/email.js';
 import type { Adapter } from './adapters/base.js';
-import type { AppConfig, Contact, Thread, Message, SyncEvent } from './types.js';
+import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent } from './types.js';
 
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
@@ -48,20 +50,49 @@ class Daemon {
     const dataDir = resolveHome(this.config.data_dir);
 
     if (adapterConfigs.telegram?.enabled) {
-      const adapter = new TelegramAdapter((msg) => this.log(msg));
-      const telegramConfig = { ...adapterConfigs.telegram, data_dir: dataDir };
-      await adapter.init(telegramConfig as AdapterConfig);
-      this.adapters.push(adapter);
-      this.log('Telegram adapter initialized');
+      try {
+        const adapter = new TelegramAdapter((msg) => this.log(msg));
+        await adapter.init({ ...adapterConfigs.telegram, data_dir: dataDir } as AdapterConfig);
+        this.adapters.push(adapter);
+        this.log('Telegram adapter initialized');
+      } catch (err) {
+        this.log(`Telegram adapter failed to initialize: ${err}`);
+      }
+    }
+
+    if (adapterConfigs.signal?.enabled) {
+      try {
+        const adapter = new SignalAdapter((msg) => this.log(msg));
+        await adapter.init({ ...adapterConfigs.signal, data_dir: dataDir } as AdapterConfig);
+        this.adapters.push(adapter);
+        this.log('Signal adapter initialized');
+      } catch (err) {
+        this.log(`Signal adapter failed to initialize: ${err}`);
+      }
+    }
+
+    if (adapterConfigs.email?.enabled) {
+      try {
+        const adapter = new EmailAdapter((msg) => this.log(msg));
+        await adapter.init({ ...adapterConfigs.email, data_dir: dataDir } as AdapterConfig);
+        this.adapters.push(adapter);
+        this.log('Email adapter initialized');
+      } catch (err) {
+        this.log(`Email adapter failed to initialize: ${err}`);
+      }
     }
 
     // Initial sync
     await this.syncAll();
 
-    // Poll loop
+    // Poll loop — use shortest enabled adapter interval
+    const intervals = Object.values(adapterConfigs)
+      .filter(c => c?.enabled)
+      .map(c => (c?.poll_interval ?? 60) * 1000);
+    const pollInterval = Math.min(...intervals, 60000);
+
     while (this.running) {
-      const interval = (adapterConfigs.telegram?.poll_interval ?? 60) * 1000;
-      await this.sleep(interval);
+      await this.sleep(pollInterval);
       if (!this.running) break;
       await this.syncAll();
     }
