@@ -152,31 +152,35 @@ export class EmailAdapter implements Adapter {
         yield* this.syncAccount(acct, now);
       } catch (err) {
         this.log(`[email] Error syncing account ${acct.id}: ${err}`);
-
-        // Try to reconnect for next time
-        try {
-          await acct.client.close();
-        } catch { /* ignore */ }
-        try {
-          const client = new ImapFlow({
-            host: acct.host,
-            port: 993,
-            secure: true,
-            auth: { user: acct.user, pass: acct.password },
-            logger: false,
-            socketTimeout: 300_000,
-          });
-          await client.connect();
-          client.on('exists', () => { acct.hasNewMail = true; });
-          client.on('error', (err: Error) => {
-            this.log(`[email] ${acct.id} socket error: ${err.message}`);
-          });
-          acct.client = client;
-          this.log(`[email] Reconnected account ${acct.id}`);
-        } catch (reconnErr) {
-          this.log(`[email] Reconnect failed for ${acct.id}: ${reconnErr}`);
-        }
+        await this.reconnectAccount(acct);
       }
+    }
+  }
+
+  private async reconnectAccount(acct: AccountConnection): Promise<boolean> {
+    try {
+      await acct.client.close();
+    } catch { /* ignore */ }
+    try {
+      const client = new ImapFlow({
+        host: acct.host,
+        port: 993,
+        secure: true,
+        auth: { user: acct.user, pass: acct.password },
+        logger: false,
+        socketTimeout: 300_000,
+      });
+      await client.connect();
+      client.on('exists', () => { acct.hasNewMail = true; });
+      client.on('error', (err: Error) => {
+        this.log(`[email] ${acct.id} socket error: ${err.message}`);
+      });
+      acct.client = client;
+      this.log(`[email] Reconnected ${acct.id}`);
+      return true;
+    } catch (err) {
+      this.log(`[email] Reconnect failed for ${acct.id}: ${err}`);
+      return false;
     }
   }
 
@@ -186,9 +190,16 @@ export class EmailAdapter implements Adapter {
     let lock;
     try {
       lock = await acct.client.getMailboxLock(this.folder);
-    } catch (err) {
-      this.log(`[email] Could not open ${this.folder} for ${acct.id}: ${err}`);
-      return;
+    } catch {
+      // Connection likely died — try to reconnect once
+      this.log(`[email] Connection lost for ${acct.id}, reconnecting...`);
+      if (!await this.reconnectAccount(acct)) return;
+      try {
+        lock = await acct.client.getMailboxLock(this.folder);
+      } catch (err) {
+        this.log(`[email] Could not open ${this.folder} for ${acct.id} after reconnect: ${err}`);
+        return;
+      }
     }
 
     try {
@@ -228,13 +239,16 @@ export class EmailAdapter implements Adapter {
 
         for (const addr of allAddresses) {
           const email = addr.address?.toLowerCase();
-          if (!email || this.knownContacts.has(email)) continue;
+          if (!email) continue;
+          const name = addr.name || null;
+          // Skip if already seen AND we don't have a new name to offer
+          if (this.knownContacts.has(email) && !name) continue;
           this.knownContacts.add(email);
 
           const contact: Contact = {
             id: `email:user:${email}`,
             platform: 'email',
-            display_name: addr.name || null,
+            display_name: name,
             username: email,
             phone: null,
             metadata: { account: acct.id },
