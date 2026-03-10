@@ -111,8 +111,40 @@ export class TelegramAdapter implements Adapter {
     const now = new Date();
     const cutoffDate = new Date(now.getTime() - this.initialDays * 24 * 60 * 60 * 1000);
 
-    // Get dialogs
-    const dialogs = await this.client.getDialogs({ limit: 100 });
+    // Get all dialogs (paginate until exhausted)
+    const dialogs: Awaited<ReturnType<TelegramClient['getDialogs']>> = [];
+    let offsetDate = 0;
+    let fetchMore = true;
+
+    while (fetchMore) {
+      const batch = await this.client.getDialogs({
+        limit: 100,
+        ...(offsetDate ? { offsetDate } : {}),
+      });
+
+      if (batch.length === 0) {
+        fetchMore = false;
+        break;
+      }
+
+      dialogs.push(...batch);
+
+      // Use the last dialog's date as offset for next page
+      const lastDialog = batch[batch.length - 1];
+      const lastDate = lastDialog.date;
+      if (!lastDate || lastDate === offsetDate) {
+        fetchMore = false;
+      } else {
+        offsetDate = lastDate;
+      }
+
+      // Safety: avoid infinite loops
+      if (dialogs.length > 10000) {
+        this.log(`[telegram] Capped at ${dialogs.length} dialogs`);
+        fetchMore = false;
+      }
+    }
+
     this.log(`[telegram] Found ${dialogs.length} dialogs`);
 
     for (const dialog of dialogs) {
