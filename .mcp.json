@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "claude-messages": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/build/mcp.mjs"],
+      "env": {
+        "MESSAGES_DATA_DIR": "${HOME}/.claude/local/messages"
+      }
+    }
+  }
+}

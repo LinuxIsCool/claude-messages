@@ -1,0 +1,32 @@
+{
+  "name": "claude-messages-server",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "build/daemon.mjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:types": "tsc --emitDeclarationOnly",
+    "start": "node build/daemon.mjs",
+    "start:mcp": "node build/mcp.mjs",
+    "dev": "tsx watch src/daemon.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@modelcontextprotocol/sdk": "^1.16.0",
+    "better-sqlite3": "^11.0.0",
+    "telegram": "^2.26.0",
+    "yaml": "^2.7.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.27.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

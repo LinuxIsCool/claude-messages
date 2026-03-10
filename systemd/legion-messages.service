@@ -1,0 +1,16 @@
+[Unit]
+Description=Legion Messages Daemon (Telegram/Signal/Email sync)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/shawn/.local/share/fnm/node-versions/v24.14.0/installation/bin/node %h/.claude/plugins/local/legion-plugins/plugins/claude-messages/server/build/daemon.mjs
+Environment=HOME=%h
+Restart=on-failure
+RestartSec=30
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target
