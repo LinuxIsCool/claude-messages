@@ -4,3 +4,7 @@ server/build/
 *.db-journal
 *.db-wal
 *.db-shm
+.letta/
+server/.letta/
+secrets/
+*.env
