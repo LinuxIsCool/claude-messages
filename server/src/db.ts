@@ -1250,8 +1250,8 @@ export class MessageDB {
       }
 
       // Pass 6: Nickname + Fuzzy name matching
-      // 6a: Nickname lookup — deterministic "Samu" → "Samuel" resolution
-      // 6b: Jaro-Winkler fuzzy — "Samu" ~ "Samuel" (scored)
+      // 6a: Nickname lookup — cross-platform only, requires full-name or unique canonical match
+      // 6b: Jaro-Winkler fuzzy — full-name only, threshold 0.88+, cross-platform required below 0.93
 
       // Build identity candidate list with extracted first names
       const allIdentities = this.db.prepare('SELECT id, display_name FROM identities')
@@ -1272,27 +1272,49 @@ export class MessageDB {
         WHERE il.id IS NULL AND c.display_name IS NOT NULL AND LENGTH(c.display_name) >= 3
       `).all() as Array<{ id: string; display_name: string; platform: string }>;
 
+      // Pre-compute: count unlinked contacts per first-name canonical (for common name guard)
+      const canonicalContactCounts = new Map<string, number>();
+      for (const c of unlinkedForFuzzy) {
+        const firstName = extractFirstName(c.display_name) ?? c.display_name.toLowerCase().trim();
+        const canonicals = this.getNicknameCanonicals(firstName);
+        for (const can of canonicals) {
+          canonicalContactCounts.set(can, (canonicalContactCounts.get(can) ?? 0) + 1);
+        }
+      }
+
       for (const contact of unlinkedForFuzzy) {
         const contactNameLower = contact.display_name.toLowerCase().trim();
         const contactFirstName = extractFirstName(contact.display_name) ?? contactNameLower;
         const platformId = contact.id.substring(contact.platform.length + 1);
 
-        // 6a: Nickname lookup
+        // 6a: Nickname lookup — only if contact has a multi-word name (first+last)
+        // Single names ("Samu") still go through; the canonical must match the identity's
+        // canonical form (not an indirect chain like ian→john)
         const canonicals = this.getNicknameCanonicals(contactFirstName);
         let nicknameLinked = false;
         for (const canonical of canonicals) {
-          if (canonical === contactFirstName) continue; // skip self-match
-          const allVariants = this.getNicknameVariants(canonical);
-          // Find identities whose first name or full name matches any variant
+          if (canonical === contactFirstName) continue; // skip self-match (exact matching already handled)
+
+          // Common name guard: skip if 5+ unlinked contacts share this canonical
+          if ((canonicalContactCounts.get(canonical) ?? 0) >= 5) continue;
+
+          // Find identities whose canonical name matches — the identity's first name
+          // must be the CANONICAL itself (not just any variant)
           const matchingIdentities = identityCandidates.filter(ic => {
             const icFirst = ic.first_name ?? ic.name_lower;
-            return allVariants.includes(icFirst) || allVariants.includes(ic.name_lower);
+            return icFirst === canonical;
           });
-          // Common name guard: skip if 3+ identities match
           if (matchingIdentities.length === 0 || matchingIdentities.length >= 3) continue;
-          // Link to first matching identity
+
+          // Cross-platform requirement — nickname match must bridge platforms
           const target = matchingIdentities[0];
-          this.linkContact(target.id, contact.platform, platformId, 0.80, 'nickname_match', contact.display_name);
+          const targetPlatforms = this.db.prepare(
+            "SELECT DISTINCT platform FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+          ).all(target.id) as { platform: string }[];
+          const samePlatform = targetPlatforms.some(p => p.platform === contact.platform);
+          if (samePlatform) continue;
+
+          this.linkContact(target.id, contact.platform, platformId, 0.75, 'nickname_match', contact.display_name);
           report.links_created++;
           report.nickname_matches++;
           report.details.push({ identity_id: target.id, action: 'nickname_match', contacts_linked: [contact.id] });
@@ -1301,26 +1323,43 @@ export class MessageDB {
         }
         if (nicknameLinked) continue;
 
-        // 6b: Jaro-Winkler fuzzy matching
-        const match = findBestFuzzyMatch(contactNameLower, contactFirstName, identityCandidates, 0.80);
+        // 6b: Jaro-Winkler fuzzy matching — full names only, higher threshold
+        // Skip short names (< 5 chars) — JW inflates scores on short strings
+        if (contactNameLower.length < 5) continue;
+
+        // Only match full names against full names — filter candidates to similar word count
+        const contactWords = contactNameLower.split(/\s+/).length;
+        // Single-word names need to be longer to be reliable (skip "Darren"→"Warren" type matches)
+        if (contactWords === 1 && contactNameLower.length < 7) continue;
+        const filteredCandidates = identityCandidates.filter(ic => {
+          const icWords = ic.name_lower.split(/\s+/).length;
+          // Never match single-word identity against multi-word contact (prefix inflation)
+          if (icWords === 1 && contactWords > 1) return false;
+          if (contactWords === 1 && icWords > 1) return false;
+          // Single-word identities need length too
+          if (icWords === 1 && ic.name_lower.length < 7) return false;
+          return true;
+        });
+
+        const match = findBestFuzzyMatch(contactNameLower, null, filteredCandidates, 0.88);
         if (!match) continue;
 
-        // Check cross-platform requirement for 0.80-0.89 tier
-        if (match.score < 0.90) {
+        // Cross-platform requirement for scores below 0.93
+        if (match.score < 0.93) {
           const identityPlatforms = this.db.prepare(
             "SELECT DISTINCT platform FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
           ).all(match.identityId) as { platform: string }[];
           const samePlatform = identityPlatforms.some(p => p.platform === contact.platform);
-          if (samePlatform) continue; // same platform + weak score → skip
+          if (samePlatform) continue;
         }
 
-        // Common name guard
-        const matchCount = identityCandidates.filter(ic =>
-          jaroWinkler(contactNameLower, ic.name_lower) >= 0.80
+        // Common name guard: skip if 3+ candidates score >= 0.88
+        const matchCount = filteredCandidates.filter(ic =>
+          jaroWinkler(contactNameLower, ic.name_lower) >= 0.88
         ).length;
         if (matchCount >= 3) continue;
 
-        const confidence = match.score >= 0.90 ? 0.80 : 0.70;
+        const confidence = match.score >= 0.93 ? 0.80 : 0.70;
         this.linkContact(match.identityId, contact.platform, platformId, confidence, 'fuzzy_match', contact.display_name);
         report.links_created++;
         report.fuzzy_matches++;
