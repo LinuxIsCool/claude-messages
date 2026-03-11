@@ -264,6 +264,152 @@ export class TelegramAdapter implements Adapter {
     }
   }
 
+  /**
+   * Backfill full message history for specific dialogs or all dialogs.
+   * Uses iterMessages() which handles pagination automatically.
+   * Safe to run repeatedly — message IDs are unique, DB upserts ignore duplicates.
+   */
+  async *backfill(dialogIds?: string[], maxPerDialog?: number): AsyncGenerator<SyncEvent & { _backfill_progress?: { dialog: string; fetched: number } }> {
+    if (!this.client) throw new Error('Telegram adapter not initialized');
+
+    const now = new Date();
+
+    // Get all dialogs to resolve entities
+    const allDialogs: Awaited<ReturnType<TelegramClient['getDialogs']>> = [];
+    let offsetDate = 0;
+    let fetchMore = true;
+    while (fetchMore) {
+      const batch = await this.client.getDialogs({
+        limit: 100,
+        ...(offsetDate ? { offsetDate } : {}),
+      });
+      if (batch.length === 0) break;
+      allDialogs.push(...batch);
+      const lastDate = batch[batch.length - 1].date;
+      if (!lastDate || lastDate === offsetDate) break;
+      offsetDate = lastDate;
+      if (allDialogs.length > 10000) break;
+    }
+    this.log(`[telegram:backfill] Found ${allDialogs.length} dialogs`);
+
+    // Filter to requested dialogs
+    const targetDialogs = dialogIds
+      ? allDialogs.filter(d => d.entity && dialogIds.includes(getEntityId(d.entity)))
+      : allDialogs;
+
+    this.log(`[telegram:backfill] Backfilling ${targetDialogs.length} dialogs`);
+
+    for (const dialog of targetDialogs) {
+      if (!dialog.entity) continue;
+
+      const entityId = getEntityId(dialog.entity);
+      const threadId = `telegram:chat:${entityId}`;
+      const dialogType = getDialogType(dialog.entity);
+      const title = getDialogTitle(dialog.entity);
+
+      // Yield contact for DMs
+      if (dialog.entity instanceof Api.User && !dialog.entity.bot) {
+        const contact: Contact = {
+          id: `telegram:user:${dialog.entity.id}`,
+          platform: 'telegram',
+          display_name: getUserDisplayName(dialog.entity),
+          username: dialog.entity.username ?? null,
+          phone: dialog.entity.phone ?? null,
+          metadata: { bot: dialog.entity.bot ?? false },
+          first_seen: now.toISOString(),
+          last_seen: now.toISOString(),
+        };
+        yield { type: 'contact', data: contact };
+      }
+
+      // Yield thread
+      const thread: Thread = {
+        id: threadId,
+        platform: 'telegram',
+        title,
+        thread_type: dialogType,
+        participants: [],
+        metadata: { unread_count: dialog.unreadCount, pinned: dialog.pinned },
+        created_at: now.toISOString(),
+        updated_at: now.toISOString(),
+      };
+      yield { type: 'thread', data: thread };
+
+      // Iterate ALL messages (iterMessages handles pagination, rate limiting)
+      let fetched = 0;
+      const limit = maxPerDialog ?? undefined; // undefined = all messages
+      try {
+        for await (const msg of this.client.iterMessages(dialog.entity, { limit })) {
+          if (!(msg instanceof Api.Message)) continue;
+
+          const senderId = msg.senderId ? `telegram:user:${msg.senderId}` : `telegram:system:${entityId}`;
+
+          let contentType: Message['content_type'] = 'text';
+          const metadata: Record<string, unknown> = {};
+
+          if (msg.photo) {
+            contentType = 'photo';
+            metadata.has_photo = true;
+          } else if (msg.document) {
+            contentType = 'document';
+            metadata.document_name = (msg.document as Api.Document).mimeType;
+          } else if (msg.sticker) {
+            contentType = 'sticker';
+            metadata.sticker_emoji = (msg.sticker as Api.Document).attributes?.find(
+              (a: Api.TypeDocumentAttribute) => a instanceof Api.DocumentAttributeSticker
+            )?.alt;
+          }
+
+          if (msg.replyTo?.replyToMsgId) {
+            metadata.reply_to_msg_id = msg.replyTo.replyToMsgId;
+          }
+          if (msg.fwdFrom) {
+            metadata.forwarded = true;
+            metadata.fwd_from_id = msg.fwdFrom.fromId?.toString();
+          }
+          if (msg.editDate) {
+            metadata.edited = true;
+            metadata.edit_date = toIso(msg.editDate);
+          }
+
+          const message: Message = {
+            id: `telegram:msg:${entityId}:${msg.id}`,
+            platform: 'telegram',
+            thread_id: threadId,
+            sender_id: senderId,
+            content: msg.message ?? null,
+            content_type: contentType,
+            reply_to: msg.replyTo?.replyToMsgId ? `telegram:msg:${entityId}:${msg.replyTo.replyToMsgId}` : null,
+            metadata,
+            platform_ts: toIso(msg.date),
+            synced_at: now.toISOString(),
+          };
+          yield { type: 'message', data: message };
+
+          fetched++;
+          if (fetched % 500 === 0) {
+            this.log(`[telegram:backfill] ${title ?? entityId}: ${fetched} messages...`);
+          }
+
+          // Update cursor to track the newest message seen
+          if (!this.currentCursor.dialogs[entityId] || msg.id > this.currentCursor.dialogs[entityId]) {
+            this.currentCursor.dialogs[entityId] = msg.id;
+          }
+        }
+
+        this.log(`[telegram:backfill] ${title ?? entityId}: ${fetched} total messages`);
+        yield { type: 'message', data: {} as Message, _backfill_progress: { dialog: title ?? entityId, fetched } };
+      } catch (err) {
+        if (err instanceof FloodWaitError) {
+          this.log(`[telegram:backfill] Flood wait: ${err.seconds}s for ${title ?? entityId}`);
+          await new Promise(resolve => setTimeout(resolve, (err.seconds + 1) * 1000));
+        } else {
+          this.log(`[telegram:backfill] Error on ${title ?? entityId}: ${err}`);
+        }
+      }
+    }
+  }
+
   getCursor(): string | null {
     return JSON.stringify(this.currentCursor);
   }

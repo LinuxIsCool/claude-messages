@@ -23,6 +23,12 @@ await Promise.all([
     outfile: 'build/mcp.mjs',
     banner: { js: "// claude-messages MCP server — bundled with esbuild" },
   }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/backfill.ts'],
+    outfile: 'build/backfill.mjs',
+    banner: { js: "// claude-messages Telegram backfill — bundled with esbuild" },
+  }),
 ]);
 
-console.log('Built daemon.mjs and mcp.mjs');
+console.log('Built daemon.mjs, mcp.mjs, and backfill.mjs');
