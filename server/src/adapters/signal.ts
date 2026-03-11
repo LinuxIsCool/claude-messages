@@ -298,6 +298,40 @@ export class SignalAdapter implements Adapter {
     }
 
     this.log(`[signal] Yielded ${contactCount} contacts, ${threadCount} threads`);
+
+    // Backfill phone numbers from recipients table for contacts that lack them.
+    // Signal Desktop may have e164→serviceId mappings here for contacts only seen
+    // in group contexts (conversations.e164 is null for them).
+    // Wrapped in try/catch: the table may not exist in all Signal Desktop versions.
+    try {
+      const recipients = this.queryDb(
+        `SELECT e164, serviceId FROM recipients WHERE e164 IS NOT NULL AND serviceId IS NOT NULL;`
+      ) as unknown as Array<{ e164: string; serviceId: string }>;
+
+      let phonesBackfilled = 0;
+      for (const r of recipients) {
+        const contactId = `signal:user:${r.serviceId}`;
+        const contact: Contact = {
+          id: contactId,
+          platform: 'signal',
+          display_name: null,  // COALESCE in upsertContact preserves existing name
+          username: null,
+          phone: r.e164,
+          metadata: { serviceId: r.serviceId, phoneSource: 'recipients' },
+          first_seen: now.toISOString(),
+          last_seen: now.toISOString(),
+        };
+        yield { type: 'contact' as const, data: contact };
+        phonesBackfilled++;
+      }
+
+      if (phonesBackfilled > 0) {
+        this.log(`[signal] Backfilled ${phonesBackfilled} phone numbers from recipients table`);
+      }
+    } catch (err) {
+      // Table doesn't exist in this Signal Desktop version — that's fine
+      this.log(`[signal] Recipients phone backfill skipped (table may not exist): ${err}`);
+    }
   }
 
   private rowToMessage(row: SignalDbMessage, now: Date): SyncEvent | null {
