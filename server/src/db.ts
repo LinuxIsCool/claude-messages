@@ -121,6 +121,17 @@ export class MessageDB {
         PRIMARY KEY (canonical, nickname)
       );
       CREATE INDEX IF NOT EXISTS idx_nickname_nickname ON nickname_map(nickname);
+
+      CREATE TABLE IF NOT EXISTS backfill_state (
+        dialog_id TEXT PRIMARY KEY,
+        platform TEXT NOT NULL DEFAULT 'telegram',
+        dialog_title TEXT,
+        dialog_type TEXT,
+        messages_fetched INTEGER DEFAULT 0,
+        started_at TEXT,
+        completed_at TEXT,
+        status TEXT DEFAULT 'pending'
+      );
     `);
 
     this.loadNicknames();
@@ -247,6 +258,50 @@ export class MessageDB {
         cursor_value = excluded.cursor_value,
         updated_at = excluded.updated_at
     `).run(adapter, cursorValue, now);
+  }
+
+  // --- BACKFILL STATE ---
+
+  markBackfillStart(dialogId: string, meta: { platform?: string; title?: string; type?: string }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO backfill_state (dialog_id, platform, dialog_title, dialog_type, started_at, status)
+      VALUES (?, ?, ?, ?, ?, 'in_progress')
+      ON CONFLICT(dialog_id) DO UPDATE SET
+        started_at = excluded.started_at,
+        status = 'in_progress',
+        dialog_title = COALESCE(excluded.dialog_title, dialog_title),
+        dialog_type = COALESCE(excluded.dialog_type, dialog_type)
+    `).run(dialogId, meta.platform ?? 'telegram', meta.title ?? null, meta.type ?? null, now);
+  }
+
+  markBackfillComplete(dialogId: string, messageCount: number): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      UPDATE backfill_state SET
+        messages_fetched = ?,
+        completed_at = ?,
+        status = 'complete'
+      WHERE dialog_id = ?
+    `).run(messageCount, now, dialogId);
+  }
+
+  markBackfillError(dialogId: string, messageCount: number): void {
+    this.db.prepare(`
+      UPDATE backfill_state SET
+        messages_fetched = ?,
+        status = 'error'
+      WHERE dialog_id = ?
+    `).run(messageCount, dialogId);
+  }
+
+  getBackfillState(): Array<{ dialog_id: string; platform: string; dialog_title: string | null; dialog_type: string | null; messages_fetched: number; started_at: string | null; completed_at: string | null; status: string }> {
+    return this.db.prepare('SELECT * FROM backfill_state ORDER BY completed_at DESC NULLS FIRST').all() as any[];
+  }
+
+  isBackfillComplete(dialogId: string): boolean {
+    const row = this.db.prepare('SELECT status FROM backfill_state WHERE dialog_id = ?').get(dialogId) as { status: string } | undefined;
+    return row?.status === 'complete';
   }
 
   // --- READS ---
@@ -607,34 +662,30 @@ export class MessageDB {
     return results;
   }
 
+  private _mergeIdentityRaw(sourceId: string, targetId: string, source = 'manual'): number {
+    const sourceLinks = this.db.prepare('SELECT * FROM identity_links WHERE identity_id = ?')
+      .all(sourceId) as Record<string, unknown>[];
+    for (const link of sourceLinks) {
+      const l = this.parseIdentityLink(link);
+      const conflict = this.db.prepare(
+        'SELECT id FROM identity_links WHERE platform = ? AND platform_id = ? AND identity_id = ?'
+      ).get(l.platform, l.platform_id, targetId);
+      if (conflict) {
+        this.db.prepare('DELETE FROM identity_links WHERE id = ?').run(l.id);
+      } else {
+        this.db.prepare('UPDATE identity_links SET identity_id = ? WHERE id = ?').run(targetId, l.id);
+      }
+    }
+    this.logIdentityEvent(targetId, 'merged', { absorbed_identity: sourceId, links_moved: sourceLinks.length, source });
+    this.db.prepare('DELETE FROM identities WHERE id = ?').run(sourceId);
+    this.touchIdentity(targetId);
+    return sourceLinks.length;
+  }
+
   mergeIdentities(sourceId: string, targetId: string): IdentityCard {
     const txn = this.db.transaction(() => {
-      // Move all links from source to target
-      const sourceLinks = this.db.prepare('SELECT * FROM identity_links WHERE identity_id = ?')
-        .all(sourceId) as Record<string, unknown>[];
-
-      for (const link of sourceLinks) {
-        const l = this.parseIdentityLink(link);
-        // Check if target already has a link for this platform+platform_id
-        const conflict = this.db.prepare(
-          'SELECT id FROM identity_links WHERE platform = ? AND platform_id = ? AND identity_id = ?'
-        ).get(l.platform, l.platform_id, targetId);
-        if (conflict) {
-          // Target already has this link — drop source's duplicate
-          this.db.prepare('DELETE FROM identity_links WHERE id = ?').run(l.id);
-        } else {
-          this.db.prepare('UPDATE identity_links SET identity_id = ? WHERE id = ?').run(targetId, l.id);
-        }
-      }
-
-      // Log merge event on target
-      this.logIdentityEvent(targetId, 'merged', { absorbed_identity: sourceId, links_moved: sourceLinks.length });
-
-      // Delete source identity (CASCADE will clean up any remaining links)
-      this.db.prepare('DELETE FROM identities WHERE id = ?').run(sourceId);
-      this.touchIdentity(targetId);
+      this._mergeIdentityRaw(sourceId, targetId);
     });
-
     txn();
     return this.getIdentityCard(targetId)!;
   }
@@ -892,6 +943,7 @@ export class MessageDB {
       signal_uuid_dedup_matches: 0,
       nickname_matches: 0,
       fuzzy_matches: 0,
+      identity_merges: 0,
       skipped_already_linked: 0,
       details: [],
     };
@@ -1364,6 +1416,177 @@ export class MessageDB {
         report.links_created++;
         report.fuzzy_matches++;
         report.details.push({ identity_id: match.identityId, action: 'fuzzy_match', contacts_linked: [contact.id] });
+      }
+
+      // Pass 7: Identity-to-identity merging
+      // Compare identity display_names pairwise, merge clearly-same-person identities
+      const pass7Identities = this.db.prepare('SELECT id, display_name, created_at FROM identities')
+        .all() as { id: string; display_name: string; created_at: string }[];
+      const mergedAway = new Set<string>();
+
+      const getWeight = (id: string) => {
+        const linkCount = (this.db.prepare(
+          'SELECT COUNT(*) as c FROM identity_links WHERE identity_id = ?'
+        ).get(id) as { c: number }).c;
+        const msgCount = (this.db.prepare(`
+          SELECT COALESCE(SUM(mc.cnt), 0) as c FROM identity_links il
+          LEFT JOIN (SELECT sender_id, COUNT(*) as cnt FROM messages GROUP BY sender_id) mc
+            ON mc.sender_id = il.platform || ':' || il.platform_id
+          WHERE il.identity_id = ?
+        `).get(id) as { c: number }).c;
+        const platforms = (this.db.prepare(
+          "SELECT DISTINCT platform FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+        ).all(id) as { platform: string }[]).map(p => p.platform);
+        return { linkCount, msgCount, platforms };
+      };
+
+      type Ident7 = { id: string; display_name: string; created_at: string };
+      const pickMergeDirection = (a: Ident7, wA: ReturnType<typeof getWeight>, b: Ident7, wB: ReturnType<typeof getWeight>): [Ident7, Ident7] => {
+        // [source, target] — target (survivor) has more links/messages/older
+        if (wA.linkCount > wB.linkCount) return [b, a];
+        if (wB.linkCount > wA.linkCount) return [a, b];
+        if (wA.msgCount > wB.msgCount) return [b, a];
+        if (wB.msgCount > wA.msgCount) return [a, b];
+        return a.created_at <= b.created_at ? [b, a] : [a, b];
+      };
+
+      const hasPlatformConflict = (pA: string[], pB: string[]) =>
+        pA.some(p => pB.includes(p));
+
+      // Tier 1: Exact name match
+      const nameGroups7 = new Map<string, Ident7[]>();
+      for (const ident of pass7Identities) {
+        if (!ident.display_name) continue;
+        const lower = ident.display_name.toLowerCase().trim();
+        if (!lower) continue;
+        if (!nameGroups7.has(lower)) nameGroups7.set(lower, []);
+        nameGroups7.get(lower)!.push(ident);
+      }
+
+      for (const [name, group] of nameGroups7) {
+        if (group.length !== 2) continue; // only pairs; 3+ = common name
+
+        const [a, b] = group;
+        if (mergedAway.has(a.id) || mergedAway.has(b.id)) continue;
+
+        const wA = getWeight(a.id);
+        const wB = getWeight(b.id);
+        if (hasPlatformConflict(wA.platforms, wB.platforms)) continue;
+
+        const [source, target] = pickMergeDirection(a, wA, b, wB);
+        this._mergeIdentityRaw(source.id, target.id, 'auto_resolve_pass7');
+        mergedAway.add(source.id);
+        report.identity_merges++;
+        report.details.push({
+          identity_id: target.id,
+          action: 'identity_merge',
+          contacts_linked: [],
+          merged_into: target.id,
+          merge_evidence: `Exact name: "${a.display_name}" (${wA.platforms.join(',')}|${wA.linkCount} links) = "${b.display_name}" (${wB.platforms.join(',')}|${wB.linkCount} links)`,
+        });
+      }
+
+      // Tier 2: High-confidence fuzzy (JW >= 0.95)
+      const remaining7 = pass7Identities.filter(i => !mergedAway.has(i.id) && i.display_name && i.display_name.length >= 5);
+      for (let i = 0; i < remaining7.length; i++) {
+        if (mergedAway.has(remaining7[i].id)) continue;
+        const aName = remaining7[i].display_name.toLowerCase().trim();
+        const aWords = aName.split(/\s+/).length;
+        if (aWords === 1 && aName.length < 7) continue;
+
+        for (let j = i + 1; j < remaining7.length; j++) {
+          if (mergedAway.has(remaining7[j].id)) continue;
+          const bName = remaining7[j].display_name.toLowerCase().trim();
+          const bWords = bName.split(/\s+/).length;
+          if (bWords !== aWords) continue;
+          if (bWords === 1 && bName.length < 7) continue;
+          if (aName === bName) continue; // handled by Tier 1
+
+          const score = jaroWinkler(aName, bName);
+          if (score < 0.95) continue;
+
+          const a = remaining7[i];
+          const b = remaining7[j];
+          const wA = getWeight(a.id);
+          const wB = getWeight(b.id);
+          if (hasPlatformConflict(wA.platforms, wB.platforms)) continue;
+
+          // Common name guard: skip if 2+ others also score >= 0.95
+          let highMatches = 0;
+          for (const other of remaining7) {
+            if (other.id === a.id || other.id === b.id || mergedAway.has(other.id)) continue;
+            const otherName = other.display_name.toLowerCase().trim();
+            if (jaroWinkler(aName, otherName) >= 0.95 || jaroWinkler(bName, otherName) >= 0.95) {
+              highMatches++;
+              if (highMatches >= 2) break;
+            }
+          }
+          if (highMatches >= 2) continue;
+
+          const [source, target] = pickMergeDirection(a, wA, b, wB);
+          this._mergeIdentityRaw(source.id, target.id, 'auto_resolve_pass7');
+          mergedAway.add(source.id);
+          report.identity_merges++;
+          report.details.push({
+            identity_id: target.id,
+            action: 'identity_merge',
+            contacts_linked: [],
+            merged_into: target.id,
+            merge_evidence: `Fuzzy (JW=${score.toFixed(3)}): "${a.display_name}" ~ "${b.display_name}"`,
+          });
+          break; // a's partner found, move to next i
+        }
+      }
+
+      // Tier 3: Nickname + last name match
+      const remaining7b = pass7Identities.filter(i => !mergedAway.has(i.id) && i.display_name && i.display_name.includes(' '));
+      const lastNameGroups = new Map<string, Ident7[]>();
+      for (const ident of remaining7b) {
+        const parts = ident.display_name.toLowerCase().trim().split(/\s+/);
+        const lastName = parts[parts.length - 1];
+        if (lastName.length < 2) continue;
+        if (!lastNameGroups.has(lastName)) lastNameGroups.set(lastName, []);
+        lastNameGroups.get(lastName)!.push(ident);
+      }
+
+      for (const [, group] of lastNameGroups) {
+        if (group.length < 2) continue;
+        for (let i = 0; i < group.length; i++) {
+          if (mergedAway.has(group[i].id)) continue;
+          const aFirst = extractFirstName(group[i].display_name);
+          if (!aFirst) continue;
+          const aCan = new Set(this.getNicknameCanonicals(aFirst));
+
+          for (let j = i + 1; j < group.length; j++) {
+            if (mergedAway.has(group[j].id)) continue;
+            const bFirst = extractFirstName(group[j].display_name);
+            if (!bFirst) continue;
+            if (aFirst === bFirst) continue; // exact = handled by Tier 1
+
+            const bCan = new Set(this.getNicknameCanonicals(bFirst));
+            const overlap = [...aCan].filter(c => bCan.has(c));
+            if (overlap.length === 0) continue;
+
+            const a = group[i];
+            const b = group[j];
+            const wA = getWeight(a.id);
+            const wB = getWeight(b.id);
+            if (hasPlatformConflict(wA.platforms, wB.platforms)) continue;
+
+            const [source, target] = pickMergeDirection(a, wA, b, wB);
+            this._mergeIdentityRaw(source.id, target.id, 'auto_resolve_pass7');
+            mergedAway.add(source.id);
+            report.identity_merges++;
+            report.details.push({
+              identity_id: target.id,
+              action: 'identity_merge',
+              contacts_linked: [],
+              merged_into: target.id,
+              merge_evidence: `Nickname + last name: "${a.display_name}" ~ "${b.display_name}" (canonical: ${overlap.join(',')})`,
+            });
+            break; // a consumed
+          }
+        }
       }
     });
 

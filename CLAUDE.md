@@ -38,6 +38,7 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 - Logs: `~/.claude/local/messages/logs/daemon.log`
 - Config: `~/.claude/local/messages/config.yml`
 - Secrets: `~/.claude/local/messages/secrets/` (gitignored)
+- Research: `~/.claude/local/research/messages/` (deep research reports, roadmap)
 
 ## Development
 - Build: `cd server && npm run build` (esbuild → daemon.mjs + mcp.mjs)
