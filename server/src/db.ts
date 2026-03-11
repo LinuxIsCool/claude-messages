@@ -1530,10 +1530,11 @@ export class MessageDB {
     // Phase B: Fuzzy name suggestions for unlinked contacts
     const unlinkedWithMessages = unlinkedRows.filter(r => (r.message_count as number) > 0);
 
-    for (let i = 0; i < unlinkedWithMessages.length && suggestions.length < limit * 2; i++) {
-      for (let j = i + 1; j < unlinkedWithMessages.length; j++) {
-        const a = this.parseContact(unlinkedWithMessages[i]);
-        const b = this.parseContact(unlinkedWithMessages[j]);
+    const fuzzyPool = unlinkedWithMessages.slice(0, 200); // cap O(n²) — max ~20K JW calls
+    for (let i = 0; i < fuzzyPool.length && suggestions.length < limit * 2; i++) {
+      for (let j = i + 1; j < fuzzyPool.length && suggestions.length < limit * 2; j++) {
+        const a = this.parseContact(fuzzyPool[i]);
+        const b = this.parseContact(fuzzyPool[j]);
         if (!a.display_name || !b.display_name) continue;
         if (a.display_name.toLowerCase() === b.display_name.toLowerCase()) continue;
 
@@ -1541,8 +1542,8 @@ export class MessageDB {
         if (score >= 0.75 && score < 0.90) {
           suggestions.push({
             contacts: [
-              { id: a.id, platform: a.platform, display_name: a.display_name, message_count: unlinkedWithMessages[i].message_count as number },
-              { id: b.id, platform: b.platform, display_name: b.display_name, message_count: unlinkedWithMessages[j].message_count as number },
+              { id: a.id, platform: a.platform, display_name: a.display_name, message_count: fuzzyPool[i].message_count as number },
+              { id: b.id, platform: b.platform, display_name: b.display_name, message_count: fuzzyPool[j].message_count as number },
             ],
             confidence: Math.round((score - 0.3) * 100) / 100,
             evidence: `Fuzzy name match: '${a.display_name}' ~ '${b.display_name}' (JW=${score.toFixed(2)})`,
