@@ -269,7 +269,9 @@ Set `email.enabled: true` and configure your `accounts` list in config.yml, then
 
 ## MCP Tools
 
-Once the daemon has synced, Claude has access to 5 tools:
+Once the daemon has synced, Claude has access to these tools:
+
+### Messaging
 
 | Tool | Description |
 |------|-------------|
@@ -278,6 +280,23 @@ Once the daemon has synced, Claude has access to 5 tools:
 | `get_thread` | Get messages from a specific conversation by thread ID |
 | `list_threads` | List conversation threads, optionally filtered by platform |
 | `message_stats` | Aggregate statistics: counts by platform, date range, totals |
+
+### Identity Resolution
+
+The same person often appears as separate contacts on each platform. Identity resolution groups them into unified person records with confidence-scored links.
+
+| Tool | Description |
+|------|-------------|
+| `auto_resolve` | Run phone-based cross-platform matching — groups contacts sharing the same phone number into unified identities |
+| `resolve_contact` | Look up the unified identity for a given platform contact |
+| `who_is` | Fuzzy search across names, phones, usernames — returns identity cards for linked contacts, raw contacts for unlinked |
+| `link_identities` | Manually link a contact to an identity (creates identity if no ID provided) |
+| `unlink_identity` | Remove a platform link from an identity |
+| `merge_identities` | Merge two identities (source absorbed into target) |
+| `list_identities` | Browse and search unified identities |
+| `get_identity` | Full identity card with linked platforms, message stats, and audit events |
+
+**How auto-resolution works:** Phone numbers are normalized (strip non-digits, prepend `+`) and used as the cross-platform merge signal. Contacts sharing the same phone across 2+ platforms are grouped into a single identity with `confidence=0.95`. The algorithm is idempotent — running it twice produces zero changes. All operations are logged to an events table for auditability.
 
 ### Search examples
 
@@ -340,7 +359,7 @@ email:msg:acct:uid         # Email message
 
 ### Database
 
-SQLite with WAL mode and FTS5. Tables: `contacts`, `threads`, `messages`, `sync_cursors`. The FTS5 virtual table uses Porter stemming with Unicode61 tokenization.
+SQLite with WAL mode and FTS5. Tables: `contacts`, `threads`, `messages`, `sync_cursors`, `identities`, `identity_links`, `identity_events`. The FTS5 virtual table uses Porter stemming with Unicode61 tokenization.
 
 ### Two-Process Model
 
