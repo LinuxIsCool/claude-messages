@@ -1,6 +1,10 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion } from './types.js';
+import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
+import type { IdentityCandidate } from './fuzzy.js';
+// @ts-ignore — esbuild text loader inlines CSV as string
+import nicknamesCsv from '../data/nicknames.csv';
 
 export class MessageDB {
   private db: Database.Database;
@@ -10,6 +14,9 @@ export class MessageDB {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
+    this.db.function('jaro_winkler', (a: unknown, b: unknown) =>
+      (typeof a === 'string' && typeof b === 'string') ? jaroWinkler(a.toLowerCase(), b.toLowerCase()) : 0
+    );
     this.migrate();
   }
 
@@ -107,7 +114,16 @@ export class MessageDB {
       CREATE INDEX IF NOT EXISTS idx_identity_links_identity ON identity_links(identity_id);
       CREATE INDEX IF NOT EXISTS idx_identity_links_platform ON identity_links(platform, platform_id);
       CREATE INDEX IF NOT EXISTS idx_identity_events_identity ON identity_events(identity_id);
+
+      CREATE TABLE IF NOT EXISTS nickname_map (
+        canonical TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        PRIMARY KEY (canonical, nickname)
+      );
+      CREATE INDEX IF NOT EXISTS idx_nickname_nickname ON nickname_map(nickname);
     `);
+
+    this.loadNicknames();
 
     // FTS5 virtual table (can't use IF NOT EXISTS, so check first)
     const ftsExists = this.db.prepare(
@@ -137,6 +153,41 @@ export class MessageDB {
         END;
       `);
     }
+  }
+
+  private loadNicknames(): void {
+    const count = (this.db.prepare('SELECT COUNT(*) as c FROM nickname_map').get() as { c: number }).c;
+    if (count > 0) return; // already loaded
+
+    const insert = this.db.prepare('INSERT OR IGNORE INTO nickname_map (canonical, nickname) VALUES (?, ?)');
+    const txn = this.db.transaction(() => {
+      for (const line of nicknamesCsv.split('\n')) {
+        const parts = line.trim().toLowerCase().split(',').filter(Boolean);
+        if (parts.length < 3) continue;
+        // CSV format: canonical,has_nickname,nickname
+        if (parts[1] !== 'has_nickname') continue;
+        const canonical = parts[0];
+        const nickname = parts[2];
+        insert.run(canonical, nickname);
+        // Self-reference: canonical is also a "nickname" of itself
+        insert.run(canonical, canonical);
+      }
+    });
+    txn();
+  }
+
+  getNicknameCanonicals(name: string): string[] {
+    const rows = this.db.prepare(
+      'SELECT DISTINCT canonical FROM nickname_map WHERE nickname = ?'
+    ).all(name.toLowerCase()) as { canonical: string }[];
+    return rows.map(r => r.canonical);
+  }
+
+  getNicknameVariants(canonical: string): string[] {
+    const rows = this.db.prepare(
+      'SELECT DISTINCT nickname FROM nickname_map WHERE canonical = ?'
+    ).all(canonical.toLowerCase()) as { nickname: string }[];
+    return rows.map(r => r.nickname);
   }
 
   // --- WRITES ---
@@ -839,6 +890,8 @@ export class MessageDB {
       cross_platform_name_matches: 0,
       skipped_ambiguous_names: 0,
       signal_uuid_dedup_matches: 0,
+      nickname_matches: 0,
+      fuzzy_matches: 0,
       skipped_already_linked: 0,
       details: [],
     };
@@ -1195,6 +1248,84 @@ export class MessageDB {
           report.details.push({ identity_id: identityId, action: 'signal_uuid_dedup', contacts_linked: linkedContacts });
         }
       }
+
+      // Pass 6: Nickname + Fuzzy name matching
+      // 6a: Nickname lookup — deterministic "Samu" → "Samuel" resolution
+      // 6b: Jaro-Winkler fuzzy — "Samu" ~ "Samuel" (scored)
+
+      // Build identity candidate list with extracted first names
+      const allIdentities = this.db.prepare('SELECT id, display_name FROM identities')
+        .all() as { id: string; display_name: string }[];
+      const identityCandidates: IdentityCandidate[] = allIdentities.map(i => ({
+        id: i.id,
+        display_name: i.display_name,
+        first_name: extractFirstName(i.display_name),
+        name_lower: i.display_name.toLowerCase(),
+      }));
+
+      // Get unlinked contacts (re-fetch — earlier passes may have linked some)
+      const unlinkedForFuzzy = this.db.prepare(`
+        SELECT c.id, c.display_name, c.platform
+        FROM contacts c
+        LEFT JOIN identity_links il
+          ON il.platform = c.platform AND il.platform_id = SUBSTR(c.id, LENGTH(c.platform) + 2)
+        WHERE il.id IS NULL AND c.display_name IS NOT NULL AND LENGTH(c.display_name) >= 3
+      `).all() as Array<{ id: string; display_name: string; platform: string }>;
+
+      for (const contact of unlinkedForFuzzy) {
+        const contactNameLower = contact.display_name.toLowerCase().trim();
+        const contactFirstName = extractFirstName(contact.display_name) ?? contactNameLower;
+        const platformId = contact.id.substring(contact.platform.length + 1);
+
+        // 6a: Nickname lookup
+        const canonicals = this.getNicknameCanonicals(contactFirstName);
+        let nicknameLinked = false;
+        for (const canonical of canonicals) {
+          if (canonical === contactFirstName) continue; // skip self-match
+          const allVariants = this.getNicknameVariants(canonical);
+          // Find identities whose first name or full name matches any variant
+          const matchingIdentities = identityCandidates.filter(ic => {
+            const icFirst = ic.first_name ?? ic.name_lower;
+            return allVariants.includes(icFirst) || allVariants.includes(ic.name_lower);
+          });
+          // Common name guard: skip if 3+ identities match
+          if (matchingIdentities.length === 0 || matchingIdentities.length >= 3) continue;
+          // Link to first matching identity
+          const target = matchingIdentities[0];
+          this.linkContact(target.id, contact.platform, platformId, 0.80, 'nickname_match', contact.display_name);
+          report.links_created++;
+          report.nickname_matches++;
+          report.details.push({ identity_id: target.id, action: 'nickname_match', contacts_linked: [contact.id] });
+          nicknameLinked = true;
+          break;
+        }
+        if (nicknameLinked) continue;
+
+        // 6b: Jaro-Winkler fuzzy matching
+        const match = findBestFuzzyMatch(contactNameLower, contactFirstName, identityCandidates, 0.80);
+        if (!match) continue;
+
+        // Check cross-platform requirement for 0.80-0.89 tier
+        if (match.score < 0.90) {
+          const identityPlatforms = this.db.prepare(
+            "SELECT DISTINCT platform FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+          ).all(match.identityId) as { platform: string }[];
+          const samePlatform = identityPlatforms.some(p => p.platform === contact.platform);
+          if (samePlatform) continue; // same platform + weak score → skip
+        }
+
+        // Common name guard
+        const matchCount = identityCandidates.filter(ic =>
+          jaroWinkler(contactNameLower, ic.name_lower) >= 0.80
+        ).length;
+        if (matchCount >= 3) continue;
+
+        const confidence = match.score >= 0.90 ? 0.80 : 0.70;
+        this.linkContact(match.identityId, contact.platform, platformId, confidence, 'fuzzy_match', contact.display_name);
+        report.links_created++;
+        report.fuzzy_matches++;
+        report.details.push({ identity_id: match.identityId, action: 'fuzzy_match', contacts_linked: [contact.id] });
+      }
     });
 
     txn();
@@ -1355,6 +1486,53 @@ export class MessageDB {
           evidence: `Name '${group[0].display_name}' appears on ${platformList} but duplicated on one platform`,
         });
       }
+    }
+
+    // Phase B: Fuzzy name suggestions for unlinked contacts
+    const unlinkedWithMessages = unlinkedRows.filter(r => (r.message_count as number) > 0);
+
+    for (let i = 0; i < unlinkedWithMessages.length && suggestions.length < limit * 2; i++) {
+      for (let j = i + 1; j < unlinkedWithMessages.length; j++) {
+        const a = this.parseContact(unlinkedWithMessages[i]);
+        const b = this.parseContact(unlinkedWithMessages[j]);
+        if (!a.display_name || !b.display_name) continue;
+        if (a.display_name.toLowerCase() === b.display_name.toLowerCase()) continue;
+
+        const score = jaroWinkler(a.display_name.toLowerCase(), b.display_name.toLowerCase());
+        if (score >= 0.75 && score < 0.90) {
+          suggestions.push({
+            contacts: [
+              { id: a.id, platform: a.platform, display_name: a.display_name, message_count: unlinkedWithMessages[i].message_count as number },
+              { id: b.id, platform: b.platform, display_name: b.display_name, message_count: unlinkedWithMessages[j].message_count as number },
+            ],
+            confidence: Math.round((score - 0.3) * 100) / 100,
+            evidence: `Fuzzy name match: '${a.display_name}' ~ '${b.display_name}' (JW=${score.toFixed(2)})`,
+          });
+        }
+      }
+    }
+
+    // Phase C: Nickname variant suggestions
+    const nicknameGroups = new Map<string, Array<Contact & { message_count: number }>>();
+    for (const row of unlinkedWithMessages) {
+      const contact = this.parseContact(row);
+      if (!contact.display_name) continue;
+      const firstName = extractFirstName(contact.display_name) ?? contact.display_name.toLowerCase();
+      const canonicals = this.getNicknameCanonicals(firstName);
+      for (const canonical of canonicals) {
+        if (!nicknameGroups.has(canonical)) nicknameGroups.set(canonical, []);
+        nicknameGroups.get(canonical)!.push({ ...contact, message_count: row.message_count as number });
+      }
+    }
+    for (const [canonical, group] of nicknameGroups) {
+      if (group.length < 2) continue;
+      const uniqueNames = new Set(group.map(c => c.display_name?.toLowerCase()));
+      if (uniqueNames.size < 2) continue;
+      suggestions.push({
+        contacts: group.map(c => ({ id: c.id, platform: c.platform, display_name: c.display_name, message_count: c.message_count })),
+        confidence: 0.6,
+        evidence: `Nickname variants of '${canonical}': ${[...uniqueNames].map(n => `'${n}'`).join(' + ')}`,
+      });
     }
 
     return suggestions

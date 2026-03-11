@@ -14,8 +14,10 @@
     "@anthropic-ai/sdk": "^0.52.0",
     "@modelcontextprotocol/sdk": "^1.16.0",
     "better-sqlite3": "^11.0.0",
+    "fast-fuzzy": "^1.12.0",
     "imapflow": "^1.2.1",
     "mailparser": "^3.9.1",
+    "parse-full-name": "^1.2.7",
     "telegram": "^2.26.0",
     "yaml": "^2.7.0",
     "zod": "^3.25.0"

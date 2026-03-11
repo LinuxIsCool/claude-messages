@@ -7,6 +7,7 @@ const common = {
   format: 'esm',
   external: ['better-sqlite3', 'telegram', 'yaml', 'imapflow', 'mailparser'],
   sourcemap: true,
+  loader: { '.csv': 'text' },
 };
 
 await Promise.all([

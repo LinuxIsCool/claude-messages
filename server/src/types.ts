@@ -125,11 +125,13 @@ export interface AutoResolveReport {
   cross_platform_name_matches: number;
   skipped_ambiguous_names: number;
   signal_uuid_dedup_matches: number;
+  nickname_matches: number;
+  fuzzy_matches: number;
   skipped_already_linked: number;
   details: Array<{
     phone?: string;
     identity_id: string;
-    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name' | 'signal_uuid_dedup';
+    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name' | 'signal_uuid_dedup' | 'nickname_match' | 'fuzzy_match';
     contacts_linked: string[];
   }>;
 }

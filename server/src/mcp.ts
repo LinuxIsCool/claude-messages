@@ -330,7 +330,7 @@ server.tool(
 // Tool: auto_resolve
 server.tool(
   'auto_resolve',
-  'Run cross-platform identity matching — phone grouping, single-platform phone, email name match, cross-platform name match, Signal UUID dedup',
+  'Run cross-platform identity matching — phone grouping, single-platform phone, email name match, cross-platform name match, Signal UUID dedup, nickname + fuzzy name matching',
   {},
   async () => {
     try {
