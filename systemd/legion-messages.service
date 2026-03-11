@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/shawn/.local/share/fnm/node-versions/v24.14.0/installation/bin/node %h/.claude/plugins/local/legion-plugins/plugins/claude-messages/server/build/daemon.mjs
+ExecStart=%h/.local/share/fnm/aliases/default/bin/node %h/.claude/plugins/local/legion-plugins/plugins/claude-messages/server/build/daemon.mjs
 Environment=HOME=%h
 Restart=on-failure
 RestartSec=30

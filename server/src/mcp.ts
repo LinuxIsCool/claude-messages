@@ -191,7 +191,7 @@ server.tool(
         const identity = db.createIdentity(display_name, notes);
         targetId = identity.id;
       }
-      const link = db.linkContact(targetId, platform, platform_id, confidence, source);
+      const link = db.linkContact(targetId, platform, platform_id, confidence, source, display_name);
       const card = db.getIdentityCard(targetId);
       return { content: [{ type: 'text' as const, text: JSON.stringify(card, null, 2) }] };
     } catch (err) {

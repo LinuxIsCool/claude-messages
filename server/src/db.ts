@@ -535,26 +535,21 @@ export class MessageDB {
       }
     }
 
-    // Search unlinked contacts
+    // Search unlinked contacts (exclude those already linked to an identity)
     if (results.length < limit) {
       const remaining = limit - results.length;
-      const linkedContactIds = this.db.prepare(
-        "SELECT platform || ':' || platform_id as cid FROM identity_links"
-      ).all() as { cid: string }[];
-      const linkedSet = new Set(linkedContactIds.map(r => r.cid));
-
       const contactRows = this.db.prepare(`
-        SELECT * FROM contacts
-        WHERE display_name LIKE ? OR username LIKE ? OR phone LIKE ? OR id LIKE ?
-        ORDER BY last_seen DESC LIMIT ?
-      `).all(pattern, pattern, pattern, pattern, remaining + linkedSet.size) as Record<string, unknown>[];
+        SELECT c.* FROM contacts c
+        WHERE (c.display_name LIKE ? OR c.username LIKE ? OR c.phone LIKE ? OR c.id LIKE ?)
+          AND NOT EXISTS (
+            SELECT 1 FROM identity_links il
+            WHERE il.platform || ':' || il.platform_id = c.id
+          )
+        ORDER BY c.last_seen DESC LIMIT ?
+      `).all(pattern, pattern, pattern, pattern, remaining) as Record<string, unknown>[];
 
       for (const r of contactRows) {
-        if (results.length >= limit) break;
-        const contact = this.parseContact(r);
-        if (!linkedSet.has(contact.id)) {
-          results.push(contact);
-        }
+        results.push(this.parseContact(r));
       }
     }
 
@@ -569,10 +564,16 @@ export class MessageDB {
 
       for (const link of sourceLinks) {
         const l = this.parseIdentityLink(link);
-        // Update to target, handling potential conflicts
-        this.db.prepare(`
-          UPDATE OR REPLACE identity_links SET identity_id = ? WHERE id = ?
-        `).run(targetId, l.id);
+        // Check if target already has a link for this platform+platform_id
+        const conflict = this.db.prepare(
+          'SELECT id FROM identity_links WHERE platform = ? AND platform_id = ? AND identity_id = ?'
+        ).get(l.platform, l.platform_id, targetId);
+        if (conflict) {
+          // Target already has this link — drop source's duplicate
+          this.db.prepare('DELETE FROM identity_links WHERE id = ?').run(l.id);
+        } else {
+          this.db.prepare('UPDATE identity_links SET identity_id = ? WHERE id = ?').run(targetId, l.id);
+        }
       }
 
       // Log merge event on target

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Unified messaging backbone — sync Telegram, Signal, Email into SQLite with FTS5 search and MCP tools",
   "author": {
-    "name": "Shawn Whitney Anderson"
+    "name": "LinuxIsCool"
   },
   "license": "MIT",
   "keywords": ["messaging", "telegram", "signal", "email", "sync", "search"]
