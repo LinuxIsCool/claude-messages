@@ -15,6 +15,14 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 | `get_thread` | Get messages from a specific thread |
 | `list_threads` | List conversation threads |
 | `message_stats` | Counts by platform, date range |
+| `resolve_contact` | Look up unified identity for a platform contact |
+| `who_is` | Fuzzy search across names, phones, usernames — returns identity cards |
+| `link_identities` | Link a contact to an identity (creates identity if needed) |
+| `unlink_identity` | Remove a platform link from an identity |
+| `merge_identities` | Merge two identities (source absorbed into target) |
+| `list_identities` | Browse/search unified identities |
+| `get_identity` | Full identity card with links, stats, events |
+| `auto_resolve` | Phone-based cross-platform identity matching |
 
 ## Infrastructure
 - Daemon: `systemctl --user {start,stop,status} legion-messages`

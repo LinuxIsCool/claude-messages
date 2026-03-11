@@ -59,3 +59,72 @@ export interface SyncCursor {
   cursor_value: string;
   updated_at: string;
 }
+
+// --- Identity Resolution ---
+
+export interface Identity {
+  id: string;
+  display_name: string;
+  notes: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IdentityLink {
+  id: number;
+  identity_id: string;
+  platform: string;
+  platform_id: string;
+  display_name: string | null;
+  username: string | null;
+  confidence: number;
+  source: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface IdentityEvent {
+  id: number;
+  event_type: string;
+  identity_id: string;
+  details: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface IdentityCard {
+  id: string;
+  display_name: string;
+  notes: string | null;
+  platforms: Array<{
+    platform: string;
+    platform_id: string;
+    display_name: string | null;
+    username: string | null;
+    confidence: number;
+    source: string;
+    contact_id: string;
+  }>;
+  stats: {
+    total_messages: number;
+    platforms_active: number;
+    first_seen: string | null;
+    last_seen: string | null;
+  };
+  events: IdentityEvent[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AutoResolveReport {
+  identities_created: number;
+  links_created: number;
+  phone_matches: number;
+  skipped_already_linked: number;
+  details: Array<{
+    phone: string;
+    identity_id: string;
+    action: 'created' | 'extended';
+    contacts_linked: string[];
+  }>;
+}

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
-import type { Contact, Thread, Message } from './types.js';
+import crypto from 'node:crypto';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport } from './types.js';
 
 export class MessageDB {
   private db: Database.Database;
@@ -71,6 +72,41 @@ export class MessageDB {
       CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(platform_ts);
       CREATE INDEX IF NOT EXISTS idx_contacts_platform ON contacts(platform);
       CREATE INDEX IF NOT EXISTS idx_threads_platform ON threads(platform);
+
+      CREATE TABLE IF NOT EXISTS identities (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        notes TEXT,
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS identity_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+        platform TEXT NOT NULL,
+        platform_id TEXT NOT NULL,
+        display_name TEXT,
+        username TEXT,
+        confidence REAL DEFAULT 1.0,
+        source TEXT DEFAULT 'manual',
+        metadata TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        UNIQUE(platform, platform_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS identity_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        identity_id TEXT NOT NULL,
+        details TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_identity_links_identity ON identity_links(identity_id);
+      CREATE INDEX IF NOT EXISTS idx_identity_links_platform ON identity_links(platform, platform_id);
+      CREATE INDEX IF NOT EXISTS idx_identity_events_identity ON identity_events(identity_id);
     `);
 
     // FTS5 virtual table (can't use IF NOT EXISTS, so check first)
@@ -279,5 +315,382 @@ export class MessageDB {
       first_seen: row.first_seen as string,
       last_seen: row.last_seen as string,
     };
+  }
+
+  private parseIdentity(row: Record<string, unknown>): Identity {
+    return {
+      id: row.id as string,
+      display_name: row.display_name as string,
+      notes: row.notes as string | null,
+      metadata: JSON.parse((row.metadata as string) || '{}'),
+      created_at: row.created_at as string,
+      updated_at: row.updated_at as string,
+    };
+  }
+
+  private parseIdentityLink(row: Record<string, unknown>): IdentityLink {
+    return {
+      id: row.id as number,
+      identity_id: row.identity_id as string,
+      platform: row.platform as string,
+      platform_id: row.platform_id as string,
+      display_name: row.display_name as string | null,
+      username: row.username as string | null,
+      confidence: row.confidence as number,
+      source: row.source as string,
+      metadata: JSON.parse((row.metadata as string) || '{}'),
+      created_at: row.created_at as string,
+    };
+  }
+
+  private parseIdentityEvent(row: Record<string, unknown>): IdentityEvent {
+    return {
+      id: row.id as number,
+      event_type: row.event_type as string,
+      identity_id: row.identity_id as string,
+      details: JSON.parse((row.details as string) || '{}'),
+      created_at: row.created_at as string,
+    };
+  }
+
+  // --- Identity Helpers ---
+
+  private normalizePhone(phone: string): string {
+    const digits = phone.replace(/\D/g, '');
+    return '+' + digits;
+  }
+
+  private logIdentityEvent(identityId: string, eventType: string, details: Record<string, unknown>): void {
+    this.db.prepare(`
+      INSERT INTO identity_events (event_type, identity_id, details, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(eventType, identityId, JSON.stringify(details), new Date().toISOString());
+  }
+
+  private touchIdentity(identityId: string): void {
+    this.db.prepare('UPDATE identities SET updated_at = ? WHERE id = ?')
+      .run(new Date().toISOString(), identityId);
+  }
+
+  private findExistingIdentityForContacts(contacts: Array<{ platform: string; platform_id: string }>): string | null {
+    for (const c of contacts) {
+      const row = this.db.prepare(
+        'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+      ).get(c.platform, c.platform_id) as { identity_id: string } | undefined;
+      if (row) return row.identity_id;
+    }
+    return null;
+  }
+
+  // --- Identity Public Methods ---
+
+  createIdentity(displayName: string, notes?: string): Identity {
+    const now = new Date().toISOString();
+    const id = crypto.randomUUID();
+    this.db.prepare(`
+      INSERT INTO identities (id, display_name, notes, metadata, created_at, updated_at)
+      VALUES (?, ?, ?, '{}', ?, ?)
+    `).run(id, displayName, notes ?? null, now, now);
+    this.logIdentityEvent(id, 'created', { display_name: displayName });
+    return { id, display_name: displayName, notes: notes ?? null, metadata: {}, created_at: now, updated_at: now };
+  }
+
+  linkContact(identityId: string, platform: string, platformId: string, confidence = 1.0, source = 'manual', displayName?: string, username?: string): IdentityLink {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO identity_links (identity_id, platform, platform_id, display_name, username, confidence, source, metadata, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, '{}', ?)
+      ON CONFLICT(platform, platform_id) DO UPDATE SET
+        identity_id = excluded.identity_id,
+        display_name = COALESCE(excluded.display_name, display_name),
+        username = COALESCE(excluded.username, username),
+        confidence = excluded.confidence,
+        source = excluded.source
+    `).run(identityId, platform, platformId, displayName ?? null, username ?? null, confidence, source, now);
+    this.touchIdentity(identityId);
+    this.logIdentityEvent(identityId, 'linked', { platform, platform_id: platformId, confidence, source });
+    const row = this.db.prepare(
+      'SELECT * FROM identity_links WHERE platform = ? AND platform_id = ?'
+    ).get(platform, platformId) as Record<string, unknown>;
+    return this.parseIdentityLink(row);
+  }
+
+  unlinkContact(identityId: string, platform: string, platformId: string): boolean {
+    const result = this.db.prepare(
+      'DELETE FROM identity_links WHERE identity_id = ? AND platform = ? AND platform_id = ?'
+    ).run(identityId, platform, platformId);
+    if (result.changes > 0) {
+      this.touchIdentity(identityId);
+      this.logIdentityEvent(identityId, 'unlinked', { platform, platform_id: platformId });
+    }
+    return result.changes > 0;
+  }
+
+  resolveContact(platform: string, platformId: string): IdentityCard | null {
+    const row = this.db.prepare(
+      'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+    ).get(platform, platformId) as { identity_id: string } | undefined;
+    if (!row) return null;
+    return this.getIdentityCard(row.identity_id);
+  }
+
+  getIdentityCard(identityId: string): IdentityCard | null {
+    const identity = this.db.prepare('SELECT * FROM identities WHERE id = ?').get(identityId) as Record<string, unknown> | undefined;
+    if (!identity) return null;
+    const parsed = this.parseIdentity(identity);
+
+    const links = this.db.prepare('SELECT * FROM identity_links WHERE identity_id = ?')
+      .all(identityId) as Record<string, unknown>[];
+
+    const platforms = links.map(l => {
+      const link = this.parseIdentityLink(l);
+      return {
+        platform: link.platform,
+        platform_id: link.platform_id,
+        display_name: link.display_name,
+        username: link.username,
+        confidence: link.confidence,
+        source: link.source,
+        contact_id: `${link.platform}:${link.platform_id}`,
+      };
+    });
+
+    // Message stats across all linked sender_ids
+    const senderIds = platforms
+      .filter(p => p.platform !== 'phone')
+      .map(p => p.contact_id);
+
+    let totalMessages = 0;
+    let firstSeen: string | null = null;
+    let lastSeen: string | null = null;
+    const activePlatforms = new Set<string>();
+
+    if (senderIds.length > 0) {
+      const placeholders = senderIds.map(() => '?').join(',');
+      const statsRow = this.db.prepare(`
+        SELECT COUNT(*) as total, MIN(platform_ts) as first_seen, MAX(platform_ts) as last_seen
+        FROM messages WHERE sender_id IN (${placeholders})
+      `).get(...senderIds) as { total: number; first_seen: string | null; last_seen: string | null };
+      totalMessages = statsRow.total;
+      firstSeen = statsRow.first_seen;
+      lastSeen = statsRow.last_seen;
+
+      const platformRows = this.db.prepare(`
+        SELECT DISTINCT platform FROM messages WHERE sender_id IN (${placeholders})
+      `).all(...senderIds) as { platform: string }[];
+      for (const r of platformRows) activePlatforms.add(r.platform);
+    }
+
+    const events = this.db.prepare(
+      'SELECT * FROM identity_events WHERE identity_id = ? ORDER BY created_at DESC LIMIT 50'
+    ).all(identityId).map(r => this.parseIdentityEvent(r as Record<string, unknown>));
+
+    return {
+      id: parsed.id,
+      display_name: parsed.display_name,
+      notes: parsed.notes,
+      platforms,
+      stats: {
+        total_messages: totalMessages,
+        platforms_active: activePlatforms.size,
+        first_seen: firstSeen,
+        last_seen: lastSeen,
+      },
+      events,
+      created_at: parsed.created_at,
+      updated_at: parsed.updated_at,
+    };
+  }
+
+  whoIs(query: string, limit = 10): Array<IdentityCard | Contact> {
+    const pattern = `%${query}%`;
+    const results: Array<IdentityCard | Contact> = [];
+    const seenIdentities = new Set<string>();
+
+    // Search identity_links first
+    const linkRows = this.db.prepare(`
+      SELECT DISTINCT identity_id FROM identity_links
+      WHERE display_name LIKE ? OR username LIKE ? OR platform_id LIKE ?
+      LIMIT ?
+    `).all(pattern, pattern, pattern, limit) as { identity_id: string }[];
+
+    for (const r of linkRows) {
+      if (!seenIdentities.has(r.identity_id)) {
+        seenIdentities.add(r.identity_id);
+        const card = this.getIdentityCard(r.identity_id);
+        if (card) results.push(card);
+      }
+    }
+
+    // Search identities by display_name
+    const identityRows = this.db.prepare(`
+      SELECT id FROM identities WHERE display_name LIKE ? LIMIT ?
+    `).all(pattern, limit) as { id: string }[];
+
+    for (const r of identityRows) {
+      if (!seenIdentities.has(r.id)) {
+        seenIdentities.add(r.id);
+        const card = this.getIdentityCard(r.id);
+        if (card) results.push(card);
+      }
+    }
+
+    // Search unlinked contacts
+    if (results.length < limit) {
+      const remaining = limit - results.length;
+      const linkedContactIds = this.db.prepare(
+        "SELECT platform || ':' || platform_id as cid FROM identity_links"
+      ).all() as { cid: string }[];
+      const linkedSet = new Set(linkedContactIds.map(r => r.cid));
+
+      const contactRows = this.db.prepare(`
+        SELECT * FROM contacts
+        WHERE display_name LIKE ? OR username LIKE ? OR phone LIKE ? OR id LIKE ?
+        ORDER BY last_seen DESC LIMIT ?
+      `).all(pattern, pattern, pattern, pattern, remaining + linkedSet.size) as Record<string, unknown>[];
+
+      for (const r of contactRows) {
+        if (results.length >= limit) break;
+        const contact = this.parseContact(r);
+        if (!linkedSet.has(contact.id)) {
+          results.push(contact);
+        }
+      }
+    }
+
+    return results;
+  }
+
+  mergeIdentities(sourceId: string, targetId: string): IdentityCard {
+    const txn = this.db.transaction(() => {
+      // Move all links from source to target
+      const sourceLinks = this.db.prepare('SELECT * FROM identity_links WHERE identity_id = ?')
+        .all(sourceId) as Record<string, unknown>[];
+
+      for (const link of sourceLinks) {
+        const l = this.parseIdentityLink(link);
+        // Update to target, handling potential conflicts
+        this.db.prepare(`
+          UPDATE OR REPLACE identity_links SET identity_id = ? WHERE id = ?
+        `).run(targetId, l.id);
+      }
+
+      // Log merge event on target
+      this.logIdentityEvent(targetId, 'merged', { absorbed_identity: sourceId, links_moved: sourceLinks.length });
+
+      // Delete source identity (CASCADE will clean up any remaining links)
+      this.db.prepare('DELETE FROM identities WHERE id = ?').run(sourceId);
+      this.touchIdentity(targetId);
+    });
+
+    txn();
+    return this.getIdentityCard(targetId)!;
+  }
+
+  listIdentities(limit = 50, offset = 0, search?: string): { identities: Identity[]; total: number } {
+    if (search) {
+      const pattern = `%${search}%`;
+      const total = (this.db.prepare(
+        'SELECT COUNT(*) as c FROM identities WHERE display_name LIKE ?'
+      ).get(pattern) as { c: number }).c;
+      const rows = this.db.prepare(
+        'SELECT * FROM identities WHERE display_name LIKE ? ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+      ).all(pattern, limit, offset) as Record<string, unknown>[];
+      return { identities: rows.map(r => this.parseIdentity(r)), total };
+    }
+    const total = (this.db.prepare('SELECT COUNT(*) as c FROM identities').get() as { c: number }).c;
+    const rows = this.db.prepare(
+      'SELECT * FROM identities ORDER BY updated_at DESC LIMIT ? OFFSET ?'
+    ).all(limit, offset) as Record<string, unknown>[];
+    return { identities: rows.map(r => this.parseIdentity(r)), total };
+  }
+
+  autoResolve(): AutoResolveReport {
+    const report: AutoResolveReport = {
+      identities_created: 0,
+      links_created: 0,
+      phone_matches: 0,
+      skipped_already_linked: 0,
+      details: [],
+    };
+
+    const txn = this.db.transaction(() => {
+      // Get all contacts with phone numbers
+      const contacts = this.db.prepare(
+        "SELECT * FROM contacts WHERE phone IS NOT NULL AND length(phone) > 0"
+      ).all() as Record<string, unknown>[];
+
+      // Group by normalized phone
+      const phoneGroups = new Map<string, Contact[]>();
+      for (const row of contacts) {
+        const contact = this.parseContact(row);
+        const normalized = this.normalizePhone(contact.phone!);
+        if (!phoneGroups.has(normalized)) phoneGroups.set(normalized, []);
+        phoneGroups.get(normalized)!.push(contact);
+      }
+
+      // Process groups spanning 2+ platforms
+      for (const [phone, group] of phoneGroups) {
+        const platforms = new Set(group.map(c => c.platform));
+        if (platforms.size < 2) continue;
+
+        report.phone_matches++;
+
+        // Split contact.id into platform + platform_id
+        const contactRefs = group.map(c => {
+          const firstColon = c.id.indexOf(':');
+          return { platform: c.id.substring(0, firstColon), platform_id: c.id.substring(firstColon + 1) };
+        });
+
+        // Check if any contact already linked
+        const existingIdentityId = this.findExistingIdentityForContacts(contactRefs);
+
+        if (existingIdentityId) {
+          // Extend existing identity with unlinked contacts
+          const linkedContacts: string[] = [];
+          for (let i = 0; i < contactRefs.length; i++) {
+            const ref = contactRefs[i];
+            const existing = this.db.prepare(
+              'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+            ).get(ref.platform, ref.platform_id) as { identity_id: string } | undefined;
+
+            if (existing) {
+              report.skipped_already_linked++;
+              continue;
+            }
+
+            this.linkContact(existingIdentityId, ref.platform, ref.platform_id, 0.95, 'phone_match', group[i].display_name ?? undefined, group[i].username ?? undefined);
+            report.links_created++;
+            linkedContacts.push(group[i].id);
+          }
+
+          if (linkedContacts.length > 0) {
+            report.details.push({ phone, identity_id: existingIdentityId, action: 'extended', contacts_linked: linkedContacts });
+          }
+        } else {
+          // Create new identity
+          const bestName = group.find(c => c.display_name)?.display_name ?? phone;
+          const identity = this.createIdentity(bestName);
+          report.identities_created++;
+
+          // Link the phone number itself
+          this.linkContact(identity.id, 'phone', phone, 1.0, 'phone_match');
+          report.links_created++;
+
+          // Link all contacts
+          const linkedContacts: string[] = [];
+          for (let i = 0; i < contactRefs.length; i++) {
+            this.linkContact(identity.id, contactRefs[i].platform, contactRefs[i].platform_id, 0.95, 'phone_match', group[i].display_name ?? undefined, group[i].username ?? undefined);
+            report.links_created++;
+            linkedContacts.push(group[i].id);
+          }
+
+          report.details.push({ phone, identity_id: identity.id, action: 'created', contacts_linked: linkedContacts });
+        }
+      }
+    });
+
+    txn();
+    return report;
   }
 }
