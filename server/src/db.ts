@@ -838,6 +838,7 @@ export class MessageDB {
       single_platform_created: 0,
       cross_platform_name_matches: 0,
       skipped_ambiguous_names: 0,
+      signal_uuid_dedup_matches: 0,
       skipped_already_linked: 0,
       details: [],
     };
@@ -1079,6 +1080,119 @@ export class MessageDB {
         if (linkedContacts.length > 0) {
           report.cross_platform_name_matches++;
           report.details.push({ identity_id: identityId, action: 'cross_platform_name', contacts_linked: linkedContacts });
+        }
+      }
+
+      // Pass 5: Signal UUID deduplication
+      // Detect same-person duplicate Signal UUIDs via name similarity + shared group membership
+      // Re-registration creates a new UUID with the same/similar display name
+      const signalUuidPairs = this.db.prepare(`
+        WITH signal_users AS (
+          SELECT m.sender_id, c.display_name,
+            MIN(m.platform_ts) as first_msg,
+            MAX(m.platform_ts) as last_msg,
+            COUNT(*) as msg_count
+          FROM messages m
+          JOIN contacts c ON c.id = m.sender_id
+          WHERE m.platform = 'signal'
+            AND m.sender_id LIKE 'signal:user:%'
+            AND m.sender_id != 'signal:user:self'
+            AND c.display_name IS NOT NULL
+            AND LENGTH(c.display_name) >= 3
+          GROUP BY m.sender_id
+          HAVING msg_count >= 5
+        )
+        SELECT a.sender_id as uuid_a, b.sender_id as uuid_b,
+          a.display_name as name_a, b.display_name as name_b,
+          a.first_msg as first_a, a.last_msg as last_a,
+          b.first_msg as first_b, b.last_msg as last_b
+        FROM signal_users a, signal_users b
+        WHERE a.sender_id < b.sender_id
+          AND (
+            LOWER(a.display_name) = LOWER(b.display_name)
+            OR LOWER(b.display_name) LIKE LOWER(a.display_name) || '%'
+            OR LOWER(a.display_name) LIKE LOWER(b.display_name) || '%'
+          )
+      `).all() as Array<{
+        uuid_a: string; uuid_b: string;
+        name_a: string; name_b: string;
+        first_a: string; last_a: string;
+        first_b: string; last_b: string;
+      }>;
+
+      for (const pair of signalUuidPairs) {
+        // Require at least 1 shared group thread
+        const sharedGroups = this.db.prepare(`
+          SELECT COUNT(DISTINCT m1.thread_id) as cnt
+          FROM messages m1
+          INNER JOIN messages m2 ON m1.thread_id = m2.thread_id
+          WHERE m1.sender_id = ? AND m2.sender_id = ?
+            AND m1.thread_id IN (
+              SELECT id FROM threads WHERE platform = 'signal' AND thread_type = 'group'
+            )
+        `).get(pair.uuid_a, pair.uuid_b) as { cnt: number };
+        if (sharedGroups.cnt < 1) continue;
+
+        // Negative filter: if they ever DM each other, they're different people
+        const hasDM = this.db.prepare(`
+          SELECT 1 FROM threads t
+          WHERE t.platform = 'signal' AND t.thread_type = 'dm'
+            AND EXISTS (SELECT 1 FROM messages WHERE thread_id = t.id AND sender_id = ?)
+            AND EXISTS (SELECT 1 FROM messages WHERE thread_id = t.id AND sender_id = ?)
+          LIMIT 1
+        `).get(pair.uuid_a, pair.uuid_b);
+        if (hasDM) continue;
+
+        // Extract platform_id from sender_id format "signal:user:UUID"
+        const platformIdA = pair.uuid_a.substring('signal:'.length);
+        const platformIdB = pair.uuid_b.substring('signal:'.length);
+
+        // Check if either is already linked
+        const existingA = this.db.prepare(
+          'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+        ).get('signal', platformIdA) as { identity_id: string } | undefined;
+        const existingB = this.db.prepare(
+          'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+        ).get('signal', platformIdB) as { identity_id: string } | undefined;
+
+        if (existingA && existingB) {
+          if (existingA.identity_id !== existingB.identity_id) continue;
+          report.skipped_already_linked++;
+          continue;
+        }
+
+        // Get display names for identity creation
+        const contactA = this.db.prepare('SELECT display_name FROM contacts WHERE id = ?').get(pair.uuid_a) as { display_name: string | null } | undefined;
+        const contactB = this.db.prepare('SELECT display_name FROM contacts WHERE id = ?').get(pair.uuid_b) as { display_name: string | null } | undefined;
+
+        let identityId: string;
+        const linkedContacts: string[] = [];
+
+        if (existingA) {
+          identityId = existingA.identity_id;
+        } else if (existingB) {
+          identityId = existingB.identity_id;
+        } else {
+          const bestName = contactA?.display_name ?? contactB?.display_name ?? pair.uuid_a;
+          const identity = this.createIdentity(bestName);
+          identityId = identity.id;
+          report.identities_created++;
+        }
+
+        if (!existingA) {
+          this.linkContact(identityId, 'signal', platformIdA, 0.85, 'signal_uuid_dedup', contactA?.display_name ?? undefined);
+          report.links_created++;
+          linkedContacts.push(pair.uuid_a);
+        }
+        if (!existingB) {
+          this.linkContact(identityId, 'signal', platformIdB, 0.85, 'signal_uuid_dedup', contactB?.display_name ?? undefined);
+          report.links_created++;
+          linkedContacts.push(pair.uuid_b);
+        }
+
+        if (linkedContacts.length > 0) {
+          report.signal_uuid_dedup_matches++;
+          report.details.push({ identity_id: identityId, action: 'signal_uuid_dedup', contacts_linked: linkedContacts });
         }
       }
     });

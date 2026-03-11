@@ -124,11 +124,12 @@ export interface AutoResolveReport {
   single_platform_created: number;
   cross_platform_name_matches: number;
   skipped_ambiguous_names: number;
+  signal_uuid_dedup_matches: number;
   skipped_already_linked: number;
   details: Array<{
     phone?: string;
     identity_id: string;
-    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name';
+    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name' | 'signal_uuid_dedup';
     contacts_linked: string[];
   }>;
 }
