@@ -120,11 +120,44 @@ export interface AutoResolveReport {
   identities_created: number;
   links_created: number;
   phone_matches: number;
+  name_matches: number;
+  single_platform_created: number;
+  cross_platform_name_matches: number;
+  skipped_ambiguous_names: number;
   skipped_already_linked: number;
   details: Array<{
-    phone: string;
+    phone?: string;
     identity_id: string;
-    action: 'created' | 'extended';
+    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name';
     contacts_linked: string[];
   }>;
+}
+
+export interface IdentityHealth {
+  total_contacts: number;
+  total_identities: number;
+  total_links: number;
+  contacts_linked: number;
+  contacts_unlinked: number;
+  coverage_pct: number;
+  links_by_source: Record<string, number>;
+  unlinked_with_messages: number;
+  unlinked_with_phone: number;
+  top_unlinked: Array<{ id: string; display_name: string | null; platform: string; message_count: number }>;
+  orphaned_identities: number;
+}
+
+export interface IdentityRelationship {
+  identity_id: string;
+  display_name: string;
+  shared_threads: number;
+  total_messages: number;
+  last_interaction: string | null;
+  platforms: string[];
+}
+
+export interface MergeSuggestion {
+  contacts: Array<{ id: string; platform: string; display_name: string | null; message_count: number }>;
+  confidence: number;
+  evidence: string;
 }

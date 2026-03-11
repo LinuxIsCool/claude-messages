@@ -20,11 +20,21 @@ const server = new McpServer({
 // Tool: search_messages
 server.tool(
   'search_messages',
-  'Full-text search across all synced messages',
-  { query: z.string().describe('Search query (FTS5 syntax supported)'), limit: z.number().optional().default(30).describe('Max results') },
-  async ({ query, limit }) => {
+  'Full-text search across all synced messages, optionally filtered by identity',
+  {
+    query: z.string().describe('Search query (FTS5 syntax supported)'),
+    limit: z.number().optional().default(30).describe('Max results'),
+    identity_id: z.string().optional().describe('Filter to messages from this identity across all platforms'),
+  },
+  async ({ query, limit, identity_id }) => {
     try {
-      const results = db.searchMessages(query, limit);
+      const results = identity_id
+        ? db.searchMessagesByIdentity(identity_id, query, limit)
+        : db.searchMessages(query, limit);
+
+      const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
+      const names = db.resolveContactNames(senderIds);
+
       return {
         content: [{
           type: 'text' as const,
@@ -32,6 +42,7 @@ server.tool(
             id: m.id,
             thread: m.thread_id,
             sender: m.sender_id,
+            sender_name: names.get(m.sender_id) ?? null,
             content: m.content,
             type: m.content_type,
             time: m.platform_ts,
@@ -51,6 +62,8 @@ server.tool(
   { limit: z.number().optional().default(30).describe('Max results') },
   async ({ limit }) => {
     const results = db.recentMessages(limit);
+    const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
     return {
       content: [{
         type: 'text' as const,
@@ -58,6 +71,7 @@ server.tool(
           id: m.id,
           thread: m.thread_id,
           sender: m.sender_id,
+          sender_name: names.get(m.sender_id) ?? null,
           content: m.content,
           type: m.content_type,
           time: m.platform_ts,
@@ -70,7 +84,7 @@ server.tool(
 // Tool: get_thread
 server.tool(
   'get_thread',
-  'Get messages from a specific thread/conversation',
+  'Get messages from a specific thread/conversation with sender names and participant info',
   {
     thread_id: z.string().describe('Thread ID (e.g. telegram:chat:12345)'),
     limit: z.number().optional().default(50).describe('Max messages'),
@@ -78,14 +92,26 @@ server.tool(
   async ({ thread_id, limit }) => {
     const thread = db.getThread(thread_id);
     const messages = db.getThreadMessages(thread_id, limit);
+
+    const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
+    const participantNames = thread ? db.resolveContactNames(thread.participants) : new Map<string, string>();
+
     return {
       content: [{
         type: 'text' as const,
         text: JSON.stringify({
-          thread: thread ? { id: thread.id, title: thread.title, type: thread.thread_type, platform: thread.platform } : null,
+          thread: thread ? {
+            id: thread.id,
+            title: thread.title,
+            type: thread.thread_type,
+            platform: thread.platform,
+            participants: thread.participants.map(p => ({ id: p, name: participantNames.get(p) ?? null })),
+          } : null,
           messages: messages.map(m => ({
             id: m.id,
             sender: m.sender_id,
+            sender_name: names.get(m.sender_id) ?? null,
             content: m.content,
             type: m.content_type,
             time: m.platform_ts,
@@ -99,13 +125,19 @@ server.tool(
 // Tool: list_threads
 server.tool(
   'list_threads',
-  'List conversation threads, optionally filtered by platform',
+  'List conversation threads, optionally filtered by platform or identity',
   {
     platform: z.string().optional().describe('Filter by platform (telegram, signal, email)'),
+    identity_id: z.string().optional().describe('Filter to threads involving this identity'),
     limit: z.number().optional().default(30).describe('Max results'),
   },
-  async ({ platform, limit }) => {
-    const threads = db.listThreads(platform, limit);
+  async ({ platform, identity_id, limit }) => {
+    if (identity_id && platform) {
+      return { content: [{ type: 'text' as const, text: 'Error: identity_id and platform are mutually exclusive — use one or the other' }] };
+    }
+    const threads = identity_id
+      ? db.getThreadsByIdentity(identity_id, limit)
+      : db.listThreads(platform, limit);
     return {
       content: [{
         type: 'text' as const,
@@ -268,10 +300,37 @@ server.tool(
   }
 );
 
+// Tool: unlinked_contacts
+server.tool(
+  'unlinked_contacts',
+  'Audit unlinked contacts sorted by message activity — surfaces contacts most worth linking to identities',
+  {
+    platform: z.string().optional().describe('Filter by platform (telegram, signal, email)'),
+    limit: z.number().optional().default(50).describe('Max results'),
+  },
+  async ({ platform, limit }) => {
+    const contacts = db.getUnlinkedContacts(platform, limit);
+    return {
+      content: [{
+        type: 'text' as const,
+        text: JSON.stringify(contacts.map(c => ({
+          id: c.id,
+          platform: c.platform,
+          display_name: c.display_name,
+          username: c.username,
+          phone: c.phone,
+          message_count: c.message_count,
+          last_seen: c.last_seen,
+        })), null, 2),
+      }],
+    };
+  }
+);
+
 // Tool: auto_resolve
 server.tool(
   'auto_resolve',
-  'Run phone-based cross-platform identity matching — groups contacts sharing the same phone number into unified identities',
+  'Run cross-platform identity matching — phone grouping, email name match, single-platform phone, cross-platform name match',
   {},
   async () => {
     try {
@@ -280,6 +339,89 @@ server.tool(
     } catch (err) {
       return { content: [{ type: 'text' as const, text: `Error: ${err}` }] };
     }
+  }
+);
+
+// Tool: identity_health
+server.tool(
+  'identity_health',
+  'Diagnostic view of identity resolution coverage — linked/unlinked counts, top unlinked contacts, orphaned identities',
+  {},
+  async () => {
+    const health = db.getIdentityHealth();
+    return { content: [{ type: 'text' as const, text: JSON.stringify(health, null, 2) }] };
+  }
+);
+
+// Tool: update_identity
+server.tool(
+  'update_identity',
+  'Update an identity\'s display name or notes',
+  {
+    identity_id: z.string().describe('Identity ID'),
+    display_name: z.string().optional().describe('New display name'),
+    notes: z.string().optional().describe('New notes'),
+  },
+  async ({ identity_id, display_name, notes }) => {
+    try {
+      if (display_name === undefined && notes === undefined) {
+        return { content: [{ type: 'text' as const, text: 'Error: at least one of display_name or notes must be provided' }] };
+      }
+      const updated = db.updateIdentity(identity_id, { display_name, notes });
+      const card = db.getIdentityCard(identity_id);
+      return { content: [{ type: 'text' as const, text: JSON.stringify(card, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err}` }] };
+    }
+  }
+);
+
+// Tool: cleanup_identities
+server.tool(
+  'cleanup_identities',
+  'Remove orphaned identities (zero links remaining)',
+  {},
+  async () => {
+    const result = db.cleanupOrphanedIdentities();
+    return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// Tool: identity_relationships
+server.tool(
+  'identity_relationships',
+  'Who talks to whom — shared thread participation between an identity and others',
+  {
+    identity_id: z.string().describe('Identity ID'),
+    limit: z.number().optional().default(20).describe('Max relationships to return'),
+  },
+  async ({ identity_id, limit }) => {
+    const relationships = db.getRelationships(identity_id, limit);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(relationships, null, 2) }] };
+  }
+);
+
+// Tool: merge_suggestions
+server.tool(
+  'merge_suggestions',
+  'Surface ambiguous name matches (first-name-only, same-platform duplicates) as human-reviewable merge candidates',
+  {
+    limit: z.number().optional().default(30).describe('Max suggestions'),
+  },
+  async ({ limit }) => {
+    const suggestions = db.getMergeSuggestions(limit);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(suggestions, null, 2) }] };
+  }
+);
+
+// Tool: export_identities
+server.tool(
+  'export_identities',
+  'Bulk export all identities with platforms and message stats — for integration with other plugins',
+  {},
+  async () => {
+    const identities = db.exportIdentities();
+    return { content: [{ type: 'text' as const, text: JSON.stringify(identities, null, 2) }] };
   }
 );
 

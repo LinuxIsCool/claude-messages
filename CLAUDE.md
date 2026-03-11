@@ -12,8 +12,8 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 |------|-------------|
 | `search_messages` | Full-text search across all synced messages |
 | `recent_messages` | Get latest messages across platforms |
-| `get_thread` | Get messages from a specific thread |
-| `list_threads` | List conversation threads |
+| `get_thread` | Get messages from a thread with sender names and participant info |
+| `list_threads` | List threads, optionally filtered by platform or identity |
 | `message_stats` | Counts by platform, date range |
 | `resolve_contact` | Look up unified identity for a platform contact |
 | `who_is` | Fuzzy search across names, phones, usernames — returns identity cards |
@@ -22,7 +22,14 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 | `merge_identities` | Merge two identities (source absorbed into target) |
 | `list_identities` | Browse/search unified identities |
 | `get_identity` | Full identity card with links, stats, events |
-| `auto_resolve` | Phone-based cross-platform identity matching |
+| `unlinked_contacts` | Audit unlinked contacts sorted by message activity |
+| `auto_resolve` | Cross-platform identity matching (phone + email + single-platform + name) |
+| `identity_health` | Diagnostic view of identity resolution coverage |
+| `update_identity` | Update an identity's display name or notes |
+| `cleanup_identities` | Remove orphaned identities with zero links |
+| `identity_relationships` | Who talks to whom — shared thread participation |
+| `merge_suggestions` | Surface ambiguous name matches for human review |
+| `export_identities` | Bulk export all identities for plugin integration |
 
 ## Infrastructure
 - Daemon: `systemctl --user {start,stop,status} legion-messages`

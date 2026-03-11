@@ -133,6 +133,12 @@ class Daemon {
       case 'contact':
         this.db.upsertContact(event.data as Contact);
         this.eventLog.append('contact.upsert', event.data);
+        {
+          const linkResult = this.db.tryAutoLink(event.data as Contact);
+          if (linkResult.linked) {
+            this.log(`[identity] Auto-linked ${(event.data as Contact).id} → ${linkResult.identity_id}`);
+          }
+        }
         break;
       case 'thread':
         this.db.upsertThread(event.data as Thread);
