@@ -459,12 +459,13 @@ export class SlackAdapter implements Adapter {
         if (effectiveMsg.user && !this.userCache.has(effectiveMsg.user) && !this.unknownUsersThisCycle.has(effectiveMsg.user)) {
           try {
             const result = await this.webClient.users.info({ user: effectiveMsg.user });
-            if (result.user) {
-              this.userCache.set(result.user.id!, result.user as SlackUser);
+            if (result.user?.id) {
+              this.userCache.set(result.user.id, result.user as SlackUser);
             }
           } catch {
-            this.unknownUsersThisCycle.add(effectiveMsg.user);
+            // failed lookup — don't retry this cycle
           }
+          this.unknownUsersThisCycle.add(effectiveMsg.user);
         }
 
         // Determine sender
@@ -568,6 +569,19 @@ export class SlackAdapter implements Adapter {
 
             // Skip system subtypes
             if (msg.subtype && SKIP_SUBTYPES.has(msg.subtype)) continue;
+
+            // Lazy-resolve unknown users (same as fetchChannelMessages)
+            if (msg.user && !this.userCache.has(msg.user) && !this.unknownUsersThisCycle.has(msg.user)) {
+              try {
+                const result = await this.webClient.users.info({ user: msg.user });
+                if (result.user?.id) {
+                  this.userCache.set(result.user.id, result.user as SlackUser);
+                }
+              } catch {
+                // failed lookup — don't retry this cycle
+              }
+              this.unknownUsersThisCycle.add(msg.user);
+            }
 
             let senderId: string;
             if (msg.user) {
