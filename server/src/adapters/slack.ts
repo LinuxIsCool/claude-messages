@@ -94,13 +94,13 @@ function loadEnv(envPath: string): Record<string, string> {
 }
 
 /** Convert Slack ts (epoch.seq) to ISO 8601. ts is always kept as string. */
-function slackTsToIso(ts: string): string {
+export function slackTsToIso(ts: string): string {
   const epochSeconds = parseInt(ts.split('.')[0], 10);
   return new Date(epochSeconds * 1000).toISOString();
 }
 
 /** Extract readable text from blocks array (recursive rich_text traversal) */
-function extractBlockText(blocks: SlackBlock[]): string {
+export function extractBlockText(blocks: SlackBlock[]): string {
   const parts: string[] = [];
 
   for (const block of blocks) {
@@ -133,7 +133,7 @@ function extractBlockText(blocks: SlackBlock[]): string {
 }
 
 /** Clean mrkdwn text — resolve basic formatting for storage */
-function cleanMrkdwn(text: string, resolveUser: (id: string) => string): string {
+export function cleanMrkdwn(text: string, resolveUser: (id: string) => string): string {
   return text
     // Resolve user mentions: <@U123> → @displayname
     .replace(/<@(U[A-Z0-9]+)>/g, (_match, uid: string) => `@${resolveUser(uid)}`)
@@ -147,7 +147,7 @@ function cleanMrkdwn(text: string, resolveUser: (id: string) => string): string 
 }
 
 /** Extract content from a Slack message — blocks first, mrkdwn text fallback */
-function extractContent(
+export function extractContent(
   msg: SlackMessage,
   resolveUser: (id: string) => string,
 ): string | null {

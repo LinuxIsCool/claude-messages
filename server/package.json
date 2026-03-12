@@ -8,11 +8,14 @@
     "build:types": "tsc --emitDeclarationOnly",
     "start": "node build/daemon.mjs",
     "start:mcp": "node build/mcp.mjs",
-    "dev": "tsx watch src/daemon.ts"
+    "dev": "tsx watch src/daemon.ts",
+    "test": "vitest run"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
     "@modelcontextprotocol/sdk": "^1.16.0",
+    "@slack/socket-mode": "^2.0.5",
+    "@slack/web-api": "^7.14.1",
     "better-sqlite3": "^11.0.0",
     "fast-fuzzy": "^1.12.0",
     "imapflow": "^1.2.1",
@@ -29,7 +32,8 @@
     "@types/node": "^22.15.0",
     "esbuild": "^0.27.3",
     "tsx": "^4.19.4",
-    "typescript": "^5.8.0"
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.0"
   },
   "engines": {
     "node": ">=20.0.0"
