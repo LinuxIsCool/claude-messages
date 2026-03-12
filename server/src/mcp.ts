@@ -425,6 +425,125 @@ server.tool(
   }
 );
 
+// Tool: relationship_score
+server.tool(
+  'relationship_score',
+  'Get full ContactRank score breakdown for a contact — all 8 scoring factors, composite score, Dunbar layer, and confidence',
+  {
+    identity_id: z.string().describe('Identity ID'),
+  },
+  async ({ identity_id }) => {
+    const score = db.getContactScore(identity_id);
+    if (!score) {
+      return { content: [{ type: 'text' as const, text: `No score found for ${identity_id}. Run refresh_scores first.` }] };
+    }
+    return { content: [{ type: 'text' as const, text: JSON.stringify(score, null, 2) }] };
+  }
+);
+
+// Tool: inner_circle
+server.tool(
+  'inner_circle',
+  'View contacts ranked by relationship strength, grouped by Dunbar layer (support_clique/sympathy_group/affinity_group/active_network/acquaintance)',
+  {
+    layer: z.enum(['support_clique', 'sympathy_group', 'affinity_group', 'active_network', 'acquaintance']).optional().describe('Filter to a specific Dunbar layer'),
+    limit: z.number().optional().default(50).describe('Max results'),
+  },
+  async ({ layer, limit }) => {
+    const scores = db.getInnerCircle(layer, limit);
+    if (scores.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No scores computed yet. Run refresh_scores first.' }] };
+    }
+
+    // Group by layer for display
+    if (!layer) {
+      const grouped: Record<string, Array<{ display_name: string; composite: number; confidence: number }>> = {};
+      for (const s of scores) {
+        const g = grouped[s.dunbar_layer] ??= [];
+        g.push({ display_name: s.display_name, composite: Math.round(s.composite * 1000) / 1000, confidence: Math.round(s.confidence * 100) / 100 });
+      }
+      return { content: [{ type: 'text' as const, text: JSON.stringify(grouped, null, 2) }] };
+    }
+
+    return { content: [{ type: 'text' as const, text: JSON.stringify(scores.map(s => ({
+      display_name: s.display_name,
+      composite: Math.round(s.composite * 1000) / 1000,
+      confidence: Math.round(s.confidence * 100) / 100,
+      frequency: Math.round(s.frequency * 100) / 100,
+      recency: Math.round(s.recency * 100) / 100,
+      reciprocity: Math.round(s.reciprocity * 100) / 100,
+      dm_ratio: Math.round(s.dm_ratio * 100) / 100,
+    })), null, 2) }] };
+  }
+);
+
+// Tool: fading_relationships
+server.tool(
+  'fading_relationships',
+  'Detect contacts going unusually silent — flags when silence exceeds N times their typical interval. Inner circle contacts shown first.',
+  {
+    threshold: z.number().optional().default(8).describe('Silence ratio threshold (default: 8x typical interval)'),
+    min_layer: z.enum(['support_clique', 'sympathy_group', 'affinity_group', 'active_network', 'acquaintance']).optional().describe('Only show contacts at this Dunbar layer or higher'),
+  },
+  async ({ threshold, min_layer }) => {
+    const results = db.getFadingRelationships(threshold, min_layer);
+    if (results.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'No fading relationships detected at this threshold.' }] };
+    }
+    return { content: [{ type: 'text' as const, text: JSON.stringify(results, null, 2) }] };
+  }
+);
+
+// Tool: refresh_scores
+server.tool(
+  'refresh_scores',
+  'Recompute ContactRank scores for all identities. Stores self_identity_id on first call.',
+  {
+    self_identity_id: z.string().optional().describe('Your own identity ID (stored for future calls)'),
+  },
+  async ({ self_identity_id }) => {
+    try {
+      if (self_identity_id) {
+        db.setConfig('self_identity_id', self_identity_id);
+      }
+      const result = db.computeAllScores();
+      return { content: [{ type: 'text' as const, text: JSON.stringify({
+        status: 'ok',
+        identities_scored: result.computed,
+        duration_ms: result.duration_ms,
+      }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err}` }] };
+    }
+  }
+);
+
+// Tool: set_dunbar_override
+server.tool(
+  'set_dunbar_override',
+  'Manually override a contact\'s Dunbar layer — survives re-scoring. Use for contacts with data gaps (e.g. iMessage-only partners).',
+  {
+    identity_id: z.string().describe('Identity ID'),
+    layer: z.enum(['support_clique', 'sympathy_group', 'affinity_group', 'active_network', 'acquaintance']).describe('Target Dunbar layer'),
+    reason: z.string().optional().describe('Why this override exists'),
+  },
+  async ({ identity_id, layer, reason }) => {
+    try {
+      db.setTierOverride(identity_id, layer, reason);
+      const score = db.getContactScore(identity_id);
+      return { content: [{ type: 'text' as const, text: JSON.stringify({
+        status: 'override_set',
+        identity_id,
+        layer,
+        reason: reason ?? null,
+        current_score: score,
+      }, null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err}` }] };
+    }
+  }
+);
+
 // Start
 const transport = new StdioServerTransport();
 await server.connect(transport);

@@ -3,8 +3,8 @@
  *
  * Usage:
  *   node build/backfill.mjs                    # backfill all dialogs (DMs only by default)
- *   node build/backfill.mjs 5840381737         # backfill specific dialog (Eve)
- *   node build/backfill.mjs 5840381737 458825601  # multiple dialogs
+ *   node build/backfill.mjs <dialog_id>        # backfill specific dialog
+ *   node build/backfill.mjs <id1> <id2>        # multiple dialogs
  *   node build/backfill.mjs --all              # backfill ALL dialogs including groups
  *   node build/backfill.mjs --dms              # backfill all DM dialogs
  *   node build/backfill.mjs --max 5000         # limit messages per dialog

@@ -6,6 +6,7 @@ import { EventLog } from './events.js';
 import { TelegramAdapter } from './adapters/telegram.js';
 import { SignalAdapter } from './adapters/signal.js';
 import { EmailAdapter } from './adapters/email.js';
+import { SlackAdapter } from './adapters/slack.js';
 import type { Adapter } from './adapters/base.js';
 import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent } from './types.js';
 
@@ -79,6 +80,25 @@ class Daemon {
         this.log('Email adapter initialized');
       } catch (err) {
         this.log(`Email adapter failed to initialize: ${err}`);
+      }
+    }
+
+    if (adapterConfigs.slack?.enabled) {
+      const workspaces = (adapterConfigs.slack.workspaces as Array<{ id: string; name: string }>) ?? [];
+      for (const ws of workspaces) {
+        try {
+          const adapter = new SlackAdapter((msg) => this.log(msg));
+          await adapter.init({
+            ...adapterConfigs.slack,
+            workspace_id: ws.id,
+            workspace_name: ws.name,
+            data_dir: dataDir,
+          } as AdapterConfig);
+          this.adapters.push(adapter);
+          this.log(`Slack adapter initialized: ${ws.name} (${ws.id})`);
+        } catch (err) {
+          this.log(`Slack adapter failed for ${ws.id}: ${err}`);
+        }
       }
     }
 

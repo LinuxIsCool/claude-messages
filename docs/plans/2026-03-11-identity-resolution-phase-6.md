@@ -220,7 +220,7 @@ Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 
 ### Task 3: Signal UUID Dedup (autoResolve Pass 5)
 
-**Problem:** Signal Desktop creates duplicate conversation records when a user re-registers. Example: "Samu" (UUID 1e8a6f8d, 1,704 messages) and "Samu El" (UUID f0ca4cb8, 1,667 messages) share 15 group threads but are treated as separate contacts.
+**Problem:** Signal Desktop creates duplicate conversation records when a user re-registers. Example: "UserA" (UUID 1e8a6f8d, 1,704 messages) and "UserA El" (UUID f0ca4cb8, 1,667 messages) share 15 group threads but are treated as separate contacts.
 
 **Approach:** Add Pass 5 to autoResolve that:
 1. Finds Signal sender_id pairs sharing 3+ group threads
@@ -415,13 +415,13 @@ for detail in r['details']:
 "
 ```
 
-Expected: `signal_uuid_dedup_matches` ≥ 1 (at minimum the Samu/Samu El pair). The exact count depends on how many re-registrations exist in the Signal data.
+Expected: `signal_uuid_dedup_matches` ≥ 1 (at minimum the UserA/UserA El pair). The exact count depends on how many re-registrations exist in the Signal data.
 
-- [ ] **Step 7: Verify Samu specifically**
+- [ ] **Step 7: Verify UserA specifically**
 
 ```bash
 cd ~/.claude/plugins/local/legion-plugins/plugins/claude-messages/server
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"who_is","arguments":{"query":"Samu","limit":5}}}' | timeout 10 node build/mcp.mjs 2>/dev/null | head -1 | python3 -c "
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"who_is","arguments":{"query":"UserA","limit":5}}}' | timeout 10 node build/mcp.mjs 2>/dev/null | head -1 | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 results = json.loads(d['result']['content'][0]['text'])
@@ -433,7 +433,7 @@ for r in results:
 "
 ```
 
-Expected: The Samu identity should now have both Signal UUIDs linked (plus Telegram), with total_messages reflecting all three sender_ids combined (~3,400+ messages).
+Expected: The UserA identity should now have both Signal UUIDs linked (plus Telegram), with total_messages reflecting all three sender_ids combined (~3,400+ messages).
 
 - [ ] **Step 8: Run identity_health to verify coverage improvement**
 
@@ -464,7 +464,7 @@ git commit -m "feat(messages): add Signal UUID dedup pass to autoResolve
 Pass 5 detects same-person Signal UUIDs by finding sender_id pairs that
 share 3+ group threads and never DM each other. Links them at confidence
 0.85 with source 'signal_uuid_dedup'. Catches re-registration cases
-like Samu/Samu El (3,371 combined messages, 15 shared groups).
+like UserA/UserA El (3,371 combined messages, 15 shared groups).
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>"
 ```
@@ -480,7 +480,7 @@ After all 3 tasks are complete:
 - [ ] `systemctl --user status legion-messages` shows active
 - [ ] `auto_resolve` runs without errors and reports `signal_uuid_dedup_matches`
 - [ ] `identity_health` shows coverage > 17.1%
-- [ ] `who_is Samu` shows a single identity with both Signal UUIDs + Telegram linked
+- [ ] `who_is UserA` shows a single identity with both Signal UUIDs + Telegram linked
 - [ ] Existing tools (`search_messages`, `get_thread`, `list_threads`) still work
 - [ ] No orphaned identities (`orphaned_identities: 0`)
 - [ ] `links_by_source` includes `signal_uuid_dedup` entry

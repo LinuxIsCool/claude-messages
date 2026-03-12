@@ -1,6 +1,6 @@
 # claude-messages
 
-Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite with FTS5 search.
+Unified messaging backbone. Syncs Telegram, Signal, Email, and Slack into SQLite with FTS5 search.
 
 ## Quick Start
 - `/messages <query>` — search messages
@@ -30,6 +30,11 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 | `identity_relationships` | Who talks to whom — shared thread participation |
 | `merge_suggestions` | Surface ambiguous name matches for human review |
 | `export_identities` | Bulk export all identities for plugin integration |
+| `relationship_score` | Full ContactRank score breakdown for one contact (8 factors + composite) |
+| `inner_circle` | Contacts ranked by relationship strength, grouped by Dunbar layer |
+| `fading_relationships` | Detect unusually silent contacts — inner circle first |
+| `refresh_scores` | Recompute all ContactRank scores (stores self_identity_id on first call) |
+| `set_dunbar_override` | Manual Dunbar layer override — survives re-scoring |
 
 ## Infrastructure
 - Daemon: `systemctl --user {start,stop,status} legion-messages`
@@ -42,5 +47,6 @@ Unified messaging backbone. Syncs Telegram (Signal, Email coming) into SQLite wi
 
 ## Development
 - Build: `cd server && npm run build` (esbuild → daemon.mjs + mcp.mjs)
+- Test: `cd server && npm test` (vitest — 23 tests)
 - Test MCP: `timeout 3 node server/build/mcp.mjs 2>&1 || true`
 - Rebuild: `cd server && npm install && npm run build`
