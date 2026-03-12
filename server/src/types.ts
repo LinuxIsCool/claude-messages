@@ -128,11 +128,12 @@ export interface AutoResolveReport {
   nickname_matches: number;
   fuzzy_matches: number;
   identity_merges: number;
+  email_metadata_matches: number;
   skipped_already_linked: number;
   details: Array<{
     phone?: string;
     identity_id: string;
-    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name' | 'signal_uuid_dedup' | 'nickname_match' | 'fuzzy_match' | 'identity_merge';
+    action: 'created' | 'extended' | 'name_matched' | 'single_platform' | 'cross_platform_name' | 'signal_uuid_dedup' | 'nickname_match' | 'fuzzy_match' | 'identity_merge' | 'email_metadata';
     contacts_linked: string[];
     merged_into?: string;
     merge_evidence?: string;
@@ -166,4 +167,68 @@ export interface MergeSuggestion {
   contacts: Array<{ id: string; platform: string; display_name: string | null; message_count: number }>;
   confidence: number;
   evidence: string;
+}
+
+// --- Relationship Intelligence (Phase 2) ---
+
+export interface RawMetrics {
+  identity_id: string;
+  total_messages: number;
+  sent: number;
+  received: number;
+  dm_messages: number;
+  group_messages: number;
+  platforms: string[];
+  shared_groups: number;
+  last_message_ts: string | null;
+  message_timestamps: string[];       // ISO 8601 timestamps for temporal analysis
+  response_latencies_ms: number[];    // response times in ms for latency scoring
+}
+
+export interface ScoringContext {
+  maxMessages: number;
+  maxSharedGroups: number;
+  maxMedianLatency: number;
+}
+
+export interface ScoringFactor {
+  name: string;
+  compute: (metrics: RawMetrics, context: ScoringContext) => number;  // returns 0-1
+  weight: number;
+}
+
+export interface ScoringConfig {
+  id: string;
+  factors: ScoringFactor[];
+  aggregate: (factorScores: Record<string, number>, factors: ScoringFactor[]) => number;
+}
+
+export type DunbarLayer = 'support_clique' | 'sympathy_group' | 'affinity_group' | 'active_network' | 'acquaintance';
+
+export interface ContactScore {
+  identity_id: string;
+  display_name: string;
+  frequency: number;
+  recency: number;
+  reciprocity: number;
+  channel_diversity: number;
+  dm_ratio: number;
+  structural: number;
+  temporal_regularity: number;
+  response_latency: number;
+  composite: number;
+  dunbar_layer: DunbarLayer;
+  confidence: number;
+  computed_at: string;
+}
+
+export interface FadingRelationship {
+  identity_id: string;
+  display_name: string;
+  dunbar_layer: DunbarLayer;
+  median_interval_days: number;
+  days_since_last: number;
+  silence_ratio: number;            // days_since_last / median_interval_days
+  last_message_ts: string;
+  total_messages: number;
 }

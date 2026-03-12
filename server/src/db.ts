@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
 // @ts-ignore — esbuild text loader inlines CSV as string
@@ -131,6 +131,34 @@ export class MessageDB {
         started_at TEXT,
         completed_at TEXT,
         status TEXT DEFAULT 'pending'
+      );
+
+      CREATE TABLE IF NOT EXISTS contact_scores (
+        identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+        frequency REAL DEFAULT 0,
+        recency REAL DEFAULT 0,
+        reciprocity REAL DEFAULT 0,
+        channel_diversity REAL DEFAULT 0,
+        dm_ratio REAL DEFAULT 0,
+        structural REAL DEFAULT 0,
+        temporal_regularity REAL DEFAULT 0,
+        response_latency REAL DEFAULT 0,
+        composite REAL DEFAULT 0,
+        dunbar_layer TEXT DEFAULT 'acquaintance',
+        confidence REAL DEFAULT 0,
+        computed_at TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE TABLE IF NOT EXISTS tier_overrides (
+        identity_id TEXT PRIMARY KEY REFERENCES identities(id) ON DELETE CASCADE,
+        dunbar_layer TEXT NOT NULL,
+        reason TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS config (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
       );
     `);
 
@@ -373,6 +401,663 @@ export class MessageDB {
     const date_range = range.earliest ? { earliest: range.earliest, latest: range.latest! } : null;
 
     return { total_messages, total_threads, total_contacts, by_platform, date_range };
+  }
+
+  // --- RELATIONSHIP INTELLIGENCE (Phase 2) ---
+
+  /**
+   * Extract raw metrics for ALL identities in batch.
+   * selfSenderIds: the sender_id values belonging to the self identity (e.g. ['telegram:user:123', 'signal:uuid:abc'])
+   */
+  computeRawMetrics(selfSenderIds: string[]): Map<string, RawMetrics> {
+    if (selfSenderIds.length === 0) return new Map();
+
+    const selfPlaceholders = selfSenderIds.map(() => '?').join(',');
+
+    // Step 1: Get all identity → sender_id mappings (excluding self)
+    const allLinks = this.db.prepare(`
+      SELECT identity_id, platform || ':' || platform_id as sender_id, platform
+      FROM identity_links WHERE platform != 'phone'
+    `).all() as Array<{ identity_id: string; sender_id: string; platform: string }>;
+
+    // Build sender_id → identity_id map, and identity → sender_ids map
+    const senderToIdentity = new Map<string, string>();
+    const identitySenders = new Map<string, string[]>();
+    const identityPlatforms = new Map<string, Set<string>>();
+    const selfIdentityId = this.getConfig('self_identity_id');
+
+    for (const link of allLinks) {
+      if (link.identity_id === selfIdentityId) continue; // skip self
+      senderToIdentity.set(link.sender_id, link.identity_id);
+      const senders = identitySenders.get(link.identity_id) ?? [];
+      senders.push(link.sender_id);
+      identitySenders.set(link.identity_id, senders);
+      const platforms = identityPlatforms.get(link.identity_id) ?? new Set();
+      platforms.add(link.platform);
+      identityPlatforms.set(link.identity_id, platforms);
+    }
+
+    // Step 2: Batch query — per-identity message counts with sent/received and DM/group split
+    // Group participant counts for denoising
+    const groupParticipants = new Map<string, number>();
+    const gpRows = this.db.prepare(`
+      SELECT thread_id, COUNT(DISTINCT sender_id) as n
+      FROM messages
+      WHERE thread_id IN (SELECT id FROM threads WHERE thread_type != 'dm')
+      GROUP BY thread_id
+    `).all() as Array<{ thread_id: string; n: number }>;
+    for (const r of gpRows) groupParticipants.set(r.thread_id, r.n);
+
+    // Step 3: Get thread types
+    const threadTypes = new Map<string, string>();
+    const ttRows = this.db.prepare('SELECT id, thread_type FROM threads').all() as Array<{ id: string; thread_type: string }>;
+    for (const r of ttRows) threadTypes.set(r.id, r.thread_type);
+
+    // Step 4: For each identity, compute metrics
+    const metrics = new Map<string, RawMetrics>();
+
+    for (const [identityId, senders] of identitySenders) {
+      const placeholders = senders.map(() => '?').join(',');
+
+      // Messages sent BY this identity
+      const sentRows = this.db.prepare(`
+        SELECT thread_id, COUNT(*) as cnt, MAX(platform_ts) as last_ts
+        FROM messages WHERE sender_id IN (${placeholders})
+        GROUP BY thread_id
+      `).all(...senders) as Array<{ thread_id: string; cnt: number; last_ts: string }>;
+
+      // Messages sent TO this identity (in threads where they participate, sent by self)
+      const receivedRows = this.db.prepare(`
+        SELECT thread_id, COUNT(*) as cnt
+        FROM messages
+        WHERE sender_id IN (${selfPlaceholders})
+          AND thread_id IN (
+            SELECT DISTINCT thread_id FROM messages WHERE sender_id IN (${placeholders})
+          )
+        GROUP BY thread_id
+      `).all(...selfSenderIds, ...senders) as Array<{ thread_id: string; cnt: number }>;
+
+      let totalSent = 0, totalReceived = 0, dmMessages = 0, groupMessages = 0;
+      let lastTs: string | null = null;
+      const sharedGroupIds = new Set<string>();
+
+      for (const r of sentRows) {
+        const type = threadTypes.get(r.thread_id);
+        if (type === 'dm') {
+          dmMessages += r.cnt;
+          totalSent += r.cnt;
+        } else {
+          // Group denoising: weight = 1/N
+          const n = groupParticipants.get(r.thread_id) ?? 1;
+          const weighted = r.cnt / n;
+          groupMessages += weighted;
+          totalSent += weighted;
+          sharedGroupIds.add(r.thread_id);
+        }
+        if (!lastTs || r.last_ts > lastTs) lastTs = r.last_ts;
+      }
+
+      for (const r of receivedRows) {
+        const type = threadTypes.get(r.thread_id);
+        if (type === 'dm') {
+          totalReceived += r.cnt;
+        } else {
+          const n = groupParticipants.get(r.thread_id) ?? 1;
+          totalReceived += r.cnt / n;
+        }
+      }
+
+      const totalMessages = totalSent + totalReceived;
+      if (totalMessages < 1) continue; // skip zero-activity identities
+
+      // Step 5: Message timestamps for temporal analysis
+      const tsRows = this.db.prepare(`
+        SELECT platform_ts FROM messages
+        WHERE sender_id IN (${placeholders})
+           OR (sender_id IN (${selfPlaceholders}) AND thread_id IN (
+             SELECT DISTINCT thread_id FROM messages WHERE sender_id IN (${placeholders})
+             INTERSECT SELECT id FROM threads WHERE thread_type = 'dm'
+           ))
+        ORDER BY platform_ts
+      `).all(...senders, ...selfSenderIds, ...senders) as Array<{ platform_ts: string }>;
+
+      // Step 6: Response latency in DM threads
+      // Use sender alternation: when self sends after other or other sends after self
+      const latencies: number[] = [];
+      const dmThreadIds = this.db.prepare(`
+        SELECT DISTINCT thread_id FROM messages
+        WHERE sender_id IN (${placeholders})
+          AND thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')
+      `).all(...senders) as Array<{ thread_id: string }>;
+
+      for (const { thread_id } of dmThreadIds) {
+        const turns = this.db.prepare(`
+          SELECT sender_id, platform_ts FROM messages
+          WHERE thread_id = ? AND (sender_id IN (${placeholders}) OR sender_id IN (${selfPlaceholders}))
+          ORDER BY platform_ts
+        `).all(thread_id, ...senders, ...selfSenderIds) as Array<{ sender_id: string; platform_ts: string }>;
+
+        const selfSet = new Set(selfSenderIds);
+        for (let i = 1; i < turns.length; i++) {
+          const prev = turns[i - 1];
+          const curr = turns[i];
+          const prevIsSelf = selfSet.has(prev.sender_id);
+          const currIsSelf = selfSet.has(curr.sender_id);
+          // Only measure when sender switches (a response)
+          if (prevIsSelf !== currIsSelf) {
+            const dt = new Date(curr.platform_ts).getTime() - new Date(prev.platform_ts).getTime();
+            if (dt > 0 && dt < 7 * 24 * 60 * 60 * 1000) { // cap at 7 days
+              latencies.push(dt);
+            }
+          }
+        }
+      }
+
+      metrics.set(identityId, {
+        identity_id: identityId,
+        total_messages: totalMessages,
+        sent: totalSent,
+        received: totalReceived,
+        dm_messages: dmMessages,
+        group_messages: groupMessages,
+        platforms: [...(identityPlatforms.get(identityId) ?? [])],
+        shared_groups: sharedGroupIds.size,
+        last_message_ts: lastTs,
+        message_timestamps: tsRows.map(r => r.platform_ts),
+        response_latencies_ms: latencies,
+      });
+    }
+
+    return metrics;
+  }
+
+  // --- SCORING FUNCTIONS ---
+
+  private static defaultScoringFactors(): ScoringFactor[] {
+    return [
+      {
+        name: 'recency',
+        weight: 0.23,
+        compute: (m: RawMetrics) => {
+          if (!m.last_message_ts) return 0;
+          const daysSince = (Date.now() - new Date(m.last_message_ts).getTime()) / (1000 * 60 * 60 * 24);
+          return Math.exp(-Math.LN2 / 30 * daysSince); // half-life 30 days
+        },
+      },
+      {
+        name: 'frequency',
+        weight: 0.15,
+        compute: (m: RawMetrics, ctx: ScoringContext) => {
+          if (ctx.maxMessages <= 1) return 0;
+          return Math.log(1 + m.total_messages) / Math.log(1 + ctx.maxMessages);
+        },
+      },
+      {
+        name: 'reciprocity',
+        weight: 0.18,
+        compute: (m: RawMetrics) => {
+          if (m.sent === 0 || m.received === 0) return 0;
+          return Math.min(m.sent, m.received) / Math.max(m.sent, m.received);
+        },
+      },
+      {
+        name: 'dm_ratio',
+        weight: 0.15,
+        compute: (m: RawMetrics) => {
+          const total = m.dm_messages + m.group_messages;
+          if (total === 0) return 0;
+          return m.dm_messages / total;
+        },
+      },
+      {
+        name: 'channel_diversity',
+        weight: 0.10,
+        compute: (m: RawMetrics) => {
+          const n = m.platforms.length;
+          if (n >= 3) return 1.0;
+          if (n === 2) return 0.67;
+          return 0.33;
+        },
+      },
+      {
+        name: 'temporal_regularity',
+        weight: 0.01,
+        compute: (m: RawMetrics) => {
+          if (m.message_timestamps.length < 3) return 0;
+          const times = m.message_timestamps.map(t => new Date(t).getTime());
+          const intervals: number[] = [];
+          for (let i = 1; i < times.length; i++) intervals.push(times[i] - times[i - 1]);
+          const mean = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+          if (mean === 0) return 0;
+          const variance = intervals.reduce((sum, v) => sum + (v - mean) ** 2, 0) / intervals.length;
+          const cv = Math.sqrt(variance) / mean; // coefficient of variation
+          return 1 / (1 + cv); // gentler decay — moderately regular contacts get partial credit
+        },
+      },
+      {
+        name: 'response_latency',
+        weight: 0.13,
+        compute: (m: RawMetrics, ctx: ScoringContext) => {
+          if (m.response_latencies_ms.length === 0) return 0;
+          const sorted = [...m.response_latencies_ms].sort((a, b) => a - b);
+          const median = sorted[Math.floor(sorted.length / 2)];
+          if (ctx.maxMedianLatency <= 0) return 0;
+          return Math.max(0, 1 - median / ctx.maxMedianLatency); // fast response = high score
+        },
+      },
+      {
+        name: 'structural',
+        weight: 0.05,
+        compute: (m: RawMetrics, ctx: ScoringContext) => {
+          if (ctx.maxSharedGroups <= 0) return 0;
+          return m.shared_groups / ctx.maxSharedGroups;
+        },
+      },
+    ];
+  }
+
+  private static defaultScoringConfig(): ScoringConfig {
+    const factors = MessageDB.defaultScoringFactors();
+    return {
+      id: 'v1-weighted-sum',
+      factors,
+      aggregate: (scores, facs) => {
+        let total = 0;
+        for (const f of facs) total += (scores[f.name] ?? 0) * f.weight;
+        return total;
+      },
+    };
+  }
+
+  private static computeConfidence(m: RawMetrics): number {
+    let score = 0;
+    if (m.total_messages >= 10) score += 0.3;
+    else if (m.total_messages >= 3) score += 0.15;
+    if (m.platforms.length >= 2) score += 0.2;
+    if (m.message_timestamps.length >= 10) score += 0.2;
+    if (m.response_latencies_ms.length >= 5) score += 0.15;
+    if (m.sent > 0 && m.received > 0) score += 0.15;
+    return Math.min(1, score);
+  }
+
+  // --- DUNBAR LAYER DETECTION ---
+
+  /**
+   * Jenks natural breaks — 1D clustering that minimizes within-class variance.
+   * Returns k-1 breakpoints. Values below breaks[0] → class 0, etc.
+   */
+  static jenksBreaks(values: number[], k: number): number[] {
+    const sorted = [...values].sort((a, b) => a - b);
+    const n = sorted.length;
+    if (n <= k) return sorted.slice(0, -1); // degenerate: each value is its own class
+
+    // Fisher-Jenks algorithm using dynamic programming
+    const lowerClassLimits = Array.from({ length: n + 1 }, () => new Float64Array(k + 1));
+    const varianceCombinations = Array.from({ length: n + 1 }, () => {
+      const arr = new Float64Array(k + 1);
+      arr.fill(Infinity);
+      return arr;
+    });
+
+    for (let i = 1; i <= k; i++) {
+      lowerClassLimits[1][i] = 1;
+      varianceCombinations[1][i] = 0;
+    }
+
+    for (let l = 2; l <= n; l++) {
+      let sum = 0, sumSq = 0;
+      for (let m = 1; m <= l; m++) {
+        const idx = l - m; // 0-based index into sorted
+        const val = sorted[idx];
+        sum += val;
+        sumSq += val * val;
+        const variance = sumSq - (sum * sum) / m;
+        if (idx > 0) {
+          for (let j = 2; j <= k; j++) {
+            const candidate = variance + varianceCombinations[l - m][j - 1];
+            if (candidate < varianceCombinations[l][j]) {
+              lowerClassLimits[l][j] = l - m + 1;
+              varianceCombinations[l][j] = candidate;
+            }
+          }
+        }
+      }
+      lowerClassLimits[l][1] = 1;
+      varianceCombinations[l][1] = sumSq - (sum * sum) / l;
+    }
+
+    // Extract breakpoints
+    const breaks: number[] = [];
+    let kk = n;
+    for (let j = k; j >= 2; j--) {
+      const idx = lowerClassLimits[kk][j] - 1; // 0-based
+      if (idx >= 0 && idx < sorted.length) {
+        breaks.unshift(sorted[idx]);
+      }
+      kk = lowerClassLimits[kk][j] - 1;
+    }
+
+    return breaks;
+  }
+
+  private static assignLayer(composite: number, breaks: number[]): DunbarLayer {
+    const layers: DunbarLayer[] = ['acquaintance', 'active_network', 'affinity_group', 'sympathy_group', 'support_clique'];
+    if (breaks.length < 4) {
+      // Fallback to percentile binning
+      // Can't classify well, default to acquaintance
+      return 'acquaintance';
+    }
+    for (let i = breaks.length - 1; i >= 0; i--) {
+      if (composite >= breaks[i]) return layers[Math.min(i + 1, layers.length - 1)];
+    }
+    return 'acquaintance';
+  }
+
+  // --- SILENCE DETECTION ---
+
+  getFadingRelationships(threshold = 8, minLayer?: DunbarLayer): FadingRelationship[] {
+    const layerOrder: DunbarLayer[] = ['support_clique', 'sympathy_group', 'affinity_group', 'active_network', 'acquaintance'];
+    const minLayerIdx = minLayer ? layerOrder.indexOf(minLayer) : layerOrder.length - 1;
+
+    const rows = this.db.prepare(`
+      SELECT cs.identity_id, i.display_name, cs.dunbar_layer, cs.composite
+      FROM contact_scores cs
+      JOIN identities i ON i.id = cs.identity_id
+      WHERE cs.composite > 0
+      ORDER BY cs.composite DESC
+    `).all() as Array<{ identity_id: string; display_name: string; dunbar_layer: string; composite: number }>;
+
+    const results: FadingRelationship[] = [];
+
+    for (const row of rows) {
+      const layer = row.dunbar_layer as DunbarLayer;
+      const layerIdx = layerOrder.indexOf(layer);
+      if (layerIdx > minLayerIdx) continue;
+
+      // Get sender IDs for this identity
+      const senders = this.db.prepare(
+        "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+      ).all(row.identity_id) as Array<{ sender_id: string }>;
+      if (senders.length === 0) continue;
+
+      const placeholders = senders.map(() => '?').join(',');
+      const senderIds = senders.map(s => s.sender_id);
+
+      // Get message timestamps — both sides of the conversation in DM threads
+      const selfId = this.getConfig('self_identity_id');
+      const selfLinks = selfId ? this.db.prepare(
+        "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+      ).all(selfId) as Array<{ sender_id: string }> : [];
+      const selfSenderIds = selfLinks.map(s => s.sender_id);
+      const selfPlaceholders = selfSenderIds.map(() => '?').join(',');
+
+      const tsRows = this.db.prepare(`
+        SELECT platform_ts FROM messages
+        WHERE sender_id IN (${placeholders})
+        ${selfSenderIds.length > 0 ? `
+          OR (sender_id IN (${selfPlaceholders}) AND thread_id IN (
+            SELECT DISTINCT thread_id FROM messages WHERE sender_id IN (${placeholders})
+            INTERSECT SELECT id FROM threads WHERE thread_type = 'dm'
+          ))
+        ` : ''}
+        ORDER BY platform_ts
+      `).all(...senderIds, ...(selfSenderIds.length > 0 ? [...selfSenderIds, ...senderIds] : [])) as Array<{ platform_ts: string }>;
+
+      if (tsRows.length < 3) continue;
+
+      const times = tsRows.map(r => new Date(r.platform_ts).getTime());
+      const intervals: number[] = [];
+      for (let i = 1; i < times.length; i++) intervals.push(times[i] - times[i - 1]);
+
+      // Median interval
+      const sorted = [...intervals].sort((a, b) => a - b);
+      const medianMs = sorted[Math.floor(sorted.length / 2)];
+      const medianDays = medianMs / (1000 * 60 * 60 * 24);
+      if (medianDays < 0.1) continue; // less than ~2.4 hours typical interval — too noisy
+
+      const lastTs = tsRows[tsRows.length - 1].platform_ts;
+      const daysSinceLast = (Date.now() - new Date(lastTs).getTime()) / (1000 * 60 * 60 * 24);
+      const silenceRatio = daysSinceLast / medianDays;
+
+      if (silenceRatio >= threshold) {
+        results.push({
+          identity_id: row.identity_id,
+          display_name: row.display_name,
+          dunbar_layer: layer,
+          median_interval_days: Math.round(medianDays * 10) / 10,
+          days_since_last: Math.round(daysSinceLast * 10) / 10,
+          silence_ratio: Math.round(silenceRatio * 10) / 10,
+          last_message_ts: lastTs,
+          total_messages: tsRows.length,
+        });
+      }
+    }
+
+    // Sort: inner circle first, then by silence_ratio descending
+    results.sort((a, b) => {
+      const aIdx = layerOrder.indexOf(a.dunbar_layer);
+      const bIdx = layerOrder.indexOf(b.dunbar_layer);
+      if (aIdx !== bIdx) return aIdx - bIdx;
+      return b.silence_ratio - a.silence_ratio;
+    });
+
+    return results;
+  }
+
+  // --- BATCH SCORING ORCHESTRATOR ---
+
+  computeAllScores(config?: ScoringConfig): { computed: number; duration_ms: number } {
+    const start = Date.now();
+    const selfId = this.getConfig('self_identity_id');
+    if (!selfId) throw new Error('self_identity_id not set in config. Call setConfig("self_identity_id", "<id>") first.');
+
+    // Get self sender IDs
+    const selfLinks = this.db.prepare(
+      "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+    ).all(selfId) as Array<{ sender_id: string }>;
+    const selfSenderIds = selfLinks.map(l => l.sender_id);
+    if (selfSenderIds.length === 0) throw new Error('Self identity has no platform links');
+
+    // Get display names
+    const nameMap = new Map<string, string>();
+    const nameRows = this.db.prepare('SELECT id, display_name FROM identities').all() as Array<{ id: string; display_name: string }>;
+    for (const r of nameRows) nameMap.set(r.id, r.display_name);
+
+    // Compute raw metrics
+    const rawMetrics = this.computeRawMetrics(selfSenderIds);
+
+    // Build scoring context from dataset maximums
+    const scoringConfig = config ?? MessageDB.defaultScoringConfig();
+    let maxMessages = 0, maxSharedGroups = 0;
+    const medianLatencies: number[] = [];
+
+    for (const m of rawMetrics.values()) {
+      if (m.total_messages > maxMessages) maxMessages = m.total_messages;
+      if (m.shared_groups > maxSharedGroups) maxSharedGroups = m.shared_groups;
+      if (m.response_latencies_ms.length > 0) {
+        const sorted = [...m.response_latencies_ms].sort((a, b) => a - b);
+        medianLatencies.push(sorted[Math.floor(sorted.length / 2)]);
+      }
+    }
+
+    const ctx: ScoringContext = {
+      maxMessages,
+      maxSharedGroups,
+      maxMedianLatency: medianLatencies.length > 0 ? Math.max(...medianLatencies) : 1,
+    };
+
+    // Score each identity
+    const scores: ContactScore[] = [];
+    const now = new Date().toISOString();
+
+    for (const [identityId, m] of rawMetrics) {
+      const factorScores: Record<string, number> = {};
+      for (const factor of scoringConfig.factors) {
+        factorScores[factor.name] = factor.compute(m, ctx);
+      }
+      const composite = scoringConfig.aggregate(factorScores, scoringConfig.factors);
+      const confidence = MessageDB.computeConfidence(m);
+
+      scores.push({
+        identity_id: identityId,
+        display_name: nameMap.get(identityId) ?? identityId,
+        frequency: factorScores['frequency'] ?? 0,
+        recency: factorScores['recency'] ?? 0,
+        reciprocity: factorScores['reciprocity'] ?? 0,
+        channel_diversity: factorScores['channel_diversity'] ?? 0,
+        dm_ratio: factorScores['dm_ratio'] ?? 0,
+        structural: factorScores['structural'] ?? 0,
+        temporal_regularity: factorScores['temporal_regularity'] ?? 0,
+        response_latency: factorScores['response_latency'] ?? 0,
+        composite,
+        dunbar_layer: 'acquaintance', // assigned next
+        confidence,
+        computed_at: now,
+      });
+    }
+
+    // Assign Dunbar layers via Jenks natural breaks
+    if (scores.length >= 5) {
+      const composites = scores.map(s => s.composite);
+      const rawBreaks = MessageDB.jenksBreaks(composites, 5);
+      // Deduplicate breakpoints — duplicate values collapse layers
+      const breaks = [...new Set(rawBreaks)].sort((a, b) => a - b);
+      if (breaks.length >= 4) {
+        for (const s of scores) {
+          s.dunbar_layer = MessageDB.assignLayer(s.composite, breaks);
+        }
+      } else {
+        // Fallback: percentile binning (ascending order)
+        const sorted = [...composites].sort((a, b) => a - b);
+        const pcts = [0.25, 0.5, 0.75, 0.9];
+        const fallbackBreaks = pcts.map(p => sorted[Math.floor(sorted.length * p)]);
+        for (const s of scores) {
+          s.dunbar_layer = MessageDB.assignLayer(s.composite, fallbackBreaks);
+        }
+      }
+    }
+
+    // Apply tier overrides
+    const overrides = this.getTierOverrides();
+    for (const s of scores) {
+      const override = overrides.get(s.identity_id);
+      if (override) s.dunbar_layer = override;
+    }
+
+    // Write to DB in a single transaction
+    const upsert = this.db.prepare(`
+      INSERT OR REPLACE INTO contact_scores
+        (identity_id, frequency, recency, reciprocity, channel_diversity, dm_ratio,
+         structural, temporal_regularity, response_latency, composite, dunbar_layer, confidence, computed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    this.db.transaction(() => {
+      for (const s of scores) {
+        upsert.run(
+          s.identity_id, s.frequency, s.recency, s.reciprocity, s.channel_diversity,
+          s.dm_ratio, s.structural, s.temporal_regularity, s.response_latency,
+          s.composite, s.dunbar_layer, s.confidence, s.computed_at,
+        );
+      }
+    })();
+
+    return { computed: scores.length, duration_ms: Date.now() - start };
+  }
+
+  // --- SCORE QUERIES ---
+
+  getContactScore(identityId: string): ContactScore | null {
+    const row = this.db.prepare(`
+      SELECT cs.*, i.display_name
+      FROM contact_scores cs
+      JOIN identities i ON i.id = cs.identity_id
+      WHERE cs.identity_id = ?
+    `).get(identityId) as (Record<string, unknown>) | undefined;
+    if (!row) return null;
+    return {
+      identity_id: row.identity_id as string,
+      display_name: row.display_name as string,
+      frequency: row.frequency as number,
+      recency: row.recency as number,
+      reciprocity: row.reciprocity as number,
+      channel_diversity: row.channel_diversity as number,
+      dm_ratio: row.dm_ratio as number,
+      structural: row.structural as number,
+      temporal_regularity: row.temporal_regularity as number,
+      response_latency: row.response_latency as number,
+      composite: row.composite as number,
+      dunbar_layer: row.dunbar_layer as DunbarLayer,
+      confidence: row.confidence as number,
+      computed_at: row.computed_at as string,
+    };
+  }
+
+  getInnerCircle(layer?: DunbarLayer, limit = 50): ContactScore[] {
+    let sql: string;
+    let params: unknown[];
+
+    if (layer) {
+      sql = `
+        SELECT cs.*, i.display_name FROM contact_scores cs
+        JOIN identities i ON i.id = cs.identity_id
+        WHERE cs.dunbar_layer = ?
+        ORDER BY cs.composite DESC LIMIT ?
+      `;
+      params = [layer, limit];
+    } else {
+      sql = `
+        SELECT cs.*, i.display_name FROM contact_scores cs
+        JOIN identities i ON i.id = cs.identity_id
+        ORDER BY cs.composite DESC LIMIT ?
+      `;
+      params = [limit];
+    }
+
+    const rows = this.db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+    return rows.map(row => ({
+      identity_id: row.identity_id as string,
+      display_name: row.display_name as string,
+      frequency: row.frequency as number,
+      recency: row.recency as number,
+      reciprocity: row.reciprocity as number,
+      channel_diversity: row.channel_diversity as number,
+      dm_ratio: row.dm_ratio as number,
+      structural: row.structural as number,
+      temporal_regularity: row.temporal_regularity as number,
+      response_latency: row.response_latency as number,
+      composite: row.composite as number,
+      dunbar_layer: row.dunbar_layer as DunbarLayer,
+      confidence: row.confidence as number,
+      computed_at: row.computed_at as string,
+    }));
+  }
+
+  // --- CONFIG ---
+
+  getConfig(key: string): string | null {
+    const row = this.db.prepare('SELECT value FROM config WHERE key = ?').get(key) as { value: string } | undefined;
+    return row?.value ?? null;
+  }
+
+  setConfig(key: string, value: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run(key, value);
+  }
+
+  // --- TIER OVERRIDES ---
+
+  setTierOverride(identityId: string, layer: DunbarLayer, reason?: string): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO tier_overrides (identity_id, dunbar_layer, reason, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(identityId, layer, reason ?? null, new Date().toISOString());
+    // Also update contact_scores if it exists
+    this.db.prepare('UPDATE contact_scores SET dunbar_layer = ? WHERE identity_id = ?').run(layer, identityId);
+  }
+
+  getTierOverrides(): Map<string, DunbarLayer> {
+    const rows = this.db.prepare('SELECT identity_id, dunbar_layer FROM tier_overrides').all() as Array<{ identity_id: string; dunbar_layer: string }>;
+    return new Map(rows.map(r => [r.identity_id, r.dunbar_layer as DunbarLayer]));
   }
 
   close(): void {
@@ -846,6 +1531,20 @@ export class MessageDB {
       }
     }
 
+    // Path 3: Slack email metadata matching — if contact has email in metadata,
+    // check if an email-platform contact with that address exists and is linked
+    if (contact.metadata?.email && typeof contact.metadata.email === 'string') {
+      const emailAddr = (contact.metadata.email as string).toLowerCase();
+      const emailLink = this.db.prepare(
+        "SELECT il.identity_id FROM identity_links il WHERE il.platform = 'email' AND il.platform_id = ?"
+      ).get(`user:${emailAddr}`) as { identity_id: string } | undefined;
+      if (emailLink) {
+        this.linkContact(emailLink.identity_id, platform, platformId, 0.9, 'metadata_email_match',
+          contact.display_name ?? undefined, contact.username ?? undefined);
+        return { linked: true, identity_id: emailLink.identity_id };
+      }
+    }
+
     return { linked: false };
   }
 
@@ -944,6 +1643,7 @@ export class MessageDB {
       nickname_matches: 0,
       fuzzy_matches: 0,
       identity_merges: 0,
+      email_metadata_matches: 0,
       skipped_already_linked: 0,
       details: [],
     };
@@ -1186,6 +1886,44 @@ export class MessageDB {
           report.cross_platform_name_matches++;
           report.details.push({ identity_id: identityId, action: 'cross_platform_name', contacts_linked: linkedContacts });
         }
+      }
+
+      // Pass 4b: Email metadata cross-linking
+      // Slack (and other) contacts store email in metadata.email — match against email-platform contacts
+      const metadataEmailContacts = this.db.prepare(`
+        SELECT c.* FROM contacts c
+        LEFT JOIN identity_links il
+          ON il.platform = c.platform AND il.platform_id = SUBSTR(c.id, LENGTH(c.platform) + 2)
+        WHERE il.id IS NULL
+          AND json_extract(c.metadata, '$.email') IS NOT NULL
+      `).all() as Record<string, unknown>[];
+
+      for (const row of metadataEmailContacts) {
+        const contact = this.parseContact(row);
+        const email = (contact.metadata as Record<string, unknown>)?.email;
+        if (!email || typeof email !== 'string') continue;
+
+        const emailAddr = email.toLowerCase();
+        const firstColon = contact.id.indexOf(':');
+        const platform = contact.id.substring(0, firstColon);
+        const platformId = contact.id.substring(firstColon + 1);
+
+        // Check if an email-platform contact with this address is already linked
+        const emailLink = this.db.prepare(
+          "SELECT il.identity_id FROM identity_links il WHERE il.platform = 'email' AND il.platform_id = ?"
+        ).get(`user:${emailAddr}`) as { identity_id: string } | undefined;
+
+        if (emailLink) {
+          this.linkContact(emailLink.identity_id, platform, platformId, 0.9, 'metadata_email_match',
+            contact.display_name ?? undefined, contact.username ?? undefined);
+          report.email_metadata_matches++;
+          report.links_created++;
+          report.details.push({ identity_id: emailLink.identity_id, action: 'email_metadata', contacts_linked: [contact.id] });
+          continue;
+        }
+
+        // Check if another unlinked contact shares this metadata email — group them
+        // (handled implicitly by tryAutoLink on next sync; autoResolve focuses on existing identities)
       }
 
       // Pass 5: Signal UUID deduplication
