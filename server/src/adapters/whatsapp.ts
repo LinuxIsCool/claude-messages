@@ -173,7 +173,7 @@ export class WhatsAppAdapter implements Adapter {
       generateHighQualityLinkPreview: false,
       logger: logger as any,
       markOnlineOnConnect: false,  // Don't broadcast daemon presence to contacts
-      syncFullHistory: false,
+      syncFullHistory: true,  // Request full history push from WhatsApp servers
       connectTimeoutMs: CONNECTION_TIMEOUT_MS,
       defaultQueryTimeoutMs: CONNECTION_TIMEOUT_MS,
       keepAliveIntervalMs: KEEPALIVE_INTERVAL_MS,

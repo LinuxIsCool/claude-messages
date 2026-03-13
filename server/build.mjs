@@ -29,6 +29,12 @@ await Promise.all([
     outfile: 'build/backfill.mjs',
     banner: { js: "// claude-messages Telegram backfill — bundled with esbuild" },
   }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/import-whatsapp-export.ts'],
+    outfile: 'build/import-whatsapp-export.mjs',
+    banner: { js: "// WhatsApp chat export importer — bundled with esbuild" },
+  }),
 ]);
 
-console.log('Built daemon.mjs, mcp.mjs, and backfill.mjs');
+console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, and import-whatsapp-export.mjs');
