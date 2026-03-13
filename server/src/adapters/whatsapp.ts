@@ -33,12 +33,14 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30000;
 const CONNECTION_TIMEOUT_MS = 60000;
 const KEEPALIVE_INTERVAL_MS = 25000;
+/** Safety cap on buffer size — prevents unbounded growth during extended auth failures */
+const MAX_BUFFER_SIZE = 50000;
 
 // --- Cursor ---
 
 interface WhatsAppCursor {
-  lastMessageTs: string;  // ISO 8601, newest message yielded
-  totalSynced: number;    // diagnostic counter
+  lastMessageTs: string;    // ISO 8601, newest message yielded
+  totalMessages: number;    // diagnostic counter — messages only (not contacts/threads)
 }
 
 // --- Helpers ---
@@ -80,7 +82,8 @@ function getContentType(msg: proto.IMessage | null | undefined): Message['conten
   if (msg.conversation || msg.extendedTextMessage) return 'text';
   if (msg.imageMessage) return 'photo';
   if (msg.videoMessage) return 'video';
-  if (msg.audioMessage) return 'voice';
+  // ptt=true is a voice note; ptt=false is an audio file share (treat as document)
+  if (msg.audioMessage) return msg.audioMessage.ptt ? 'voice' : 'document';
   if (msg.documentMessage) return 'document';
   if (msg.stickerMessage) return 'sticker';
   return 'other';
@@ -109,7 +112,7 @@ export class WhatsAppAdapter implements Adapter {
 
   private socket: WASocket | null = null;
   private buffer: SyncEvent[] = [];
-  private currentCursor: WhatsAppCursor = { lastMessageTs: '', totalSynced: 0 };
+  private currentCursor: WhatsAppCursor = { lastMessageTs: '', totalMessages: 0 };
   private authenticated = false;
   private reconnectAttempts = 0;
   private intentionalDisconnect = false;
@@ -136,8 +139,9 @@ export class WhatsAppAdapter implements Adapter {
    * Safe to call multiple times — old socket is cleaned up first.
    */
   private async connectSocket(): Promise<void> {
-    // Clean up old socket if any
+    // Clean up old socket — remove listeners first to stop in-flight events writing creds
     if (this.socket) {
+      try { this.socket.ev.removeAllListeners(); } catch { /* ignore */ }
       try { this.socket.end(undefined); } catch { /* ignore */ }
       this.socket = null;
     }
@@ -168,7 +172,7 @@ export class WhatsAppAdapter implements Adapter {
       },
       generateHighQualityLinkPreview: false,
       logger: logger as any,
-      markOnlineOnConnect: true,
+      markOnlineOnConnect: false,  // Don't broadcast daemon presence to contacts
       syncFullHistory: false,
       connectTimeoutMs: CONNECTION_TIMEOUT_MS,
       defaultQueryTimeoutMs: CONNECTION_TIMEOUT_MS,
@@ -248,16 +252,16 @@ export class WhatsAppAdapter implements Adapter {
 
       for (const contact of contacts) {
         if (!contact.id) continue;
-        this.buffer.push({ type: 'contact', data: this.transformContact(contact, now) });
+        this.pushToBuffer({ type: 'contact', data: this.transformContact(contact, now) });
       }
       for (const chat of chats) {
         if (!chat.id) continue;
-        this.buffer.push({ type: 'thread', data: this.transformChat(chat, now) });
+        this.pushToBuffer({ type: 'thread', data: this.transformChat(chat, now) });
       }
       for (const msg of messages) {
         if (!msg.message || !msg.key?.remoteJid) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
-        this.buffer.push({ type: 'message', data: this.transformMessage(msg, now) });
+        this.pushToBuffer({ type: 'message', data: this.transformMessage(msg, now) });
       }
     });
 
@@ -267,7 +271,7 @@ export class WhatsAppAdapter implements Adapter {
       for (const msg of messages) {
         if (!msg.message || !msg.key?.remoteJid) continue;
         if (msg.key.remoteJid === 'status@broadcast') continue;
-        this.buffer.push({ type: 'message', data: this.transformMessage(msg, now) });
+        this.pushToBuffer({ type: 'message', data: this.transformMessage(msg, now) });
       }
       if (messages.length > 0) {
         this.log(`Buffered ${messages.length} messages (${type})`);
@@ -279,7 +283,7 @@ export class WhatsAppAdapter implements Adapter {
       const now = new Date().toISOString();
       for (const chat of chats) {
         if (!chat.id) continue;
-        this.buffer.push({ type: 'thread', data: this.transformChat(chat, now) });
+        this.pushToBuffer({ type: 'thread', data: this.transformChat(chat, now) });
       }
     });
 
@@ -288,7 +292,7 @@ export class WhatsAppAdapter implements Adapter {
       const now = new Date().toISOString();
       for (const contact of contacts) {
         if (!contact.id) continue;
-        this.buffer.push({ type: 'contact', data: this.transformContact(contact, now) });
+        this.pushToBuffer({ type: 'contact', data: this.transformContact(contact, now) });
       }
     });
 
@@ -310,11 +314,12 @@ export class WhatsAppAdapter implements Adapter {
 
     const cursor: WhatsAppCursor = cursorStr
       ? JSON.parse(cursorStr)
-      : { lastMessageTs: '', totalSynced: 0 };
+      : { lastMessageTs: '', totalMessages: 0 };
 
     // Drain buffer
     const events = this.buffer.splice(0);
     let yielded = 0;
+    let msgCount = 0;
     let newestTs = cursor.lastMessageTs;
 
     for (const event of events) {
@@ -328,6 +333,7 @@ export class WhatsAppAdapter implements Adapter {
       yielded++;
 
       if (event.type === 'message') {
+        msgCount++;
         const msg = event.data as Message;
         if (msg.platform_ts > newestTs) newestTs = msg.platform_ts;
       }
@@ -335,12 +341,21 @@ export class WhatsAppAdapter implements Adapter {
 
     this.currentCursor = {
       lastMessageTs: newestTs || cursor.lastMessageTs,
-      totalSynced: cursor.totalSynced + yielded,
+      totalMessages: cursor.totalMessages + msgCount,
     };
 
     if (yielded > 0) {
       this.log(`Drained ${yielded} events (${events.length - yielded} deduped)`);
     }
+  }
+
+  /** Push to buffer with size cap to prevent unbounded growth during auth failures */
+  private pushToBuffer(event: SyncEvent): void {
+    if (this.buffer.length >= MAX_BUFFER_SIZE) {
+      this.log(`Buffer cap (${MAX_BUFFER_SIZE}) reached — dropping oldest event`);
+      this.buffer.shift();
+    }
+    this.buffer.push(event);
   }
 
   getCursor(): string | null {
@@ -409,7 +424,13 @@ export class WhatsAppAdapter implements Adapter {
     }
 
     let replyTo: string | null = null;
-    const contextInfo = msgContent?.extendedTextMessage?.contextInfo;
+    // contextInfo exists on all message types that can be replies
+    const contextInfo = msgContent?.extendedTextMessage?.contextInfo
+      ?? msgContent?.imageMessage?.contextInfo
+      ?? msgContent?.videoMessage?.contextInfo
+      ?? msgContent?.audioMessage?.contextInfo
+      ?? msgContent?.documentMessage?.contextInfo
+      ?? msgContent?.stickerMessage?.contextInfo;
     if (contextInfo?.stanzaId) {
       replyTo = messageId(chatJid, contextInfo.stanzaId);
     }
@@ -425,11 +446,16 @@ export class WhatsAppAdapter implements Adapter {
 
     const ts = msg.messageTimestamp;
     let platformTs: string;
-    if (typeof ts === 'number') {
+    if (typeof ts === 'number' && ts > 0) {
       platformTs = new Date(ts * 1000).toISOString();
-    } else if (typeof ts === 'object' && ts !== null && 'low' in ts) {
-      platformTs = new Date(Number(ts) * 1000).toISOString();
+    } else if (ts !== null && ts !== undefined && typeof ts === 'object' && 'toNumber' in ts) {
+      // Protobuf Long — use .toNumber() (handles high+low 32-bit words correctly)
+      const n = (ts as { toNumber(): number }).toNumber();
+      platformTs = n > 0 ? new Date(n * 1000).toISOString() : now;
+      if (n <= 0) this.log(`warn: missing timestamp on message ${key.id}`);
     } else {
+      // Unknown type — log and fall back to sync time (affects dedup; prefer explicit warning)
+      this.log(`warn: unknown timestamp type for message ${key.id}, using sync time`);
       platformTs = now;
     }
 
