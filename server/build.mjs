@@ -5,7 +5,7 @@ const common = {
   platform: 'node',
   target: 'node20',
   format: 'esm',
-  external: ['better-sqlite3', 'telegram', 'yaml', 'imapflow', 'mailparser', '@slack/web-api', '@slack/socket-mode'],
+  external: ['better-sqlite3', 'telegram', 'yaml', 'imapflow', 'mailparser', '@slack/web-api', '@slack/socket-mode', '@whiskeysockets/baileys', 'qrcode-terminal'],
   sourcemap: true,
   loader: { '.csv': 'text' },
 };

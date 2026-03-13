@@ -7,6 +7,7 @@ import { TelegramAdapter } from './adapters/telegram.js';
 import { SignalAdapter } from './adapters/signal.js';
 import { EmailAdapter } from './adapters/email.js';
 import { SlackAdapter } from './adapters/slack.js';
+import { WhatsAppAdapter } from './adapters/whatsapp.js';
 import type { Adapter } from './adapters/base.js';
 import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent } from './types.js';
 
@@ -99,6 +100,17 @@ class Daemon {
         } catch (err) {
           this.log(`Slack adapter failed for ${ws.id}: ${err}`);
         }
+      }
+    }
+
+    if (adapterConfigs.whatsapp?.enabled) {
+      try {
+        const adapter = new WhatsAppAdapter((msg) => this.log(msg));
+        await adapter.init({ ...adapterConfigs.whatsapp, data_dir: dataDir } as AdapterConfig);
+        this.adapters.push(adapter);
+        this.log('WhatsApp adapter initialized');
+      } catch (err) {
+        this.log(`WhatsApp adapter failed to initialize: ${err}`);
       }
     }
 
