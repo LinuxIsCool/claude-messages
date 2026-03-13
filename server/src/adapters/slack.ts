@@ -302,12 +302,11 @@ export class SlackAdapter implements Adapter {
 
   private *syncContacts(now: string): Generator<SyncEvent> {
     for (const user of this.userCache.values()) {
-      if (user.deleted) continue;
-
       const metadata: Record<string, unknown> = {};
       if (user.profile?.email) metadata.email = user.profile.email;
       if (user.profile?.image_72) metadata.avatar = user.profile.image_72;
       if (user.is_bot) metadata.is_bot = true;
+      if (user.deleted) metadata.deactivated = true;
 
       const idSuffix = user.is_bot ? `bot:${user.id}` : `user:${user.id}`;
 
@@ -457,15 +456,33 @@ export class SlackAdapter implements Adapter {
 
         // Lazy-resolve unknown users (joined after init, deactivated, etc.)
         if (effectiveMsg.user && !this.userCache.has(effectiveMsg.user) && !this.unknownUsersThisCycle.has(effectiveMsg.user)) {
+          this.unknownUsersThisCycle.add(effectiveMsg.user);
           try {
             const result = await this.webClient.users.info({ user: effectiveMsg.user });
             if (result.user?.id) {
               this.userCache.set(result.user.id, result.user as SlackUser);
+              // Yield contact for newly discovered user
+              const user = result.user as SlackUser;
+              const meta: Record<string, unknown> = {};
+              if (user.profile?.email) meta.email = user.profile.email;
+              if (user.profile?.image_72) meta.avatar = user.profile.image_72;
+              if (user.is_bot) meta.is_bot = true;
+              if (user.deleted) meta.deactivated = true;
+              const idSuffix = user.is_bot ? `bot:${user.id}` : `user:${user.id}`;
+              yield { type: 'contact', data: {
+                id: `slack:${this.teamId}:${idSuffix}`,
+                platform: 'slack',
+                display_name: user.profile?.display_name || user.real_name || user.name || null,
+                username: user.name ?? null,
+                phone: null,
+                metadata: meta,
+                first_seen: now,
+                last_seen: now,
+              } as Contact };
             }
           } catch {
             // failed lookup — don't retry this cycle
           }
-          this.unknownUsersThisCycle.add(effectiveMsg.user);
         }
 
         // Determine sender
@@ -572,15 +589,33 @@ export class SlackAdapter implements Adapter {
 
             // Lazy-resolve unknown users (same as fetchChannelMessages)
             if (msg.user && !this.userCache.has(msg.user) && !this.unknownUsersThisCycle.has(msg.user)) {
+              this.unknownUsersThisCycle.add(msg.user);
               try {
                 const result = await this.webClient.users.info({ user: msg.user });
                 if (result.user?.id) {
                   this.userCache.set(result.user.id, result.user as SlackUser);
+                  // Yield contact for newly discovered user
+                  const user = result.user as SlackUser;
+                  const meta: Record<string, unknown> = {};
+                  if (user.profile?.email) meta.email = user.profile.email;
+                  if (user.profile?.image_72) meta.avatar = user.profile.image_72;
+                  if (user.is_bot) meta.is_bot = true;
+                  if (user.deleted) meta.deactivated = true;
+                  const idSuffix = user.is_bot ? `bot:${user.id}` : `user:${user.id}`;
+                  yield { type: 'contact', data: {
+                    id: `slack:${this.teamId}:${idSuffix}`,
+                    platform: 'slack',
+                    display_name: user.profile?.display_name || user.real_name || user.name || null,
+                    username: user.name ?? null,
+                    phone: null,
+                    metadata: meta,
+                    first_seen: now,
+                    last_seen: now,
+                  } as Contact };
                 }
               } catch {
                 // failed lookup — don't retry this cycle
               }
-              this.unknownUsersThisCycle.add(msg.user);
             }
 
             let senderId: string;
