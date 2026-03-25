@@ -145,7 +145,7 @@ export class SignalAdapter implements Adapter {
 
     const output = execFileSync('sqlcipher', [this.dbPath], {
       input: stdin,
-      timeout: 10000,
+      timeout: 30000,
       maxBuffer: 50 * 1024 * 1024,  // 50MB for large result sets
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
@@ -154,21 +154,31 @@ export class SignalAdapter implements Adapter {
     const trimmed = output.trim();
     if (!trimmed) return [];
 
-    // sqlcipher outputs PRAGMA key result as first JSON line, then query result
-    // Find the last JSON array in the output (skip PRAGMA response)
+    // sqlcipher outputs: "ok\n" from PRAGMA key, then the JSON array from the query.
+    // The JSON array may span multiple lines (one object per line for large results),
+    // so we can't scan line-by-line. Instead, find the first '[' after the PRAGMA
+    // response and parse everything from there to the end.
     const lines = trimmed.split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
+    let dataStart = -1;
+    for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
-      if (line.startsWith('[') && line !== '[{"ok":"ok"}]') {
-        try {
-          return JSON.parse(line);
-        } catch {
-          continue;
-        }
+      // Skip the PRAGMA "ok" response
+      if (line === 'ok' || line === '[{"ok":"ok"}]') continue;
+      if (line.startsWith('[')) {
+        dataStart = i;
+        break;
       }
     }
-    // No data rows — query returned empty
-    return [];
+
+    if (dataStart === -1) return [];
+
+    // Join from the data start line to the end and parse as one JSON array
+    const jsonStr = lines.slice(dataStart).join('\n').trim();
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      return [];
+    }
   }
 
   async *sync(cursorStr: string | null): AsyncGenerator<SyncEvent> {
