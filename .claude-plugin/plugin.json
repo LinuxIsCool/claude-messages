@@ -6,5 +6,6 @@
     "name": "LinuxIsCool"
   },
   "license": "MIT",
-  "keywords": ["messaging", "telegram", "signal", "email", "sync", "search"]
+  "keywords": ["messaging", "telegram", "signal", "email", "sync", "search"],
+  "hooks": "./hooks/hooks.json"
 }
