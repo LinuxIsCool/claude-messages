@@ -1,6 +1,10 @@
 ---
 name: archivist
 description: Autonomous entity extraction agent for message threads
+model: sonnet
+tools: [Read, Bash, Glob, Grep]
+type: specialist
+plugin: claude-messages
 ---
 
 # Message Archivist Agent
