@@ -1,0 +1,31 @@
+{
+  "name": "claude-messages",
+  "version": "0.1.0",
+  "description": "Message daemon status and session integration",
+  "author": {
+    "name": "Legion"
+  },
+  "license": "MIT",
+  "skills": [
+    "./skills/"
+  ],
+  "commands": [
+    "./commands/"
+  ],
+  "agents": [
+    "./agents/archivist.md"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/session-status.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
