@@ -22,14 +22,37 @@ interface AccountConnection {
   password: string;
   idleTimer: ReturnType<typeof setTimeout> | null;
   hasNewMail: boolean;
+  resolvedFolders: string[];
+}
+
+// --- Cursor format v2: per-folder UID tracking ---
+interface FolderCursor {
+  lastUid: number;
+}
+
+interface AccountCursorV2 {
+  folders: Record<string, FolderCursor>;
 }
 
 interface EmailCursor {
-  accounts: Record<string, { lastUid: number }>;
+  accounts: Record<string, AccountCursorV2 | { lastUid: number }>;
+  version?: 2;
 }
 
 // Map message-id header → thread ID for resolving In-Reply-To chains
 type ThreadIndex = Map<string, string>;
+
+// Sent folder detection
+const SENT_FOLDER_NAMES = ['Sent', 'Sent Mail', 'Sent Items', '[Gmail]/Sent Mail', 'INBOX.Sent'];
+
+function isSentFolder(folder: string): boolean {
+  const lower = folder.toLowerCase();
+  return lower === 'sent' || lower.includes('sent mail') || lower.includes('sent items');
+}
+
+function folderSlug(folder: string): string {
+  return folder.toLowerCase().replace(/[\[\]\/\s]+/g, '-').replace(/^-|-$/g, '');
+}
 
 function loadEnv(envPath: string): Record<string, string> {
   const content = fs.readFileSync(envPath, 'utf-8');
@@ -56,10 +79,11 @@ export class EmailAdapter implements Adapter {
   platform = 'email';
   private accounts: AccountConnection[] = [];
   private currentCursor: EmailCursor = { accounts: {} };
-  private folder: string = 'INBOX';
+  private folders: string[] = ['INBOX'];
   private initialDays: number = 30;
   private threadIndex: ThreadIndex = new Map();
   private knownContacts: Set<string> = new Set();
+  private selfAddresses: Set<string> = new Set();
   private log: (msg: string) => void;
 
   constructor(log: (msg: string) => void = console.log) {
@@ -70,8 +94,15 @@ export class EmailAdapter implements Adapter {
     const dataDir = (config as unknown as { data_dir?: string }).data_dir ??
       path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
     const secretsDir = path.join(dataDir, 'secrets');
-    this.folder = (config.folder as string) ?? 'INBOX';
     this.initialDays = config.initial_days ?? 30;
+
+    // Support both old `folder` (string) and new `folders` (array) config
+    const configFolders = config.folders ?? config.folder;
+    if (Array.isArray(configFolders)) {
+      this.folders = configFolders as string[];
+    } else if (typeof configFolders === 'string') {
+      this.folders = [configFolders];
+    }
 
     const envPath = path.join(secretsDir, 'email.env');
     if (!fs.existsSync(envPath)) {
@@ -111,6 +142,13 @@ export class EmailAdapter implements Adapter {
         await client.connect();
         this.log(`[email] Connected to ${acct.id} (${user}@${host})`);
 
+        // Track self addresses for direction tagging
+        this.selfAddresses.add(user.toLowerCase());
+
+        // Discover which configured folders actually exist on this server
+        const resolvedFolders = await this.resolveFolders(client, this.folders);
+        this.log(`[email] ${acct.id} resolved folders: ${resolvedFolders.join(', ')}`);
+
         const conn: AccountConnection = {
           id: acct.id,
           name: acct.name ?? acct.id,
@@ -120,6 +158,7 @@ export class EmailAdapter implements Adapter {
           password,
           idleTimer: null,
           hasNewMail: false,
+          resolvedFolders,
         };
 
         // Listen for new mail events
@@ -143,8 +182,72 @@ export class EmailAdapter implements Adapter {
     }
   }
 
+  /**
+   * Resolve configured folder names to actual folders on the IMAP server.
+   * Uses RFC 6154 special-use flags first, then falls back to name matching.
+   */
+  private async resolveFolders(client: ImapFlow, configured: string[]): Promise<string[]> {
+    const resolved: string[] = [];
+    const mailboxes = await client.list();
+
+    for (const folder of configured) {
+      if (folder === 'INBOX') {
+        // INBOX always exists
+        resolved.push('INBOX');
+        continue;
+      }
+
+      // Check if this exact folder name exists
+      const exact = mailboxes.find(mb => mb.path === folder);
+      if (exact) {
+        resolved.push(exact.path);
+        continue;
+      }
+
+      // For sent folder names, try RFC 6154 special-use discovery
+      if (isSentFolder(folder)) {
+        const sentByFlag = mailboxes.find(mb => mb.specialUse === '\\Sent');
+        if (sentByFlag) {
+          resolved.push(sentByFlag.path);
+          continue;
+        }
+        // Try other common sent folder names
+        const sentByName = mailboxes.find(mb => SENT_FOLDER_NAMES.includes(mb.path));
+        if (sentByName) {
+          resolved.push(sentByName.path);
+          continue;
+        }
+      }
+
+      this.log(`[email] Folder "${folder}" not found on server — skipping`);
+    }
+
+    // Deduplicate (e.g. if config lists both "Sent" and "[Gmail]/Sent Mail" and they resolve to the same thing)
+    return [...new Set(resolved)];
+  }
+
+  /**
+   * Migrate old cursor format (per-account lastUid) to v2 (per-account per-folder lastUid).
+   */
+  private migrateCursor(cursor: EmailCursor): EmailCursor {
+    for (const [acctId, acctCursor] of Object.entries(cursor.accounts)) {
+      if ('lastUid' in acctCursor && !('folders' in acctCursor)) {
+        // Old format: migrate INBOX lastUid into folders structure
+        cursor.accounts[acctId] = {
+          folders: { 'INBOX': { lastUid: (acctCursor as { lastUid: number }).lastUid } }
+        };
+      }
+    }
+    cursor.version = 2;
+    return cursor;
+  }
+
   async *sync(cursorStr: string | null): AsyncGenerator<SyncEvent> {
     this.currentCursor = cursorStr ? JSON.parse(cursorStr) : { accounts: {} };
+    // Migrate old cursor format if needed
+    if (!this.currentCursor.version) {
+      this.currentCursor = this.migrateCursor(this.currentCursor);
+    }
     const now = new Date();
 
     for (const acct of this.accounts) {
@@ -176,6 +279,8 @@ export class EmailAdapter implements Adapter {
         this.log(`[email] ${acct.id} socket error: ${err.message}`);
       });
       acct.client = client;
+      // Re-resolve folders after reconnect
+      acct.resolvedFolders = await this.resolveFolders(client, this.folders);
       this.log(`[email] Reconnected ${acct.id}`);
       return true;
     } catch (err) {
@@ -184,20 +289,37 @@ export class EmailAdapter implements Adapter {
     }
   }
 
+  /**
+   * Sync all resolved folders for an account.
+   */
   private async *syncAccount(acct: AccountConnection, now: Date): AsyncGenerator<SyncEvent> {
-    const acctCursor = this.currentCursor.accounts[acct.id] ?? { lastUid: 0 };
+    for (const folder of acct.resolvedFolders) {
+      try {
+        yield* this.syncAccountFolder(acct, folder, now);
+      } catch (err) {
+        this.log(`[email] Error syncing ${acct.id}/${folder}: ${err}`);
+      }
+    }
+  }
+
+  /**
+   * Sync a single folder for an account. Extracted from the old single-folder syncAccount().
+   */
+  private async *syncAccountFolder(acct: AccountConnection, folder: string, now: Date): AsyncGenerator<SyncEvent> {
+    const acctCursor = this.currentCursor.accounts[acct.id] as AccountCursorV2 | undefined;
+    const folderCursor = acctCursor?.folders?.[folder] ?? { lastUid: 0 };
 
     let lock;
     try {
-      lock = await acct.client.getMailboxLock(this.folder);
+      lock = await acct.client.getMailboxLock(folder);
     } catch {
       // Connection likely died — try to reconnect once
-      this.log(`[email] Connection lost for ${acct.id}, reconnecting...`);
+      this.log(`[email] Connection lost for ${acct.id}/${folder}, reconnecting...`);
       if (!await this.reconnectAccount(acct)) return;
       try {
-        lock = await acct.client.getMailboxLock(this.folder);
+        lock = await acct.client.getMailboxLock(folder);
       } catch (err) {
-        this.log(`[email] Could not open ${this.folder} for ${acct.id} after reconnect: ${err}`);
+        this.log(`[email] Could not open ${folder} for ${acct.id} after reconnect: ${err}`);
         return;
       }
     }
@@ -205,17 +327,20 @@ export class EmailAdapter implements Adapter {
     try {
       // Determine search range
       let searchQuery: Record<string, unknown>;
-      if (acctCursor.lastUid > 0) {
+      if (folderCursor.lastUid > 0) {
         // Incremental: fetch UIDs after last known
-        searchQuery = { uid: `${acctCursor.lastUid + 1}:*` };
+        searchQuery = { uid: `${folderCursor.lastUid + 1}:*` };
       } else {
         // Initial sync: last N days
         const cutoff = new Date(now.getTime() - this.initialDays * 24 * 60 * 60 * 1000);
         searchQuery = { since: cutoff };
       }
 
-      let maxUid = acctCursor.lastUid;
+      let maxUid = folderCursor.lastUid;
       let msgCount = 0;
+
+      // Determine direction for this folder
+      const folderIsSent = isSentFolder(folder);
 
       // Envelope-only fetch for speed — avoids downloading full message bodies.
       // headers returns raw buffer; we parse References from it for threading.
@@ -227,7 +352,7 @@ export class EmailAdapter implements Adapter {
         bodyParts: ['1'],
       })) {
         // Skip messages we've already processed (IMAP UID ranges can re-include boundary)
-        if (msg.uid <= acctCursor.lastUid) continue;
+        if (msg.uid <= folderCursor.lastUid) continue;
 
         const env = msg.envelope;
         if (!env) continue;
@@ -287,6 +412,7 @@ export class EmailAdapter implements Adapter {
           metadata: {
             account: acct.id,
             account_name: acct.name,
+            folder,
           },
           created_at: (env.date ? new Date(env.date) : now).toISOString(),
           updated_at: now.toISOString(),
@@ -302,6 +428,7 @@ export class EmailAdapter implements Adapter {
           account: acct.id,
           subject: env.subject,
           message_id: messageId,
+          folder,
         };
 
         const envToAddrs = toAddrs.map(a => a.address).filter(Boolean);
@@ -310,14 +437,30 @@ export class EmailAdapter implements Adapter {
         const ccAddrs = (env.cc ?? []).map((a: { address?: string }) => a.address).filter(Boolean);
         if (ccAddrs.length) metadata.cc = ccAddrs;
 
+        // Determine direction: sent folder -> sent, inbox from self -> sent, otherwise received
+        let direction: 'sent' | 'received' | 'unknown' = 'unknown';
+        if (folderIsSent) {
+          direction = 'sent';
+        } else if (this.selfAddresses.has(senderEmail ?? '')) {
+          direction = 'sent';
+        } else {
+          direction = 'received';
+        }
+
+        // Message ID: INBOX keeps old format for backward compat, other folders include slug
+        const msgId = folder === 'INBOX'
+          ? `email:msg:${acct.id}:${msg.uid}`
+          : `email:msg:${acct.id}:${folderSlug(folder)}:${msg.uid}`;
+
         const message: Message = {
-          id: `email:msg:${acct.id}:${msg.uid}`,
+          id: msgId,
           platform: 'email',
           thread_id: threadId,
           sender_id: senderEmail ? `email:user:${senderEmail}` : `email:system:${acct.id}`,
           content: textContent,
           content_type: 'text',
           reply_to: null,  // Threading handled via threadId
+          direction,
           metadata,
           platform_ts: (env.date ? new Date(env.date) : now).toISOString(),
           synced_at: now.toISOString(),
@@ -328,22 +471,27 @@ export class EmailAdapter implements Adapter {
         msgCount++;
       }
 
-      // Update cursor
-      if (maxUid > acctCursor.lastUid) {
-        this.currentCursor.accounts[acct.id] = { lastUid: maxUid };
+      // Update cursor — per-folder
+      if (maxUid > folderCursor.lastUid) {
+        const acctCursorObj = (this.currentCursor.accounts[acct.id] as AccountCursorV2) ?? { folders: {} };
+        if (!acctCursorObj.folders) (acctCursorObj as AccountCursorV2).folders = {};
+        acctCursorObj.folders[folder] = { lastUid: maxUid };
+        this.currentCursor.accounts[acct.id] = acctCursorObj;
       }
 
       acct.hasNewMail = false;
 
       if (msgCount > 0) {
-        this.log(`[email] ${acct.id}: synced ${msgCount} messages (maxUid: ${maxUid})`);
+        this.log(`[email] ${acct.id}/${folder}: synced ${msgCount} messages (maxUid: ${maxUid})`);
       }
     } finally {
       lock.release();
     }
 
-    // Start IDLE for real-time notifications (non-blocking)
-    this.startIdle(acct);
+    // Start IDLE for INBOX only (Sent folders don't need real-time push)
+    if (folder === 'INBOX') {
+      this.startIdle(acct);
+    }
   }
 
   private resolveThread(

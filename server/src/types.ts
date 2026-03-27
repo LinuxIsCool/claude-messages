@@ -30,6 +30,7 @@ export interface Message {
   content: string | null;
   content_type: 'text' | 'photo' | 'document' | 'sticker' | 'voice' | 'video' | 'other';
   reply_to: string | null;
+  direction?: 'sent' | 'received' | 'unknown';
   metadata: Record<string, unknown>;
   platform_ts: string;      // ISO 8601
   synced_at: string;

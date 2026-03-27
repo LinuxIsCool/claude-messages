@@ -20,17 +20,18 @@ const server = new McpServer({
 // Tool: search_messages
 server.tool(
   'search_messages',
-  'Full-text search across all synced messages, optionally filtered by identity',
+  'Full-text search across all synced messages, optionally filtered by identity and direction',
   {
     query: z.string().describe('Search query (FTS5 syntax supported)'),
     limit: z.number().optional().default(30).describe('Max results'),
     identity_id: z.string().optional().describe('Filter to messages from this identity across all platforms'),
+    direction: z.enum(['sent', 'received', 'unknown']).optional().describe('Filter by message direction (sent/received)'),
   },
-  async ({ query, limit, identity_id }) => {
+  async ({ query, limit, identity_id, direction }) => {
     try {
       const results = identity_id
         ? db.searchMessagesByIdentity(identity_id, query, limit)
-        : db.searchMessages(query, limit);
+        : db.searchMessages(query, limit, direction);
 
       const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
       const names = db.resolveContactNames(senderIds);
@@ -45,6 +46,7 @@ server.tool(
             sender_name: names.get(m.sender_id) ?? null,
             content: m.content,
             type: m.content_type,
+            direction: m.direction,
             time: m.platform_ts,
           })), null, 2),
         }],
@@ -58,10 +60,13 @@ server.tool(
 // Tool: recent_messages
 server.tool(
   'recent_messages',
-  'Get the most recent messages across all platforms',
-  { limit: z.number().optional().default(30).describe('Max results') },
-  async ({ limit }) => {
-    const results = db.recentMessages(limit);
+  'Get the most recent messages across all platforms, optionally filtered by direction',
+  {
+    limit: z.number().optional().default(30).describe('Max results'),
+    direction: z.enum(['sent', 'received', 'unknown']).optional().describe('Filter by message direction (sent/received)'),
+  },
+  async ({ limit, direction }) => {
+    const results = db.recentMessages(limit, direction);
     const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
     const names = db.resolveContactNames(senderIds);
     return {
@@ -74,6 +79,7 @@ server.tool(
           sender_name: names.get(m.sender_id) ?? null,
           content: m.content,
           type: m.content_type,
+          direction: m.direction,
           time: m.platform_ts,
         })), null, 2),
       }],
@@ -114,6 +120,7 @@ server.tool(
             sender_name: names.get(m.sender_id) ?? null,
             content: m.content,
             type: m.content_type,
+            direction: m.direction,
             time: m.platform_ts,
           })),
         }, null, 2),

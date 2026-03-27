@@ -162,6 +162,67 @@ export class MessageDB {
       );
     `);
 
+    // --- Phase 0: direction column + self-identity links + backfill ---
+    try {
+      this.db.exec("ALTER TABLE messages ADD COLUMN direction TEXT DEFAULT 'unknown'");
+    } catch (e: any) {
+      if (!e.message.includes('duplicate column')) throw e;
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_direction ON messages(direction)");
+
+    // Backfill self-identity links (known Shawn email addresses)
+    {
+      const selfId = this.db.prepare("SELECT value FROM config WHERE key = 'self_identity_id'").get() as { value: string } | undefined;
+      if (selfId) {
+        const selfAddresses = ['shawn@kwaxala.com', 'shawnltf@pm.me', 'shawn@unify.org', 'shawnltf@protonmail.com'];
+        const linkStmt = this.db.prepare(`
+          INSERT OR IGNORE INTO identity_links
+          (identity_id, platform, platform_id, display_name, username, confidence, source, metadata, created_at)
+          VALUES (?, 'email', ?, NULL, ?, 1.0, 'migration', '{}', ?)
+        `);
+        for (const addr of selfAddresses) {
+          linkStmt.run(selfId.value, `user:${addr}`, addr, new Date().toISOString());
+        }
+      }
+    }
+
+    // Backfill direction for all existing messages (one-time)
+    {
+      const backfilled = this.db.prepare("SELECT value FROM config WHERE key = 'direction_backfill_v1'").get();
+      if (!backfilled) {
+        const selfId = this.db.prepare("SELECT value FROM config WHERE key = 'self_identity_id'").get() as { value: string } | undefined;
+        if (selfId) {
+          // Email messages: default to 'received' (all currently from INBOX)
+          this.db.exec(`UPDATE messages SET direction = 'received' WHERE platform = 'email' AND direction = 'unknown'`);
+
+          // Email messages from self addresses -> 'sent'
+          this.db.prepare(`
+            UPDATE messages SET direction = 'sent'
+            WHERE platform = 'email' AND direction = 'received'
+            AND sender_id IN (
+              SELECT 'email:' || platform_id FROM identity_links
+              WHERE identity_id = ? AND platform = 'email'
+            )
+          `).run(selfId.value);
+
+          // All other platforms: sender matches self identity -> 'sent'
+          this.db.prepare(`
+            UPDATE messages SET direction = 'sent'
+            WHERE direction = 'unknown'
+            AND sender_id IN (
+              SELECT platform || ':' || platform_id FROM identity_links
+              WHERE identity_id = ? AND platform != 'phone'
+            )
+          `).run(selfId.value);
+
+          // Remaining messages with a sender -> 'received'
+          this.db.exec(`UPDATE messages SET direction = 'received' WHERE direction = 'unknown' AND sender_id IS NOT NULL`);
+
+          this.db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('direction_backfill_v1', 'done')").run();
+        }
+      }
+    }
+
     this.loadNicknames();
 
     // FTS5 virtual table (can't use IF NOT EXISTS, so check first)
@@ -267,12 +328,13 @@ export class MessageDB {
   insertMessage(msg: Message): boolean {
     // Returns true if actually inserted (not duplicate)
     const result = this.db.prepare(`
-      INSERT OR IGNORE INTO messages (id, platform, thread_id, sender_id, content, content_type, reply_to, metadata, platform_ts, synced_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO messages (id, platform, thread_id, sender_id, content, content_type, reply_to, metadata, platform_ts, synced_at, direction)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       msg.id, msg.platform, msg.thread_id, msg.sender_id,
       msg.content, msg.content_type, msg.reply_to,
-      JSON.stringify(msg.metadata), msg.platform_ts, msg.synced_at
+      JSON.stringify(msg.metadata), msg.platform_ts, msg.synced_at,
+      msg.direction ?? 'unknown'
     );
     return result.changes > 0;
   }
@@ -339,7 +401,16 @@ export class MessageDB {
     return row?.cursor_value ?? null;
   }
 
-  searchMessages(query: string, limit = 50): Message[] {
+  searchMessages(query: string, limit = 50, direction?: string): Message[] {
+    if (direction) {
+      return this.db.prepare(`
+        SELECT m.* FROM messages m
+        JOIN messages_fts fts ON m.rowid = fts.rowid
+        WHERE messages_fts MATCH ? AND m.direction = ?
+        ORDER BY rank
+        LIMIT ?
+      `).all(query, direction, limit).map(this.parseMessage);
+    }
     return this.db.prepare(`
       SELECT m.* FROM messages m
       JOIN messages_fts fts ON m.rowid = fts.rowid
@@ -362,7 +433,12 @@ export class MessageDB {
     `).all(threadId, limit, offset).map(this.parseMessage);
   }
 
-  recentMessages(limit = 50): Message[] {
+  recentMessages(limit = 50, direction?: string): Message[] {
+    if (direction) {
+      return this.db.prepare(`
+        SELECT * FROM messages WHERE direction = ? ORDER BY platform_ts DESC LIMIT ?
+      `).all(direction, limit).map(this.parseMessage);
+    }
     return this.db.prepare(`
       SELECT * FROM messages ORDER BY platform_ts DESC LIMIT ?
     `).all(limit).map(this.parseMessage);
@@ -1076,6 +1152,7 @@ export class MessageDB {
       content: r.content as string | null,
       content_type: (r.content_type as Message['content_type']) ?? 'text',
       reply_to: r.reply_to as string | null,
+      direction: (r.direction as Message['direction']) ?? 'unknown',
       metadata: JSON.parse((r.metadata as string) || '{}'),
       platform_ts: r.platform_ts as string,
       synced_at: r.synced_at as string,
