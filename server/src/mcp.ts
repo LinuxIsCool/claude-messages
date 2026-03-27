@@ -2,10 +2,16 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { MessageDB } from './db.js';
-import { formatMessages, formatThreadList, formatThread, formatContext } from './formatters.js';
+import { formatMessages, formatThreadList, formatThread, formatContext, formatTimeline } from './formatters.js';
 import type { OutputFormat } from './formatters.js';
 import type { Contact, IdentityCard } from './types.js';
+import { parseTemporalRef } from './temporal.js';
+
+const execFileAsync = promisify(execFile);
 
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
@@ -46,10 +52,18 @@ server.tool(
       const threadIds = [...new Set(results.map(m => m.thread_id))];
       const threadInfo = db.getThreadInfoBatch(threadIds);
 
-      const text = formatMessages(results, names, threadInfo, {
+      let text = formatMessages(results, names, threadInfo, {
         format: format as OutputFormat,
         header: `${results.length} results for "${query}"`,
       });
+
+      // Smart suggestions when few results (Phase 3)
+      if (results.length < 3 && format !== 'json') {
+        const suggestions = db.getSearchSuggestions(query, results);
+        if (suggestions.length > 0) {
+          text += '\n\nFew results? Try:\n' + suggestions.map(s => `  - "${s}"`).join('\n');
+        }
+      }
 
       return { content: [{ type: 'text' as const, text }] };
     } catch (err) {
@@ -127,9 +141,17 @@ server.tool(
       ? db.getThreadsByIdentity(identity_id, limit)
       : db.listThreads(platform, limit);
 
+    // Fetch cached summaries for all output formats
+    const summaries = new Map<string, string>();
+    for (const t of threads) {
+      const cached = db.getThreadSummary(t.id);
+      if (cached) summaries.set(t.id, cached.summary);
+    }
+
     const text = formatThreadList(
       threads.map(t => ({ id: t.id, title: t.title, thread_type: t.thread_type ?? '', platform: t.platform, updated_at: t.updated_at })),
       { format: format as OutputFormat, header: `${threads.length} threads` },
+      summaries,
     );
 
     return { content: [{ type: 'text' as const, text }] };
@@ -227,6 +249,215 @@ server.tool(
       format: format as OutputFormat,
     });
 
+    return { content: [{ type: 'text' as const, text }] };
+  }
+);
+
+// Tool: thread_messages (Phase 3 — temporal thread navigation)
+server.tool(
+  'thread_messages',
+  'Get messages from a thread with temporal navigation — slice by time range, anchor point, or latest',
+  {
+    thread_id: z.string().describe('Thread ID'),
+    around: z.string().optional().describe('Timestamp or natural date — center window here'),
+    after: z.string().optional().describe('Timestamp or natural date — messages after this point'),
+    before: z.string().optional().describe('Timestamp or natural date — messages before this point'),
+    limit: z.number().optional().default(50).describe('Max messages'),
+    format: formatSchema,
+  },
+  async ({ thread_id, around, after, before, limit, format }) => {
+    const parsedAround = around ? parseTemporalRef(around) : undefined;
+    const parsedAfter = after ? parseTemporalRef(after) : undefined;
+    const parsedBefore = before ? parseTemporalRef(before) : undefined;
+
+    if (around && !parsedAround) return { content: [{ type: 'text' as const, text: `Could not parse date: "${around}"` }] };
+    if (after && !parsedAfter) return { content: [{ type: 'text' as const, text: `Could not parse date: "${after}"` }] };
+    if (before && !parsedBefore) return { content: [{ type: 'text' as const, text: `Could not parse date: "${before}"` }] };
+
+    const thread = db.getThread(thread_id);
+    const messages = db.getThreadMessagesTemporally(thread_id, {
+      around: parsedAround,
+      after: parsedAfter,
+      before: parsedBefore,
+      limit,
+    });
+
+    const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
+    const participantNames = thread ? db.resolveContactNames(thread.participants) : new Map<string, string>();
+
+    let headerDesc = `${messages.length} messages`;
+    if (parsedAround) headerDesc += ` around ${parsedAround.slice(0, 16)}`;
+    else if (parsedAfter && parsedBefore) headerDesc += ` between ${parsedAfter.slice(0, 10)} and ${parsedBefore.slice(0, 10)}`;
+    else if (parsedAfter) headerDesc += ` after ${parsedAfter.slice(0, 10)}`;
+    else if (parsedBefore) headerDesc += ` before ${parsedBefore.slice(0, 10)}`;
+
+    const text = formatThread(thread, messages, names, participantNames, {
+      format: format as OutputFormat,
+      header: headerDesc,
+    });
+
+    return { content: [{ type: 'text' as const, text }] };
+  }
+);
+
+// Tool: messages_timeframe (Phase 3 — global temporal search)
+server.tool(
+  'messages_timeframe',
+  'Search messages within a time window — global or filtered by person/query',
+  {
+    start: z.string().describe('Start date (ISO or natural: "last week", "March 1", "3 days ago")'),
+    end: z.string().optional().describe('End date (default: now)'),
+    person: z.string().optional().describe('Name to auto-resolve to identity'),
+    query: z.string().optional().describe('Search within time window (FTS5)'),
+    dm_only: z.boolean().optional().default(false),
+    limit: z.number().optional().default(30),
+    format: formatSchema,
+  },
+  async ({ start, end, person, query, dm_only, limit, format }) => {
+    const parsedStart = parseTemporalRef(start);
+    if (!parsedStart) return { content: [{ type: 'text' as const, text: `Could not parse start date: "${start}"` }] };
+    const parsedEnd = end ? parseTemporalRef(end) : undefined;
+    if (end && !parsedEnd) return { content: [{ type: 'text' as const, text: `Could not parse end date: "${end}"` }] };
+
+    // Resolve person name to identity_id
+    let identityId: string | undefined;
+    let personLabel = '';
+    if (person) {
+      const matches = db.whoIs(person, 1);
+      if (matches.length && 'platforms' in matches[0]) {
+        const card = matches[0] as IdentityCard;
+        identityId = card.id;
+        personLabel = card.display_name;
+      } else {
+        personLabel = person;
+      }
+    }
+
+    const results = db.searchMessagesInTimeframe({
+      start: parsedStart,
+      end: parsedEnd ?? undefined,
+      query,
+      person: identityId,
+      dmOnly: dm_only || undefined,
+      limit,
+    });
+
+    const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
+    const threadIds = [...new Set(results.map(m => m.thread_id))];
+    const threadInfo = db.getThreadInfoBatch(threadIds);
+
+    let header = `${results.length} messages`;
+    if (parsedEnd) header += ` between ${parsedStart.slice(0, 10)} and ${parsedEnd.slice(0, 10)}`;
+    else header += ` since ${parsedStart.slice(0, 10)}`;
+    if (personLabel) header += ` from ${personLabel}`;
+    if (query) header += ` matching "${query}"`;
+
+    const text = formatMessages(results, names, threadInfo, {
+      format: format as OutputFormat,
+      header,
+    });
+    return { content: [{ type: 'text' as const, text }] };
+  }
+);
+
+// Tool: get_thread_summary (Phase 3 — LLM thread summaries)
+server.tool(
+  'get_thread_summary',
+  'Get or generate an LLM summary of a thread — cached, regenerated when stale',
+  {
+    thread_id: z.string().describe('Thread ID'),
+    force: z.boolean().optional().default(false).describe('Force regeneration even if cached'),
+  },
+  async ({ thread_id, force }) => {
+    // Check cache
+    if (!force) {
+      const cached = db.getThreadSummary(thread_id);
+      if (cached && !cached.stale) {
+        return { content: [{ type: 'text' as const, text:
+          `Summary (${cached.message_count} messages, cached ${cached.generated_at}):\n${cached.summary}`
+        }] };
+      }
+    }
+
+    // Generate: pull last 100 messages, send to summarize.py
+    const thread = db.getThread(thread_id);
+    const messages = db.getThreadMessages(thread_id, 100);
+    if (messages.length === 0) {
+      return { content: [{ type: 'text' as const, text: 'Thread has no messages' }] };
+    }
+
+    const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
+
+    const input = JSON.stringify({
+      messages: messages.reverse().map(m => ({
+        sender_id: m.sender_id,
+        sender_name: names.get(m.sender_id) ?? m.sender_id,
+        content: m.content,
+        platform_ts: m.platform_ts,
+      })),
+    });
+
+    try {
+      const currentDir = path.dirname(fileURLToPath(import.meta.url));
+      const scriptPath = path.join(currentDir, '..', 'scripts', 'summarize.py');
+      const { stdout } = await execFileAsync('uv', ['run', '--script', scriptPath], {
+        input,
+        env: { ...process.env },
+        timeout: 45000,
+      });
+
+      const result = JSON.parse(stdout);
+      const lastTs = messages[messages.length - 1]?.platform_ts ?? new Date().toISOString();
+      db.upsertThreadSummary(thread_id, result.summary, messages.length, lastTs, result.model);
+
+      const threadTitle = thread?.title ?? thread_id;
+      return { content: [{ type: 'text' as const, text:
+        `=== ${threadTitle} ===\nSummary (${messages.length} messages):\n${result.summary}`
+      }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Summary generation failed: ${err}` }] };
+    }
+  }
+);
+
+// Tool: message_timeline (Phase 3 — activity visualization)
+server.tool(
+  'message_timeline',
+  'Show message activity over time — ASCII bar chart by month, optionally filtered by person or thread',
+  {
+    person: z.string().optional().describe('Person name (auto-resolved to identity)'),
+    thread_id: z.string().optional().describe('Thread ID'),
+    months: z.number().optional().default(12).describe('How many months back'),
+    format: formatSchema,
+  },
+  async ({ person, thread_id, months, format }) => {
+    let identityId: string | undefined;
+    let displayName = 'All Messages';
+
+    if (person) {
+      const matches = db.whoIs(person, 1);
+      if (matches.length && 'platforms' in matches[0]) {
+        const card = matches[0] as IdentityCard;
+        identityId = card.id;
+        displayName = card.display_name;
+      } else {
+        displayName = person;
+      }
+    }
+
+    const data = db.getMessageTimeline({
+      identityId,
+      threadId: thread_id,
+      months,
+    });
+
+    const text = formatTimeline(data, {
+      format: format as OutputFormat,
+      header: `${displayName} — Message Timeline (${months} months)`,
+    });
     return { content: [{ type: 'text' as const, text }] };
   }
 );

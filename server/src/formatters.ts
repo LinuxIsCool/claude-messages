@@ -123,11 +123,12 @@ export function formatMessages(
 }
 
 /**
- * Format a list of threads.
+ * Format a list of threads, optionally with cached summaries.
  */
 export function formatThreadList(
   threads: Array<{ id: string; title: string | null; thread_type: string; platform: string; updated_at: string }>,
   opts: FormatOpts,
+  summaries?: Map<string, string>,
 ): string {
   if (opts.format === 'json') {
     return JSON.stringify(threads.map(t => ({
@@ -136,6 +137,7 @@ export function formatThreadList(
       type: t.thread_type,
       platform: t.platform,
       updated: t.updated_at,
+      summary: summaries?.get(t.id) ?? null,
     })), null, 2);
   }
 
@@ -156,8 +158,42 @@ export function formatThreadList(
     const t = threads[i];
     const ts = formatTimestamp(t.updated_at);
     lines.push(`${i + 1}. ${t.title ?? t.id} [${abbrevPlatform(t.platform)}/${threadTypeLabel(t.thread_type)}] -- updated ${ts}`);
+    const summary = summaries?.get(t.id);
+    if (summary) {
+      lines.push(`   "${summary}"`);
+    }
   }
   return lines.join('\n').trimEnd();
+}
+
+/**
+ * Format a message timeline as ASCII bar chart.
+ */
+export function formatTimeline(
+  data: Array<{ month: string; count: number }>,
+  opts: FormatOpts,
+): string {
+  if (opts.format === 'json') return JSON.stringify(data, null, 2);
+
+  if (data.length === 0) return opts.header ? `${opts.header}\n(no data)` : '(no data)';
+
+  const maxCount = Math.max(...data.map(d => d.count), 1);
+  const barWidth = 40;
+  const total = data.reduce((s, d) => s + d.count, 0);
+  const avg = data.length > 0 ? Math.round(total / data.length) : 0;
+
+  const lines: string[] = [];
+  if (opts.header) lines.push(opts.header, '');
+
+  for (const d of data) {
+    const bar = '#'.repeat(Math.round((d.count / maxCount) * barWidth));
+    const monthName = new Date(d.month + '-01').toLocaleString('en', { month: 'short' });
+    lines.push(`${monthName} |${bar} ${d.count}`);
+  }
+  lines.push(`     ${'─'.repeat(barWidth + 2)}`);
+  lines.push(`Total: ${total.toLocaleString()} | Avg: ${avg.toLocaleString()}/mo`);
+
+  return lines.join('\n');
 }
 
 /**

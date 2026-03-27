@@ -223,6 +223,18 @@ export class MessageDB {
       }
     }
 
+    // --- Phase 3: thread_summaries table ---
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS thread_summaries (
+        thread_id TEXT PRIMARY KEY REFERENCES threads(id),
+        summary TEXT NOT NULL,
+        message_count INTEGER NOT NULL,
+        last_message_ts TEXT NOT NULL,
+        generated_at TEXT NOT NULL,
+        model TEXT NOT NULL DEFAULT 'telus-gpt-oss'
+      )
+    `);
+
     this.loadNicknames();
 
     // FTS5 virtual table (can't use IF NOT EXISTS, so check first)
@@ -428,6 +440,214 @@ export class MessageDB {
       ORDER BY platform_ts DESC
       LIMIT ? OFFSET ?
     `).all(threadId, limit, offset).map(this.parseMessage);
+  }
+
+  getThreadMessagesTemporally(
+    threadId: string,
+    opts: { after?: string; before?: string; around?: string; limit?: number },
+  ): Message[] {
+    const limit = opts.limit ?? 50;
+
+    if (opts.around) {
+      const halfLimit = Math.ceil(limit / 2);
+      const beforeMsgs = this.db.prepare(`
+        SELECT * FROM messages WHERE thread_id = ? AND platform_ts <= ?
+        ORDER BY platform_ts DESC LIMIT ?
+      `).all(threadId, opts.around, halfLimit).map(this.parseMessage).reverse();
+
+      const afterMsgs = this.db.prepare(`
+        SELECT * FROM messages WHERE thread_id = ? AND platform_ts > ?
+        ORDER BY platform_ts ASC LIMIT ?
+      `).all(threadId, opts.around, halfLimit).map(this.parseMessage);
+
+      return [...beforeMsgs, ...afterMsgs];
+    }
+
+    if (opts.after && opts.before) {
+      return this.db.prepare(`
+        SELECT * FROM messages WHERE thread_id = ? AND platform_ts >= ? AND platform_ts <= ?
+        ORDER BY platform_ts ASC LIMIT ?
+      `).all(threadId, opts.after, opts.before, limit).map(this.parseMessage);
+    }
+
+    if (opts.after) {
+      return this.db.prepare(`
+        SELECT * FROM messages WHERE thread_id = ? AND platform_ts >= ?
+        ORDER BY platform_ts ASC LIMIT ?
+      `).all(threadId, opts.after, limit).map(this.parseMessage);
+    }
+
+    if (opts.before) {
+      return this.db.prepare(`
+        SELECT * FROM messages WHERE thread_id = ? AND platform_ts <= ?
+        ORDER BY platform_ts DESC LIMIT ?
+      `).all(threadId, opts.before, limit).map(this.parseMessage).reverse();
+    }
+
+    // No temporal params — latest messages, returned in chronological order
+    return this.db.prepare(`
+      SELECT * FROM messages WHERE thread_id = ?
+      ORDER BY platform_ts DESC LIMIT ?
+    `).all(threadId, limit).map(this.parseMessage).reverse();
+  }
+
+  searchMessagesInTimeframe(opts: {
+    start: string;
+    end?: string;
+    query?: string;
+    person?: string;
+    dmOnly?: boolean;
+    limit?: number;
+  }): Message[] {
+    const limit = opts.limit ?? 30;
+    const end = opts.end ?? new Date().toISOString();
+    const dmFilter = opts.dmOnly ? "AND m.thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')" : '';
+
+    if (opts.person) {
+      const linkRows = this.db.prepare(
+        "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+      ).all(opts.person) as { sender_id: string }[];
+      const senderIds = linkRows.map(r => r.sender_id);
+      if (senderIds.length === 0) return [];
+      const placeholders = senderIds.map(() => '?').join(',');
+
+      if (opts.query) {
+        return this.db.prepare(`
+          SELECT m.* FROM messages m
+          JOIN messages_fts fts ON m.rowid = fts.rowid
+          WHERE messages_fts MATCH ?
+            AND m.platform_ts >= ? AND m.platform_ts <= ?
+            AND m.sender_id IN (${placeholders}) ${dmFilter}
+          ORDER BY m.platform_ts DESC LIMIT ?
+        `).all(opts.query, opts.start, end, ...senderIds, limit).map(this.parseMessage);
+      }
+
+      return this.db.prepare(`
+        SELECT * FROM messages m
+        WHERE m.platform_ts >= ? AND m.platform_ts <= ?
+          AND m.sender_id IN (${placeholders}) ${dmFilter}
+        ORDER BY m.platform_ts DESC LIMIT ?
+      `).all(opts.start, end, ...senderIds, limit).map(this.parseMessage);
+    }
+
+    if (opts.query) {
+      return this.db.prepare(`
+        SELECT m.* FROM messages m
+        JOIN messages_fts fts ON m.rowid = fts.rowid
+        WHERE messages_fts MATCH ?
+          AND m.platform_ts >= ? AND m.platform_ts <= ? ${dmFilter}
+        ORDER BY m.platform_ts DESC LIMIT ?
+      `).all(opts.query, opts.start, end, limit).map(this.parseMessage);
+    }
+
+    return this.db.prepare(`
+      SELECT * FROM messages m
+      WHERE m.platform_ts >= ? AND m.platform_ts <= ? ${dmFilter}
+      ORDER BY m.platform_ts DESC LIMIT ?
+    `).all(opts.start, end, limit).map(this.parseMessage);
+  }
+
+  getMessageTimeline(opts: {
+    identityId?: string;
+    threadId?: string;
+    months?: number;
+  }): Array<{ month: string; count: number }> {
+    const months = opts.months ?? 12;
+    const cutoff = new Date();
+    cutoff.setMonth(cutoff.getMonth() - months);
+    const cutoffIso = cutoff.toISOString();
+
+    if (opts.identityId) {
+      const linkRows = this.db.prepare(
+        "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
+      ).all(opts.identityId) as { sender_id: string }[];
+      const senderIds = linkRows.map(r => r.sender_id);
+      if (senderIds.length === 0) return [];
+      const placeholders = senderIds.map(() => '?').join(',');
+      return this.db.prepare(`
+        SELECT strftime('%Y-%m', platform_ts) as month, COUNT(*) as count
+        FROM messages
+        WHERE sender_id IN (${placeholders}) AND platform_ts >= ?
+        GROUP BY month ORDER BY month
+      `).all(...senderIds, cutoffIso) as Array<{ month: string; count: number }>;
+    }
+
+    if (opts.threadId) {
+      return this.db.prepare(`
+        SELECT strftime('%Y-%m', platform_ts) as month, COUNT(*) as count
+        FROM messages
+        WHERE thread_id = ? AND platform_ts >= ?
+        GROUP BY month ORDER BY month
+      `).all(opts.threadId, cutoffIso) as Array<{ month: string; count: number }>;
+    }
+
+    return this.db.prepare(`
+      SELECT strftime('%Y-%m', platform_ts) as month, COUNT(*) as count
+      FROM messages WHERE platform_ts >= ?
+      GROUP BY month ORDER BY month
+    `).all(cutoffIso) as Array<{ month: string; count: number }>;
+  }
+
+  getThreadSummary(threadId: string): { summary: string; message_count: number; generated_at: string; stale: boolean } | null {
+    const row = this.db.prepare(`
+      SELECT ts.*, t.updated_at as thread_updated_at
+      FROM thread_summaries ts
+      JOIN threads t ON t.id = ts.thread_id
+      WHERE ts.thread_id = ?
+    `).get(threadId) as { summary: string; message_count: number; generated_at: string; last_message_ts: string; thread_updated_at: string } | undefined;
+
+    if (!row) return null;
+    return {
+      summary: row.summary,
+      message_count: row.message_count,
+      generated_at: row.generated_at,
+      stale: row.last_message_ts !== row.thread_updated_at,
+    };
+  }
+
+  upsertThreadSummary(threadId: string, summary: string, messageCount: number, lastMessageTs: string, model: string): void {
+    this.db.prepare(`
+      INSERT OR REPLACE INTO thread_summaries (thread_id, summary, message_count, last_message_ts, generated_at, model)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(threadId, summary, messageCount, lastMessageTs, new Date().toISOString(), model);
+  }
+
+  getSearchSuggestions(query: string, existingResults: Message[]): string[] {
+    if (existingResults.length === 0) return [];
+
+    const threadIds = [...new Set(existingResults.map(m => m.thread_id))];
+    if (threadIds.length === 0) return [];
+    const placeholders = threadIds.map(() => '?').join(',');
+
+    const rows = this.db.prepare(`
+      SELECT DISTINCT content FROM messages
+      WHERE thread_id IN (${placeholders}) AND content IS NOT NULL
+      ORDER BY platform_ts DESC LIMIT 100
+    `).all(...threadIds) as { content: string }[];
+
+    const queryTerms = new Set(query.toLowerCase().split(/\s+/));
+    const termCounts = new Map<string, number>();
+    const STOP = new Set([
+      'this', 'that', 'with', 'from', 'have', 'been', 'they', 'what', 'would',
+      'could', 'about', 'there', 'their', 'will', 'when', 'than', 'them',
+      'were', 'some', 'more', 'also', 'into', 'just', 'like', 'your', 'know',
+      'http', 'https', 'www', 'the', 'and', 'for', 'are', 'but', 'not', 'you',
+      'all', 'can', 'had', 'her', 'was', 'one', 'our', 'out', 'has', 'its',
+    ]);
+
+    for (const row of rows) {
+      const words = row.content.toLowerCase().split(/\s+/).filter(w =>
+        w.length > 3 && !queryTerms.has(w) && !STOP.has(w) && !/^\d+$/.test(w)
+      );
+      for (const w of words) {
+        termCounts.set(w, (termCounts.get(w) ?? 0) + 1);
+      }
+    }
+
+    return [...termCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([term]) => term);
   }
 
   recentMessages(limit = 50, direction?: string, dmOnly?: boolean): Message[] {
