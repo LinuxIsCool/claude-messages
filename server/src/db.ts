@@ -401,23 +401,20 @@ export class MessageDB {
     return row?.cursor_value ?? null;
   }
 
-  searchMessages(query: string, limit = 50, direction?: string): Message[] {
-    if (direction) {
-      return this.db.prepare(`
-        SELECT m.* FROM messages m
-        JOIN messages_fts fts ON m.rowid = fts.rowid
-        WHERE messages_fts MATCH ? AND m.direction = ?
-        ORDER BY rank
-        LIMIT ?
-      `).all(query, direction, limit).map(this.parseMessage);
-    }
+  searchMessages(query: string, limit = 50, direction?: string, dmOnly?: boolean): Message[] {
+    const dirFilter = direction ? 'AND m.direction = ?' : '';
+    const dmFilter = dmOnly ? "AND m.thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')" : '';
+    const params: unknown[] = [query];
+    if (direction) params.push(direction);
+    params.push(limit);
+
     return this.db.prepare(`
       SELECT m.* FROM messages m
       JOIN messages_fts fts ON m.rowid = fts.rowid
-      WHERE messages_fts MATCH ?
+      WHERE messages_fts MATCH ? ${dirFilter} ${dmFilter}
       ORDER BY rank
       LIMIT ?
-    `).all(query, limit).map(this.parseMessage);
+    `).all(...params).map(this.parseMessage);
   }
 
   getThread(threadId: string): Thread | null {
@@ -433,15 +430,16 @@ export class MessageDB {
     `).all(threadId, limit, offset).map(this.parseMessage);
   }
 
-  recentMessages(limit = 50, direction?: string): Message[] {
-    if (direction) {
-      return this.db.prepare(`
-        SELECT * FROM messages WHERE direction = ? ORDER BY platform_ts DESC LIMIT ?
-      `).all(direction, limit).map(this.parseMessage);
-    }
+  recentMessages(limit = 50, direction?: string, dmOnly?: boolean): Message[] {
+    const dirFilter = direction ? 'AND direction = ?' : '';
+    const dmFilter = dmOnly ? "AND thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')" : '';
+    const params: unknown[] = [];
+    if (direction) params.push(direction);
+    params.push(limit);
+
     return this.db.prepare(`
-      SELECT * FROM messages ORDER BY platform_ts DESC LIMIT ?
-    `).all(limit).map(this.parseMessage);
+      SELECT * FROM messages WHERE 1=1 ${dirFilter} ${dmFilter} ORDER BY platform_ts DESC LIMIT ?
+    `).all(...params).map(this.parseMessage);
   }
 
   listThreads(platform?: string, limit = 50): Thread[] {
@@ -1682,7 +1680,7 @@ export class MessageDB {
     }));
   }
 
-  searchMessagesByIdentity(identityId: string, query?: string, limit = 50): Message[] {
+  searchMessagesByIdentity(identityId: string, query?: string, limit = 50, dmOnly?: boolean): Message[] {
     const linkRows = this.db.prepare(
       "SELECT platform || ':' || platform_id as sender_id FROM identity_links WHERE identity_id = ? AND platform != 'phone'"
     ).all(identityId) as { sender_id: string }[];
@@ -1692,6 +1690,29 @@ export class MessageDB {
 
     const placeholders = senderIds.map(() => '?').join(',');
 
+    // When dmOnly, search by thread membership (both sides of conversation)
+    // Otherwise, search by sender_id only (messages FROM this person)
+    if (dmOnly) {
+      const threadFilter = `m.thread_id IN (
+        SELECT DISTINCT thread_id FROM messages WHERE sender_id IN (${placeholders})
+      ) AND m.thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')`;
+
+      if (query) {
+        return this.db.prepare(`
+          SELECT m.* FROM messages m
+          JOIN messages_fts fts ON m.rowid = fts.rowid
+          WHERE messages_fts MATCH ? AND ${threadFilter}
+          ORDER BY rank LIMIT ?
+        `).all(query, ...senderIds, limit).map(this.parseMessage);
+      }
+
+      return this.db.prepare(`
+        SELECT * FROM messages m WHERE ${threadFilter}
+        ORDER BY m.platform_ts DESC LIMIT ?
+      `).all(...senderIds, limit).map(this.parseMessage);
+    }
+
+    // Non-DM mode: filter by sender_id (messages FROM this identity)
     if (query) {
       return this.db.prepare(`
         SELECT m.* FROM messages m
@@ -1702,9 +1723,74 @@ export class MessageDB {
     }
 
     return this.db.prepare(`
-      SELECT * FROM messages WHERE sender_id IN (${placeholders})
-      ORDER BY platform_ts DESC LIMIT ?
+      SELECT * FROM messages m WHERE m.sender_id IN (${placeholders})
+      ORDER BY m.platform_ts DESC LIMIT ?
     `).all(...senderIds, limit).map(this.parseMessage);
+  }
+
+  messagesBySender(senderId: string, query?: string, limit = 50, dmOnly?: boolean): Message[] {
+    const dmFilter = dmOnly ? "AND m.thread_id IN (SELECT id FROM threads WHERE thread_type = 'dm')" : '';
+
+    if (query) {
+      return this.db.prepare(`
+        SELECT m.* FROM messages m
+        JOIN messages_fts fts ON m.rowid = fts.rowid
+        WHERE messages_fts MATCH ? AND m.sender_id = ? ${dmFilter}
+        ORDER BY rank LIMIT ?
+      `).all(query, senderId, limit).map(this.parseMessage);
+    }
+
+    return this.db.prepare(`
+      SELECT * FROM messages m WHERE m.sender_id = ? ${dmFilter}
+      ORDER BY m.platform_ts DESC LIMIT ?
+    `).all(senderId, limit).map(this.parseMessage);
+  }
+
+  getThreadInfoBatch(threadIds: string[]): Map<string, { title: string | null; thread_type: string; message_count: number }> {
+    const result = new Map<string, { title: string | null; thread_type: string; message_count: number }>();
+    if (!threadIds.length) return result;
+    const placeholders = threadIds.map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT t.id, t.title, t.thread_type, COUNT(m.id) as message_count
+      FROM threads t
+      LEFT JOIN messages m ON m.thread_id = t.id
+      WHERE t.id IN (${placeholders})
+      GROUP BY t.id
+    `).all(...threadIds) as Array<{ id: string; title: string | null; thread_type: string; message_count: number }>;
+    for (const r of rows) {
+      result.set(r.id, { title: r.title, thread_type: r.thread_type, message_count: r.message_count });
+    }
+    return result;
+  }
+
+  getMessageContext(messageId: string, before = 5, after = 5): {
+    target: Message;
+    messages: Message[];
+    thread: Thread | null;
+  } | null {
+    const raw = this.db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
+    if (!raw) return null;
+    const target = this.parseMessage(raw);
+
+    const thread = this.getThread(target.thread_id);
+
+    const beforeMsgs = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE thread_id = ? AND platform_ts < ?
+      ORDER BY platform_ts DESC LIMIT ?
+    `).all(target.thread_id, target.platform_ts, before).map(this.parseMessage).reverse();
+
+    const afterMsgs = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE thread_id = ? AND platform_ts > ?
+      ORDER BY platform_ts ASC LIMIT ?
+    `).all(target.thread_id, target.platform_ts, after).map(this.parseMessage);
+
+    return {
+      target,
+      messages: [...beforeMsgs, target, ...afterMsgs],
+      thread,
+    };
   }
 
   autoResolve(): AutoResolveReport {

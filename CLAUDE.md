@@ -10,10 +10,12 @@ Unified messaging backbone. Syncs Telegram, Signal, Email, and Slack into SQLite
 ## MCP Tools
 | Tool | Description |
 |------|-------------|
-| `search_messages` | Full-text search across all synced messages |
-| `recent_messages` | Get latest messages across platforms |
-| `get_thread` | Get messages from a thread with sender names and participant info |
-| `list_threads` | List threads, optionally filtered by platform or identity |
+| `search_messages` | Full-text search — text/json/compact output, dm_only filter |
+| `recent_messages` | Latest messages — text/json/compact output, dm_only filter |
+| `get_thread` | Thread messages with sender names — text/json/compact output |
+| `list_threads` | List threads — text/json/compact output |
+| `messages_person` | **One-call person search** — resolves identity + searches, DM-first |
+| `get_message_context` | Context window around a message (N before + N after) |
 | `message_stats` | Counts by platform, date range |
 | `resolve_contact` | Look up unified identity for a platform contact |
 | `who_is` | Fuzzy search across names, phones, usernames — returns identity cards |

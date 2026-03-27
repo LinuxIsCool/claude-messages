@@ -3,6 +3,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import path from 'node:path';
 import { MessageDB } from './db.js';
+import { formatMessages, formatThreadList, formatThread, formatContext } from './formatters.js';
+import type { OutputFormat } from './formatters.js';
+import type { Contact, IdentityCard } from './types.js';
 
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
@@ -14,43 +17,41 @@ const db = new MessageDB(path.join(dataDir, 'messages.db'));
 
 const server = new McpServer({
   name: 'claude-messages',
-  version: '0.1.0',
+  version: '0.2.0',
 });
+
+const formatSchema = z.enum(['text', 'json', 'compact']).optional().default('text')
+  .describe('Output format: text (readable, default), json (structured), compact (one-line)');
 
 // Tool: search_messages
 server.tool(
   'search_messages',
-  'Full-text search across all synced messages, optionally filtered by identity and direction',
+  'Full-text search across all synced messages — returns readable text by default',
   {
     query: z.string().describe('Search query (FTS5 syntax supported)'),
     limit: z.number().optional().default(30).describe('Max results'),
     identity_id: z.string().optional().describe('Filter to messages from this identity across all platforms'),
     direction: z.enum(['sent', 'received', 'unknown']).optional().describe('Filter by message direction (sent/received)'),
+    dm_only: z.boolean().optional().default(false).describe('Only return DM messages (filter out group chats)'),
+    format: formatSchema,
   },
-  async ({ query, limit, identity_id, direction }) => {
+  async ({ query, limit, identity_id, direction, dm_only, format }) => {
     try {
       const results = identity_id
-        ? db.searchMessagesByIdentity(identity_id, query, limit)
-        : db.searchMessages(query, limit, direction);
+        ? db.searchMessagesByIdentity(identity_id, query, limit, dm_only || undefined)
+        : db.searchMessages(query, limit, direction, dm_only || undefined);
 
       const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
       const names = db.resolveContactNames(senderIds);
+      const threadIds = [...new Set(results.map(m => m.thread_id))];
+      const threadInfo = db.getThreadInfoBatch(threadIds);
 
-      return {
-        content: [{
-          type: 'text' as const,
-          text: JSON.stringify(results.map(m => ({
-            id: m.id,
-            thread: m.thread_id,
-            sender: m.sender_id,
-            sender_name: names.get(m.sender_id) ?? null,
-            content: m.content,
-            type: m.content_type,
-            direction: m.direction,
-            time: m.platform_ts,
-          })), null, 2),
-        }],
-      };
+      const text = formatMessages(results, names, threadInfo, {
+        format: format as OutputFormat,
+        header: `${results.length} results for "${query}"`,
+      });
+
+      return { content: [{ type: 'text' as const, text }] };
     } catch (err) {
       return { content: [{ type: 'text' as const, text: `Search error: ${err}` }] };
     }
@@ -60,30 +61,26 @@ server.tool(
 // Tool: recent_messages
 server.tool(
   'recent_messages',
-  'Get the most recent messages across all platforms, optionally filtered by direction',
+  'Get the most recent messages across all platforms — returns readable text by default',
   {
     limit: z.number().optional().default(30).describe('Max results'),
     direction: z.enum(['sent', 'received', 'unknown']).optional().describe('Filter by message direction (sent/received)'),
+    dm_only: z.boolean().optional().default(false).describe('Only return DM messages (filter out group chats)'),
+    format: formatSchema,
   },
-  async ({ limit, direction }) => {
-    const results = db.recentMessages(limit, direction);
+  async ({ limit, direction, dm_only, format }) => {
+    const results = db.recentMessages(limit, direction, dm_only || undefined);
     const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
     const names = db.resolveContactNames(senderIds);
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(results.map(m => ({
-          id: m.id,
-          thread: m.thread_id,
-          sender: m.sender_id,
-          sender_name: names.get(m.sender_id) ?? null,
-          content: m.content,
-          type: m.content_type,
-          direction: m.direction,
-          time: m.platform_ts,
-        })), null, 2),
-      }],
-    };
+    const threadIds = [...new Set(results.map(m => m.thread_id))];
+    const threadInfo = db.getThreadInfoBatch(threadIds);
+
+    const text = formatMessages(results, names, threadInfo, {
+      format: format as OutputFormat,
+      header: `${results.length} recent messages`,
+    });
+
+    return { content: [{ type: 'text' as const, text }] };
   }
 );
 
@@ -94,8 +91,9 @@ server.tool(
   {
     thread_id: z.string().describe('Thread ID (e.g. telegram:chat:12345)'),
     limit: z.number().optional().default(50).describe('Max messages'),
+    format: formatSchema,
   },
-  async ({ thread_id, limit }) => {
+  async ({ thread_id, limit, format }) => {
     const thread = db.getThread(thread_id);
     const messages = db.getThreadMessages(thread_id, limit);
 
@@ -103,29 +101,11 @@ server.tool(
     const names = db.resolveContactNames(senderIds);
     const participantNames = thread ? db.resolveContactNames(thread.participants) : new Map<string, string>();
 
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify({
-          thread: thread ? {
-            id: thread.id,
-            title: thread.title,
-            type: thread.thread_type,
-            platform: thread.platform,
-            participants: thread.participants.map(p => ({ id: p, name: participantNames.get(p) ?? null })),
-          } : null,
-          messages: messages.map(m => ({
-            id: m.id,
-            sender: m.sender_id,
-            sender_name: names.get(m.sender_id) ?? null,
-            content: m.content,
-            type: m.content_type,
-            direction: m.direction,
-            time: m.platform_ts,
-          })),
-        }, null, 2),
-      }],
-    };
+    const text = formatThread(thread, messages, names, participantNames, {
+      format: format as OutputFormat,
+    });
+
+    return { content: [{ type: 'text' as const, text }] };
   }
 );
 
@@ -137,26 +117,117 @@ server.tool(
     platform: z.string().optional().describe('Filter by platform (telegram, signal, email)'),
     identity_id: z.string().optional().describe('Filter to threads involving this identity'),
     limit: z.number().optional().default(30).describe('Max results'),
+    format: formatSchema,
   },
-  async ({ platform, identity_id, limit }) => {
+  async ({ platform, identity_id, limit, format }) => {
     if (identity_id && platform) {
       return { content: [{ type: 'text' as const, text: 'Error: identity_id and platform are mutually exclusive — use one or the other' }] };
     }
     const threads = identity_id
       ? db.getThreadsByIdentity(identity_id, limit)
       : db.listThreads(platform, limit);
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(threads.map(t => ({
-          id: t.id,
-          title: t.title,
-          type: t.thread_type,
-          platform: t.platform,
-          updated: t.updated_at,
-        })), null, 2),
-      }],
-    };
+
+    const text = formatThreadList(
+      threads.map(t => ({ id: t.id, title: t.title, thread_type: t.thread_type ?? '', platform: t.platform, updated_at: t.updated_at })),
+      { format: format as OutputFormat, header: `${threads.length} threads` },
+    );
+
+    return { content: [{ type: 'text' as const, text }] };
+  }
+);
+
+// Tool: messages_person (Phase 1 — single-call identity-first search)
+server.tool(
+  'messages_person',
+  'Search messages from/to a specific person — resolves identity automatically. One call replaces who_is + search_messages.',
+  {
+    person: z.string().describe('Name, email, phone, or username'),
+    query: z.string().optional().describe('Search within their messages'),
+    dm_only: z.boolean().optional().default(true).describe('Only DMs (default true)'),
+    limit: z.number().optional().default(20).describe('Max results'),
+    format: formatSchema,
+  },
+  async ({ person, query, dm_only, limit, format }) => {
+    try {
+      // 1. Resolve person to identity
+      const matches = db.whoIs(person, 3);
+      if (!matches.length) {
+        return { content: [{ type: 'text' as const, text: `No identity or contact found for "${person}"` }] };
+      }
+
+      const best = matches[0];
+
+      // Check if it's an IdentityCard (has platforms array) vs raw Contact
+      const isIdentity = 'platforms' in best && Array.isArray((best as IdentityCard).platforms);
+
+      if (isIdentity) {
+        const card = best as IdentityCard;
+        const results = db.searchMessagesByIdentity(card.id, query, limit, dm_only || undefined);
+        const senderIds = [...new Set(results.map(m => m.sender_id).filter(Boolean))];
+        const names = db.resolveContactNames(senderIds);
+        const threadIds = [...new Set(results.map(m => m.thread_id))];
+        const threadInfo = db.getThreadInfoBatch(threadIds);
+
+        const header = query
+          ? `${results.length} results for "${query}" from ${card.display_name}`
+          : `${results.length} recent messages with ${card.display_name}`;
+
+        const text = formatMessages(results, names, threadInfo, {
+          format: format as OutputFormat,
+          header,
+        });
+        return { content: [{ type: 'text' as const, text }] };
+      }
+
+      // Unlinked contact — search by sender_id at SQL level
+      const contact = best as Contact;
+      const results = db.messagesBySender(contact.id, query, limit, dm_only || undefined);
+
+      const names = db.resolveContactNames([contact.id]);
+      const threadIds = [...new Set(results.map(m => m.thread_id))];
+      const threadInfo = db.getThreadInfoBatch(threadIds);
+
+      const displayName = contact.display_name ?? contact.id;
+      const header = query
+        ? `${results.length} results for "${query}" from ${displayName}`
+        : `${results.length} recent messages with ${displayName}`;
+
+      const text = formatMessages(results, names, threadInfo, {
+        format: format as OutputFormat,
+        header,
+      });
+      return { content: [{ type: 'text' as const, text }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err}` }] };
+    }
+  }
+);
+
+// Tool: get_message_context (Phase 1 — context window expansion)
+server.tool(
+  'get_message_context',
+  'Get a message with surrounding conversation context from the same thread',
+  {
+    message_id: z.string().describe('Message ID from a search result'),
+    before: z.number().optional().default(5).describe('Messages before'),
+    after: z.number().optional().default(5).describe('Messages after'),
+    format: formatSchema,
+  },
+  async ({ message_id, before, after, format }) => {
+    const ctx = db.getMessageContext(message_id, before, after);
+    if (!ctx) {
+      return { content: [{ type: 'text' as const, text: `Message ${message_id} not found` }] };
+    }
+
+    const { target, messages, thread } = ctx;
+    const senderIds = [...new Set(messages.map(m => m.sender_id).filter(Boolean))];
+    const names = db.resolveContactNames(senderIds);
+
+    const text = formatContext(target, messages, thread, names, {
+      format: format as OutputFormat,
+    });
+
+    return { content: [{ type: 'text' as const, text }] };
   }
 );
 
