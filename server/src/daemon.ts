@@ -51,17 +51,8 @@ class Daemon {
     const adapterConfigs = this.config.adapters;
     const dataDir = resolveHome(this.config.data_dir);
 
-    if (adapterConfigs.telegram?.enabled) {
-      try {
-        const adapter = new TelegramAdapter((msg) => this.log(msg));
-        await adapter.init({ ...adapterConfigs.telegram, data_dir: dataDir } as AdapterConfig);
-        this.adapters.push(adapter);
-        this.log('Telegram adapter initialized');
-      } catch (err) {
-        this.log(`Telegram adapter failed to initialize: ${err}`);
-      }
-    }
-
+    // Signal FIRST — reads from local SQLite, zero network dependency, instant sync.
+    // Must run before network-dependent adapters to avoid head-of-line blocking.
     if (adapterConfigs.signal?.enabled) {
       try {
         const adapter = new SignalAdapter((msg) => this.log(msg));
@@ -70,6 +61,18 @@ class Daemon {
         this.log('Signal adapter initialized');
       } catch (err) {
         this.log(`Signal adapter failed to initialize: ${err}`);
+      }
+    }
+
+    // Telegram after Signal — network-dependent, can take 5-10 min for 881 dialogs
+    if (adapterConfigs.telegram?.enabled) {
+      try {
+        const adapter = new TelegramAdapter((msg) => this.log(msg));
+        await adapter.init({ ...adapterConfigs.telegram, data_dir: dataDir } as AdapterConfig);
+        this.adapters.push(adapter);
+        this.log('Telegram adapter initialized');
+      } catch (err) {
+        this.log(`Telegram adapter failed to initialize: ${err}`);
       }
     }
 
@@ -130,33 +133,74 @@ class Daemon {
     }
   }
 
+  // Per-adapter sync timeout (ms). Prevents one slow/hung adapter from blocking others.
+  // Telegram with 881 dialogs typically takes 5-8 min; 10 min gives headroom.
+  private static readonly ADAPTER_SYNC_TIMEOUT_MS = 10 * 60 * 1000;
+
   private async syncAll(): Promise<void> {
     for (const adapter of this.adapters) {
       try {
-        const cursor = this.db.getCursor(adapter.platform);
-        this.log(`Syncing ${adapter.platform} (cursor: ${cursor ? 'exists' : 'none'})`);
-
-        let msgCount = 0;
-        let contactCount = 0;
-        let threadCount = 0;
-
-        for await (const event of adapter.sync(cursor)) {
-          this.processEvent(event);
-          if (event.type === 'message') msgCount++;
-          else if (event.type === 'contact') contactCount++;
-          else if (event.type === 'thread') threadCount++;
-        }
-
-        // Save updated cursor
-        const newCursor = adapter.getCursor();
-        if (newCursor) {
-          this.db.updateCursor(adapter.platform, newCursor);
-        }
-
-        this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts`);
+        await this.syncOneAdapter(adapter);
       } catch (err) {
         this.log(`Error syncing ${adapter.platform}: ${err}`);
       }
+    }
+  }
+
+  private async syncOneAdapter(adapter: Adapter): Promise<void> {
+    const cursor = this.db.getCursor(adapter.platform);
+    this.log(`Syncing ${adapter.platform} (cursor: ${cursor ? 'exists' : 'none'})`);
+
+    let msgCount = 0;
+    let contactCount = 0;
+    let threadCount = 0;
+    let timedOut = false;
+
+    // Capture the generator so we can cancel it on timeout
+    const gen = adapter.sync(cursor);
+
+    // Race the sync generator against a timeout
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        // Signal the generator to stop — async generators honor .return()
+        gen.return(undefined as never);
+        reject(new Error(`${adapter.platform} sync timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`));
+      }, Daemon.ADAPTER_SYNC_TIMEOUT_MS);
+      // Don't keep the process alive just for this timer
+      if (timeoutTimer.unref) timeoutTimer.unref();
+    });
+
+    const syncWork = async () => {
+      for await (const event of gen) {
+        // Respect shutdown requests mid-sync (break triggers gen.return() automatically)
+        if (!this.running) break;
+        this.processEvent(event);
+        if (event.type === 'message') msgCount++;
+        else if (event.type === 'contact') contactCount++;
+        else if (event.type === 'thread') threadCount++;
+      }
+    };
+
+    try {
+      await Promise.race([syncWork(), timeoutPromise]);
+    } catch (err) {
+      // Re-throw non-timeout errors; timeout is handled below via finally
+      if (!timedOut) throw err;
+      this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
+    } finally {
+      // Clear timeout if sync finished before it fired
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+
+      // Always save cursor — even partial progress avoids re-processing on next cycle
+      const newCursor = adapter.getCursor();
+      if (newCursor) {
+        this.db.updateCursor(adapter.platform, newCursor);
+      }
+
+      const suffix = timedOut ? ' (partial — timed out)' : '';
+      this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts${suffix}`);
     }
   }
 
@@ -188,9 +232,13 @@ class Daemon {
 
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => {
-      const timer = setTimeout(resolve, ms);
+      let check: ReturnType<typeof setInterval>;
+      const timer = setTimeout(() => {
+        clearInterval(check);
+        resolve();
+      }, ms);
       // Allow shutdown to interrupt sleep
-      const check = setInterval(() => {
+      check = setInterval(() => {
         if (!this.running) {
           clearTimeout(timer);
           clearInterval(check);
