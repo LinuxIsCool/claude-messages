@@ -15,11 +15,11 @@ ALERT_LOG="${HOME}/.claude/local/messages/health-alerts.log"
 # Staleness thresholds per tier (seconds)
 # NOTE: Tier-0 adapters sync in <1s but the full cycle takes ~8 min (Telegram scans 881 dialogs).
 # Threshold must exceed: cycle_duration + poll_interval + margin.
-TIER_0_THRESHOLD=900    # 15 min — ~2 full cycles of headroom for local adapters
+TIER_0_THRESHOLD=1200   # 20 min — ~2.5 full cycles (Telegram scan ~8min + poll ~60s + variance)
 TIER_2_THRESHOLD=7200   # 2 hr  — network adapters (Telegram, Email, Slack)
 
 # Daemon-level staleness: if last_cycle is older than this, daemon is stuck/dead
-DAEMON_THRESHOLD=900    # 15 min (cycle ~8min + poll ~60s + margin)
+DAEMON_THRESHOLD=1200   # 20 min (cycle ~8min + poll ~60s + generous margin)
 
 NOW_EPOCH=$(date +%s)
 
