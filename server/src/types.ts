@@ -233,3 +233,37 @@ export interface FadingRelationship {
   last_message_ts: string;
   total_messages: number;
 }
+
+// --- Daemon Health Reporting ---
+
+/** Dependency tier for scheduling and staleness thresholds */
+export type AdapterTier = 0 | 1 | 2;
+
+/** Per-adapter health snapshot, written after each sync cycle */
+export interface AdapterHealth {
+  platform: string;
+  tier: AdapterTier;
+  last_success: string | null;      // ISO 8601 of last successful sync
+  last_failure: string | null;       // ISO 8601 of last failed sync (null if never failed)
+  last_error: string | null;         // error message from last failure
+  last_duration_ms: number;          // duration of last sync attempt
+  last_yield: {
+    messages: number;
+    threads: number;
+    contacts: number;
+  };
+  consecutive_failures: number;      // reset to 0 on success
+  timed_out: boolean;                // true if last sync was a timeout
+}
+
+/** Top-level daemon health file — shared contract for all Legion daemons */
+export interface DaemonHealth {
+  daemon: string;                    // 'legion-messages'
+  version: string;                   // package version or commit hash
+  pid: number;
+  started_at: string;                // ISO 8601 daemon start time
+  last_cycle: string;                // ISO 8601 of last completed syncAll()
+  cycle_count: number;               // total sync cycles since start
+  cycle_duration_ms: number;         // duration of last full syncAll()
+  adapters: Record<string, AdapterHealth>;
+}

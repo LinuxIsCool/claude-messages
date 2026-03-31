@@ -9,7 +9,7 @@ import { EmailAdapter } from './adapters/email.js';
 import { SlackAdapter } from './adapters/slack.js';
 import { WhatsAppAdapter } from './adapters/whatsapp.js';
 import type { Adapter } from './adapters/base.js';
-import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent } from './types.js';
+import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent, AdapterHealth, AdapterTier, DaemonHealth } from './types.js';
 
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
@@ -23,6 +23,12 @@ class Daemon {
   private adapters: Adapter[] = [];
   private running = false;
   private logFile: fs.WriteStream;
+
+  // Health tracking
+  private healthPath: string = '';
+  private startedAt: string = '';
+  private cycleCount: number = 0;
+  private adapterHealth: Map<string, AdapterHealth> = new Map();
 
   constructor() {
     const configPath = resolveHome('~/.claude/local/messages/config.yml');
@@ -117,6 +123,24 @@ class Daemon {
       }
     }
 
+    // Initialize health tracking
+    this.healthPath = path.join(dataDir, 'health.json');
+    this.startedAt = new Date().toISOString();
+    this.cycleCount = 0;
+    for (const adapter of this.adapters) {
+      this.adapterHealth.set(adapter.platform, {
+        platform: adapter.platform,
+        tier: Daemon.ADAPTER_TIERS[adapter.platform] ?? 2,
+        last_success: null,
+        last_failure: null,
+        last_error: null,
+        last_duration_ms: 0,
+        last_yield: { messages: 0, threads: 0, contacts: 0 },
+        consecutive_failures: 0,
+        timed_out: false,
+      });
+    }
+
     // Initial sync
     await this.syncAll();
 
@@ -137,7 +161,17 @@ class Daemon {
   // Telegram with 881 dialogs typically takes 5-8 min; 10 min gives headroom.
   private static readonly ADAPTER_SYNC_TIMEOUT_MS = 10 * 60 * 1000;
 
+  /** Adapter dependency tiers: 0=local (Signal, WhatsApp), 2=network (Telegram, Email, Slack) */
+  private static readonly ADAPTER_TIERS: Record<string, AdapterTier> = {
+    signal: 0,
+    whatsapp: 0,
+    telegram: 2,
+    email: 2,
+    slack: 2,
+  };
+
   private async syncAll(): Promise<void> {
+    const cycleStart = Date.now();
     for (const adapter of this.adapters) {
       try {
         await this.syncOneAdapter(adapter);
@@ -145,12 +179,37 @@ class Daemon {
         this.log(`Error syncing ${adapter.platform}: ${err}`);
       }
     }
+    this.cycleCount++;
+    this.writeHealth(Date.now() - cycleStart);
+  }
+
+  private writeHealth(cycleDurationMs: number): void {
+    const health: DaemonHealth = {
+      daemon: 'legion-messages',
+      version: '2.2.0',
+      pid: process.pid,
+      started_at: this.startedAt,
+      last_cycle: new Date().toISOString(),
+      cycle_count: this.cycleCount,
+      cycle_duration_ms: cycleDurationMs,
+      adapters: Object.fromEntries(this.adapterHealth),
+    };
+
+    // Atomic write: temp file → rename (prevents partial reads by health checker)
+    const tmpPath = this.healthPath + '.tmp';
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(health, null, 2) + '\n');
+      fs.renameSync(tmpPath, this.healthPath);
+    } catch (err) {
+      this.log(`Failed to write health.json: ${err}`);
+    }
   }
 
   private async syncOneAdapter(adapter: Adapter): Promise<void> {
     const cursor = this.db.getCursor(adapter.platform);
     this.log(`Syncing ${adapter.platform} (cursor: ${cursor ? 'exists' : 'none'})`);
 
+    const syncStartMs = Date.now();
     let msgCount = 0;
     let contactCount = 0;
     let threadCount = 0;
@@ -186,8 +245,17 @@ class Daemon {
     try {
       await Promise.race([syncWork(), timeoutPromise]);
     } catch (err) {
-      // Re-throw non-timeout errors; timeout is handled below via finally
-      if (!timedOut) throw err;
+      // Track health for non-timeout errors before re-throwing
+      if (!timedOut) {
+        const health = this.adapterHealth.get(adapter.platform);
+        if (health) {
+          health.last_failure = new Date().toISOString();
+          health.last_error = String(err);
+          health.consecutive_failures++;
+          health.last_duration_ms = Date.now() - syncStartMs;
+        }
+        throw err;
+      }
       this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
     } finally {
       // Clear timeout if sync finished before it fired
@@ -197,6 +265,23 @@ class Daemon {
       const newCursor = adapter.getCursor();
       if (newCursor) {
         this.db.updateCursor(adapter.platform, newCursor);
+      }
+
+      // Update adapter health
+      const health = this.adapterHealth.get(adapter.platform);
+      if (health) {
+        health.last_duration_ms = Date.now() - syncStartMs;
+        health.last_yield = { messages: msgCount, threads: threadCount, contacts: contactCount };
+        health.timed_out = timedOut;
+        if (timedOut) {
+          health.last_failure = new Date().toISOString();
+          health.last_error = `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`;
+          health.consecutive_failures++;
+        } else {
+          health.last_success = new Date().toISOString();
+          health.last_error = null;
+          health.consecutive_failures = 0;
+        }
       }
 
       const suffix = timedOut ? ' (partial — timed out)' : '';
