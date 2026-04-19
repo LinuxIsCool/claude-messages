@@ -105,7 +105,6 @@ def get_unified_contacts(db: sqlite3.Connection) -> dict:
             i.id AS identity_id,
             i.display_name,
             il.platform,
-            il.platform || ':' || il.platform_id AS sender_key,
             m.platform_ts,
             m.direction
         FROM identities i
@@ -115,7 +114,7 @@ def get_unified_contacts(db: sqlite3.Connection) -> dict:
         ORDER BY i.id, m.platform_ts
     """.format(",".join(f"'{s}'" for s in SHAWN_PLATFORM_IDS))).fetchall()
 
-    for identity_id, display_name, platform, sender_key, ts, direction in rows:
+    for identity_id, display_name, platform, ts, direction in rows:
         if identity_id not in contacts:
             contacts[identity_id] = {
                 "display_name": display_name,
@@ -323,11 +322,19 @@ def main():
     # Trim to top N
     results = results[: args.top]
 
-    # Compute summary stats
-    total_alarms = sum(1 for r in ranked if compute_8x_alarm(r[1]["messages"], now)["alarm"])
+    # Compute summary stats (use already-computed results to avoid redundant work)
+    total_alarms = sum(1 for r in results if r["alarm"]["alarm"])
+    # Count alarms across ALL contacts (not just top N) — scan remaining
+    if not args.alarms_only and len(results) < len(ranked):
+        for _, (_, extra_contact) in enumerate(ranked[len(results):], len(results) + 1):
+            if extra_contact["messages"]:
+                extra_alarm = compute_8x_alarm(extra_contact["messages"], now)
+                if extra_alarm["alarm"]:
+                    total_alarms += 1
+
     tier_counts = {}
-    for rank, (_, contact) in enumerate(ranked, 1):
-        tier, _ = classify_dunbar_tier(rank)
+    for tier_rank, _ in enumerate(ranked, 1):
+        tier, _ = classify_dunbar_tier(tier_rank)
         tier_counts[tier] = tier_counts.get(tier, 0) + 1
 
     output = {
