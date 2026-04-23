@@ -1,29 +1,28 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["requests>=2.31"]
+# dependencies = [
+#     "claude-llms @ file:///home/shawn/.claude/plugins/local/legion-plugins/plugins/claude-llms",
+# ]
 # ///
 """
-Thread summarization via claude-llms TELUS GPT OSS endpoint.
+Thread summarization via claude-llms.
 
 Input (stdin JSON):
   { "messages": [{ "sender_name": "...", "content": "...", "platform_ts": "..." }] }
 
 Output (stdout JSON):
-  { "summary": "...", "model": "telus-gpt-oss" }
+  { "summary": "...", "model": "telus:gemma-4-31b-it" }
 
-Loads TELUS credentials from ~/.claude/local/secrets/telus-api.env
-(same file as claude-llms plugin).
+No direct TELUS env-var reads. Routing + fallback + spend tracking are
+handled by `claude_llms.api.complete()`. Backlog 247 migration, 2026-04-22.
 """
 
+import asyncio
 import json
-import os
 import sys
-from pathlib import Path
 
-import requests
-
-SECRETS_FILE = Path.home() / ".claude" / "local" / "secrets" / "telus-api.env"
+from claude_llms.api import complete
 
 SYSTEM_PROMPT = (
     "Summarize this conversation in 2-3 sentences. "
@@ -33,48 +32,8 @@ SYSTEM_PROMPT = (
 )
 
 
-def load_secrets() -> dict[str, str]:
-    """Load KEY=VALUE pairs from the secrets env file."""
-    secrets: dict[str, str] = {}
-    if SECRETS_FILE.exists():
-        for line in SECRETS_FILE.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, val = line.split("=", 1)
-                secrets[key.strip()] = val.strip()
-    return secrets
-
-
-def get_config() -> tuple[str, str, str]:
-    """Resolve URL, API key, and model from env or secrets file."""
-    secrets = load_secrets()
-
-    url = os.environ.get("TELUS_GPT_OSS_URL") or secrets.get("TELUS_GPT_OSS_URL", "")
-    key = os.environ.get("TELUS_GPT_OSS_KEY") or secrets.get("TELUS_GPT_OSS_KEY", "")
-    model = (
-        os.environ.get("TELUS_LLM_MODEL")
-        or secrets.get("TELUS_LLM_MODEL", "")
-        or "gpt-oss:120b"
-    )
-
-    # Fallback to legacy TELUS_OLLAMA_URL for Mistral endpoint
-    if not url:
-        url = os.environ.get("TELUS_OLLAMA_URL") or secrets.get("TELUS_OLLAMA_URL", "")
-        if url:
-            model = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
-    if not key:
-        key = os.environ.get("TELUS_API_KEY") or secrets.get("TELUS_API_KEY", "")
-
-    return url, key, model
-
-
-def summarize(messages: list[dict]) -> tuple[str, str]:
-    """Call TELUS LLM to summarize messages. Returns (summary, model_used)."""
-    url, key, model = get_config()
-
-    if not url or not key:
-        return "(summary unavailable — no TELUS credentials found)", "none"
-
+async def summarize_async(messages: list[dict]) -> tuple[str, str]:
+    """Call claude_llms to summarize messages. Returns (summary, model_used)."""
     # Build conversation text from last 100 messages
     lines = []
     for m in messages[-100:]:
@@ -85,7 +44,7 @@ def summarize(messages: list[dict]) -> tuple[str, str]:
             lines.append(f"[{ts}] {name}: {content}")
 
     if not lines:
-        return "(empty thread)", model
+        return "(empty thread)", "none"
 
     conversation = "\n".join(lines)
 
@@ -93,23 +52,28 @@ def summarize(messages: list[dict]) -> tuple[str, str]:
     if len(conversation) > 8000:
         conversation = conversation[-8000:]
 
-    resp = requests.post(
-        f"{url.rstrip('/')}/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [
+    try:
+        result = await complete(
+            messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": conversation},
             ],
-            "max_tokens": 200,
-            "temperature": 0.3,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    summary = resp.json()["choices"][0]["message"]["content"].strip()
-    return summary, model
+            task_type="summarization",
+            sovereignty=True,
+            max_tokens=200,
+            temperature=0.3,
+            caller="claude-messages:summarize",
+        )
+        summary = (result.content or "").strip()
+        if not summary:
+            return "(summary unavailable — empty response)", result.model or "unknown"
+        return summary, result.model or "unknown"
+    except Exception as e:  # noqa: BLE001
+        return f"(summary unavailable — {type(e).__name__})", "none"
+
+
+def summarize(messages: list[dict]) -> tuple[str, str]:
+    return asyncio.run(summarize_async(messages))
 
 
 def main():
