@@ -254,6 +254,8 @@ export interface AdapterHealth {
   };
   consecutive_failures: number;      // reset to 0 on success
   timed_out: boolean;                // true if last sync was a timeout
+  skipped?: boolean;                 // true if this cycle intentionally skipped the adapter
+  cooldown_until?: string | null;     // ISO 8601 time before retrying a failing adapter
 }
 
 /** Top-level daemon health file — shared contract for all Legion daemons */

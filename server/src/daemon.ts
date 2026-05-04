@@ -138,8 +138,11 @@ class Daemon {
         last_yield: { messages: 0, threads: 0, contacts: 0 },
         consecutive_failures: 0,
         timed_out: false,
+        skipped: false,
+        cooldown_until: null,
       });
     }
+    this.seedHealthFromPreviousRun();
 
     // Initial sync
     await this.syncAll();
@@ -160,6 +163,8 @@ class Daemon {
   // Per-adapter sync timeout (ms). Prevents one slow/hung adapter from blocking others.
   // Telegram with 881 dialogs typically takes 5-8 min; 10 min gives headroom.
   private static readonly ADAPTER_SYNC_TIMEOUT_MS = 10 * 60 * 1000;
+  private static readonly DEFAULT_COOLDOWN_AFTER_FAILURES = 3;
+  private static readonly DEFAULT_FAILURE_COOLDOWN_MINUTES = 60;
 
   /** Adapter dependency tiers: 0=local (Signal, WhatsApp), 2=network (Telegram, Email, Slack) */
   private static readonly ADAPTER_TIERS: Record<string, AdapterTier> = {
@@ -169,6 +174,79 @@ class Daemon {
     email: 2,
     slack: 2,
   };
+
+  private seedHealthFromPreviousRun(): void {
+    try {
+      if (!fs.existsSync(this.healthPath)) return;
+      const previous = JSON.parse(fs.readFileSync(this.healthPath, 'utf-8')) as Partial<DaemonHealth>;
+      for (const [platform, current] of this.adapterHealth.entries()) {
+        const previousHealth = previous.adapters?.[platform];
+        if (!previousHealth) continue;
+        this.adapterHealth.set(platform, {
+          ...current,
+          last_success: previousHealth.last_success,
+          last_failure: previousHealth.last_failure,
+          last_error: previousHealth.last_error,
+          last_duration_ms: previousHealth.last_duration_ms,
+          last_yield: previousHealth.last_yield,
+          consecutive_failures: previousHealth.consecutive_failures,
+          timed_out: previousHealth.timed_out,
+          skipped: previousHealth.skipped ?? false,
+          cooldown_until: previousHealth.cooldown_until ?? null,
+        });
+      }
+    } catch (err) {
+      this.log(`Failed to seed health from previous run: ${err}`);
+    }
+  }
+
+  private adapterConfigFor(platform: string): AdapterConfig | undefined {
+    return this.config.adapters[platform] ?? this.config.adapters[platform.split(':')[0]];
+  }
+
+  private cooldownAfterFailures(platform: string): number {
+    const configured = this.adapterConfigFor(platform)?.cooldown_after_failures;
+    return typeof configured === 'number'
+      ? configured
+      : Daemon.DEFAULT_COOLDOWN_AFTER_FAILURES;
+  }
+
+  private failureCooldownMs(platform: string): number {
+    const configured = this.adapterConfigFor(platform)?.failure_cooldown_minutes;
+    const minutes = typeof configured === 'number'
+      ? configured
+      : Daemon.DEFAULT_FAILURE_COOLDOWN_MINUTES;
+    return Math.max(1, minutes) * 60 * 1000;
+  }
+
+  private startFailureCooldown(platform: string, health: AdapterHealth): void {
+    const afterFailures = this.cooldownAfterFailures(platform);
+    if (afterFailures <= 0 || health.consecutive_failures < afterFailures) return;
+    health.cooldown_until = new Date(Date.now() + this.failureCooldownMs(platform)).toISOString();
+  }
+
+  private shouldSkipForCooldown(platform: string, health: AdapterHealth): boolean {
+    const afterFailures = this.cooldownAfterFailures(platform);
+    if (afterFailures <= 0 || health.consecutive_failures < afterFailures) return false;
+
+    if (!health.cooldown_until) {
+      this.startFailureCooldown(platform, health);
+    }
+
+    const cooldownUntilMs = health.cooldown_until ? Date.parse(health.cooldown_until) : NaN;
+    if (!Number.isFinite(cooldownUntilMs) || cooldownUntilMs <= Date.now()) {
+      health.cooldown_until = null;
+      return false;
+    }
+
+    health.skipped = true;
+    health.timed_out = false;
+    health.last_duration_ms = 0;
+    health.last_yield = { messages: 0, threads: 0, contacts: 0 };
+    health.last_error = `Skipped until ${health.cooldown_until} after ${health.consecutive_failures} consecutive failures`;
+    this.log(`${platform} sync skipped: ${health.last_error}`);
+    return true;
+  }
 
   private async syncAll(): Promise<void> {
     const cycleStart = Date.now();
@@ -206,6 +284,11 @@ class Daemon {
   }
 
   private async syncOneAdapter(adapter: Adapter): Promise<void> {
+    const existingHealth = this.adapterHealth.get(adapter.platform);
+    if (existingHealth && this.shouldSkipForCooldown(adapter.platform, existingHealth)) {
+      return;
+    }
+
     const cursor = this.db.getCursor(adapter.platform);
     this.log(`Syncing ${adapter.platform} (cursor: ${cursor ? 'exists' : 'none'})`);
 
@@ -253,6 +336,8 @@ class Daemon {
           health.last_error = String(err);
           health.consecutive_failures++;
           health.last_duration_ms = Date.now() - syncStartMs;
+          health.skipped = false;
+          this.startFailureCooldown(adapter.platform, health);
         }
         throw err;
       }
@@ -273,14 +358,17 @@ class Daemon {
         health.last_duration_ms = Date.now() - syncStartMs;
         health.last_yield = { messages: msgCount, threads: threadCount, contacts: contactCount };
         health.timed_out = timedOut;
+        health.skipped = false;
         if (timedOut) {
           health.last_failure = new Date().toISOString();
           health.last_error = `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`;
           health.consecutive_failures++;
+          this.startFailureCooldown(adapter.platform, health);
         } else {
           health.last_success = new Date().toISOString();
           health.last_error = null;
           health.consecutive_failures = 0;
+          health.cooldown_until = null;
         }
       }
 
