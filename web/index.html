@@ -84,6 +84,11 @@
         <p class="font-mono text-sm text-gray-500 mt-2">Unified messaging corpus browser</p>
       </div>
       <div class="flex items-center gap-3">
+        <a href="http://127.0.0.1:8800/home/?embedded=1" title="Legion Webui Hub"
+           class="rounded-lg border border-surface-border bg-surface-card hover:border-accent-blue transition-colors px-3 py-2 min-w-24 no-underline">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Legion</div>
+          <div class="font-mono text-xs text-accent-blue mt-1">⌂ Hub</div>
+        </a>
         <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-52">
           <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Corpus</div>
           <div id="header-counts" class="font-mono text-xs text-gray-400 mt-1">Loading…</div>
@@ -773,5 +778,7 @@ async function boot() {
 
 boot();
 </script>
+  <!-- Mandatory Legion hub-bar standard: no-op in Mode A, injects "← Legion Webui Hub" bar in Mode B. -->
+  <script src="static/embedded-bar.js"></script>
 </body>
 </html>
