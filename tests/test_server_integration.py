@@ -54,7 +54,7 @@ def test_healthz(live_server: str) -> None:
 def test_root_serves_spa(live_server: str) -> None:
     status, body = _get(f"{live_server}/")
     assert status == 200
-    assert 'id="grid"' in body  # the card grid container
+    assert "MESSAGES" in body and "/api/list" in body  # layout-agnostic SPA markers
 
 
 def test_api_list_reverse_chron(live_server: str) -> None:

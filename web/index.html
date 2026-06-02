@@ -1,244 +1,776 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Messages — Legion</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Messages</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><text x='50%' y='52' font-size='52' text-anchor='middle'>%F0%9F%92%AC</text></svg>">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
-    tailwind.config = { darkMode: "class", theme: { extend: { colors: {
-      base:"#1e1e2e", mantle:"#181825", surface:"#313244", overlay:"#45475a",
-      text:"#cdd6f4", subtext:"#a6adc8", green:"#a6e3a1", blue:"#89b4fa",
-      red:"#f38ba8", yellow:"#f9e2af", purple:"#cba6f7", pink:"#f5c2e7", teal:"#94e2d5",
-    }, fontFamily: { display:['"Press Start 2P"',"monospace"], mono:['"JetBrains Mono"',"monospace"] } } } };
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            pixel: ['"Press Start 2P"', 'monospace'],
+            mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+          },
+          colors: {
+            surface: { DEFAULT: '#0f0f17', card: '#161622', border: '#2a2a3e', raised: '#1e1e30' },
+            accent: { green: '#a6e3a1', blue: '#89b4fa', red: '#f38ba8', yellow: '#f9e2af', purple: '#cba6f7' },
+          },
+          animation: {
+            'fade-in': 'fade-in 0.2s ease-out',
+          },
+          keyframes: {
+            'fade-in': {
+              from: { opacity: 0, transform: 'translateY(5px)' },
+              to: { opacity: 1, transform: 'translateY(0)' },
+            },
+          },
+        }
+      }
+    }
   </script>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
-    body { background:#1e1e2e; color:#cdd6f4; font-family:"JetBrains Mono",monospace; }
-    .input { background:#181825; border:1px solid #45475a; border-radius:6px; padding:6px 10px; color:#cdd6f4; font-size:12px; }
-    .input:focus { outline:none; border-color:#89b4fa; }
-    .card { background:#313244; border:1px solid #45475a; border-radius:10px; padding:12px; cursor:pointer; transition:border-color .12s; }
-    .card:hover { border-color:#89b4fa; }
-    .badge { font-size:10px; padding:1px 6px; border-radius:999px; border:1px solid #45475a; color:#a6adc8; }
-    .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
-    .bar { height:5px; border-radius:999px; background:#45475a; overflow:hidden; }
-    .bar > i { display:block; height:100%; background:#a6e3a1; }
-    .glyph { width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; border-radius:5px; font-size:12px; }
-    .ava { width:26px; height:26px; border-radius:6px; }
-    #detail { position:fixed; inset:0; background:rgba(17,17,27,.7); display:none; align-items:flex-start; justify-content:center; padding:5vh 16px; z-index:50; }
-    #detail.open { display:flex; }
-    .panel { background:#1e1e2e; border:1px solid #45475a; border-radius:12px; max-width:720px; width:100%; padding:20px; max-height:88vh; overflow:auto; }
+    :root { color-scheme: dark; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { background: #0f0f17; color: #cdd6f4; }
+    ::-webkit-scrollbar { width: 7px; height: 7px; }
+    ::-webkit-scrollbar-track { background: #0f0f17; }
+    ::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 4px; }
+    button, input, select, a { transition: all .15s ease; }
+    .nav-tab:hover { transform: translateY(-1px); border-color: #89b4fa66; color: #89b4fa; }
+    .nav-tab.active { border-color: #a6e3a166; color: #a6e3a1; background: #a6e3a111; }
+    .nav-tab.disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+    .msg-row { transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+    .msg-row:hover { transform: translateX(3px); background: #1e1e30; border-color: #89b4fa55; }
+    .msg-row.selected { background: #a6e3a10d; border-color: #a6e3a166; }
+    .badge { border: 1px solid #2a2a3e; background: #0f0f17; color: #bac2de; }
+    .metric-card:hover { border-color: #89b4fa66; transform: translateY(-1px); }
+    mark { background: #f9e2af33; color: #f9e2af; border-radius: 3px; padding: 0 2px; }
+    .line-clamp-2 {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .conn-bar { height: 4px; border-radius: 999px; background: #2a2a3e; overflow: hidden; display: inline-block; vertical-align: middle; }
+    .conn-bar > i { display: block; height: 100%; background: #a6e3a1; }
+    .input-field {
+      background: #161622;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      padding: 5px 10px;
+      color: #cdd6f4;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .input-field:focus { outline: none; border-color: #89b4fa; }
+    .input-field::placeholder { color: #45475a; }
+    @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .live-on { animation: livePulse 1.6s ease-in-out infinite; }
+    @keyframes slideIn { from { opacity:0; transform: translateX(8px); } to { opacity:1; transform: translateX(0); } }
+    .slide-in { animation: slideIn 0.2s ease-out; }
   </style>
 </head>
-<body>
-  <header class="sticky top-0 z-40 bg-mantle border-b border-overlay px-4 py-3">
-    <div class="flex items-center gap-3 flex-wrap">
-      <span style="font-family:'Press Start 2P',monospace" class="text-blue text-xs">MESSAGES</span>
-      <span id="summary" class="text-subtext text-xs"></span>
-      <span id="live" class="badge ml-auto">● live</span>
-    </div>
-    <div class="flex items-center gap-2 flex-wrap mt-3">
-      <input id="q" class="input flex-1 min-w-[200px]" placeholder="Search messages (FTS)…" />
-      <select id="platform" class="input"><option value="">all platforms</option></select>
-      <select id="direction" class="input">
-        <option value="">any direction</option>
-        <option value="received">received</option>
-        <option value="sent">sent</option>
-      </select>
-      <input id="since" type="date" class="input" />
-      <input id="until" type="date" class="input" />
-      <button id="clear" class="input cursor-pointer">clear</button>
+<body class="min-h-screen overflow-x-hidden">
+
+  <header class="w-full max-w-[1800px] mx-auto px-5 2xl:px-6 pt-6 pb-4">
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div>
+        <h1 class="font-pixel text-accent-green text-lg tracking-wider">MESSAGES</h1>
+        <p class="font-mono text-sm text-gray-500 mt-2">Unified messaging corpus browser</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-52">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Corpus</div>
+          <div id="header-counts" class="font-mono text-xs text-gray-400 mt-1">Loading…</div>
+        </div>
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-28">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Mode</div>
+          <div class="font-mono text-xs text-accent-blue mt-1">Read-only · :8895</div>
+        </div>
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-20">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Live</div>
+          <div id="sse-indicator" class="font-mono text-xs text-gray-500 mt-1">● connecting</div>
+        </div>
+      </div>
     </div>
   </header>
 
-  <main id="grid" class="p-4 grid gap-3" style="grid-template-columns:repeat(auto-fill,minmax(320px,1fr))"></main>
-  <div class="flex justify-center pb-10">
-    <button id="more" class="input cursor-pointer" style="display:none">load more</button>
-  </div>
+  <main class="w-full max-w-[1800px] mx-auto px-5 2xl:px-6 pb-8 grid grid-cols-1 xl:grid-cols-12 gap-5 2xl:gap-6">
+    <!-- Left nav -->
+    <aside class="xl:col-span-2 min-w-0">
+      <div class="sticky top-6 space-y-4">
+        <nav id="nav" class="rounded-xl border border-surface-border bg-surface-card p-2 space-y-1.5">
+          <button data-view="messages" class="nav-tab active w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Messages</button>
+          <button data-view="search" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Search</button>
+          <button data-view="stats" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Stats</button>
+          <button data-view="threads" class="nav-tab disabled w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Threads <span class="text-gray-700 text-[9px]">soon</span></button>
+        </nav>
+      </div>
+    </aside>
 
-  <div id="detail" onclick="if(event.target===this)closeDetail()"><div class="panel" id="panelBody"></div></div>
+    <!-- Center view -->
+    <section class="xl:col-span-7 min-w-0">
+      <div id="view-root" class="animate-fade-in"></div>
+    </section>
+
+    <!-- Right detail panel -->
+    <aside class="xl:col-span-3 min-w-0">
+      <div class="sticky top-6 space-y-4">
+        <section id="detail-panel" class="rounded-xl border border-surface-border bg-surface-card overflow-hidden">
+          <div class="p-4 border-b border-surface-border flex items-center justify-between">
+            <h2 class="font-pixel text-accent-purple text-[10px] tracking-wider">MESSAGE</h2>
+            <span id="detail-context" class="font-mono text-[10px] text-gray-600">Select a message</span>
+          </div>
+          <div id="detail-body" class="p-4 font-mono text-sm text-gray-500">
+            Click any message row to view the full content here.
+          </div>
+        </section>
+      </div>
+    </aside>
+  </main>
 
 <script>
-const PLATFORM_GLYPH = {
-  telegram:{e:"✈",bg:"#229ED9"}, signal:{e:"◎",bg:"#3A76F0"},
-  email:{e:"✉",bg:"#cba6f7"}, whatsapp:{e:"✆",bg:"#25D366"},
-  slack:{e:"#",bg:"#E01E5A"}, default:{e:"•",bg:"#45475a"}
-};
-const PRIORITY_COLOR = {
-  support_clique:"#f38ba8", sympathy_group:"#fab387", active_network:"#f9e2af",
-  acquaintance:"#94e2d5"
-};
-const state = { q:"", platform:"", direction:"", since:"", until:"", offset:0, limit:60 };
-const PAGE = 60;
-let lastBatch = [];
+// ── Security escaper — KEEP EXACT: attribute-safe, encodes all injection chars ──
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"'`=\/]/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;","=":"&#61;","/":"&#47;"}[c]
+  ));
+}
 
-function loadState() {
-  const u = new URLSearchParams(location.search);
+// ── Relative time with NaN guard ──
+function rel(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  const s = (Date.now() - d.getTime()) / 1000;
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  if (s < 2592000) return Math.floor(s / 86400) + "d";
+  return d.toISOString().slice(0, 10);
+}
+
+function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+// ── Platform glyph map ──
+const PLATFORM_GLYPH = {
+  telegram:  { e: "✈", bg: "#229ED9" },
+  signal:    { e: "◎", bg: "#3A76F0" },
+  email:     { e: "✉", bg: "#cba6f7" },
+  whatsapp:  { e: "✆", bg: "#25D366" },
+  slack:     { e: "#", bg: "#E01E5A" },
+  default:   { e: "•", bg: "#45475a" },
+};
+
+const PRIORITY_COLOR = {
+  support_clique:  "#f38ba8",
+  sympathy_group:  "#fab387",
+  active_network:  "#f9e2af",
+  acquaintance:    "#94e2d5",
+};
+
+function glyphHTML(p) {
+  const g = PLATFORM_GLYPH[p] || PLATFORM_GLYPH.default;
+  return `<span title="${esc(p)}" style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;font-size:12px;background:${g.bg};color:#fff;flex-shrink:0">${g.e}</span>`;
+}
+
+function hashHue(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; }
+
+function identiconHTML(name) {
+  const hue = hashHue(name || "?");
+  const hue2 = (hue + 40) % 360;
+  const initials = esc((name || "?").replace(/^[a-z]+:user:/, "").slice(0, 2).toUpperCase());
+  return `<span style="width:26px;height:26px;border-radius:6px;background:linear-gradient(135deg,hsl(${hue} 50% 45%),hsl(${hue2} 50% 35%));display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:#fff;flex-shrink:0">${initials}</span>`;
+}
+
+// ── API helper ──
+function apiPath(p) { return p.replace(/^\//, ""); }
+async function api(path) {
+  const r = await fetch(apiPath(path));
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+// ── State ──
+const state = {
+  view: "messages",
+  q: "",
+  platform: "",
+  direction: "",
+  since: "",
+  until: "",
+  offset: 0,
+  limit: 50,
+  selectedId: null,
+  rows: [],         // current loaded rows
+  facets: null,
+  stats: null,
+};
+
+const LS_KEY = "legion.messages.filters";
+
+function loadFilters() {
+  const params = new URLSearchParams(location.search);
   let any = false;
-  for (const k of ["q","platform","direction","since","until"]) {
-    if (u.has(k)) { state[k]=u.get(k); any=true; }
+  for (const k of ["q","platform","direction","since","until","view"]) {
+    if (params.has(k)) { state[k] = params.get(k); any = true; }
   }
   if (!any) {
-    try { const s=JSON.parse(localStorage.getItem("messages.filters")||"{}");
-      for (const k of ["q","platform","direction","since","until"]) if(s[k]) state[k]=s[k];
-    } catch(e){}
+    try {
+      const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
+      for (const k of ["q","platform","direction","since","until"]) if (s[k]) state[k] = s[k];
+    } catch(e) {}
   }
 }
-function persist() {
+
+function persistFilters() {
   const u = new URLSearchParams();
-  for (const k of ["q","platform","direction","since","until"]) if(state[k]) u.set(k,state[k]);
-  history.replaceState({}, "", u.toString()? "?"+u.toString() : location.pathname);
-  localStorage.setItem("messages.filters", JSON.stringify(
-    Object.fromEntries(["q","platform","direction","since","until"].map(k=>[k,state[k]]))));
-}
-function syncInputs() {
-  q.value=state.q; platform.value=state.platform; direction.value=state.direction;
-  since.value=state.since? state.since.slice(0,10):""; until.value=state.until? state.until.slice(0,10):"";
+  for (const k of ["q","platform","direction","since","until"]) if (state[k]) u.set(k, state[k]);
+  if (state.view !== "messages") u.set("view", state.view);
+  history.replaceState({}, "", u.toString() ? "?" + u.toString() : location.pathname);
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(
+      Object.fromEntries(["q","platform","direction","since","until"].map(k => [k, state[k]]))
+    ));
+  } catch(e) {}
 }
 
-function hashHue(s){ let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0; return h%360; }
-function identicon(name){
-  const hue=hashHue(name||"?"); const hue2=(hue+40)%360;
-  const initials=(name||"?").replace(/^[a-z]+:user:/,'').slice(0,2).toUpperCase();
-  return `<span class="ava" style="background:linear-gradient(135deg,hsl(${hue} 50% 45%),hsl(${hue2} 50% 35%));display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:#fff">${esc(initials)}</span>`;
+// ── Nav routing ──
+function setView(view, persist = true) {
+  state.view = view;
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+  if (persist) persistFilters();
+  renderView();
 }
-function glyph(p){ const g=PLATFORM_GLYPH[p]||PLATFORM_GLYPH.default;
-  return `<span class="glyph" style="background:${g.bg};color:#fff" title="${esc(p)}">${g.e}</span>`; }
-function esc(s){ return String(s==null?"":s).replace(/[&<>"'`=\/]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;","=":"&#61;","/":"&#47;"}[c])); }
-function rel(ts){ if(!ts) return ""; const d=new Date(ts); if(isNaN(d.getTime())) return ""; const s=(Date.now()-d.getTime())/1000;
-  if(s<3600) return Math.floor(s/60)+"m"; if(s<86400) return Math.floor(s/3600)+"h";
-  if(s<2592000) return Math.floor(s/86400)+"d"; return d.toISOString().slice(0,10); }
 
-function cardHTML(m){
+function renderView() {
+  if (state.view === "messages") renderMessages();
+  else if (state.view === "search") renderSearch();
+  else if (state.view === "stats") renderStats();
+}
+
+// ── Message row HTML ──
+function msgRowHTML(m, selected = false) {
   const from = m.sender_name || m.sender_id || "unknown";
-  const to = m.direction==="sent" ? (m.thread_title||"—") : "me";
-  const conn = m.connectedness!=null ? Math.round(m.connectedness*100) : null;
-  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier]||"#a6adc8") : null;
-  const tags = (m.tags||[]).map(t=>`<span class="badge">#${esc(t)}</span>`).join(" ");
-  const vents = (m.ventures||[]).map(v=>`<span class="badge" style="border-color:#cba6f7;color:#cba6f7">◆ ${esc(v)}</span>`).join(" ");
-  return `<div class="card" data-id="${esc(m.id)}">
+  const to = m.direction === "sent" ? (m.thread_title || "—") : "me";
+  const conn = m.connectedness != null ? Math.round(m.connectedness * 100) : null;
+  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier] || "#a6adc8") : null;
+  const tags = (m.tags || []).map(t => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]">#${esc(t)}</span>`).join(" ");
+  const vents = (m.ventures || []).map(v => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]" style="border-color:#cba6f788;color:#cba6f7">◆ ${esc(v)}</span>`).join(" ");
+  const selCls = selected ? "selected" : "";
+
+  return `<div class="msg-row ${selCls} rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer" data-id="${esc(m.id)}">
     <div class="flex items-center gap-2">
-      ${glyph(m.platform)} ${identicon(from)}
+      ${glyphHTML(m.platform)}
+      ${identiconHTML(from)}
       <div class="min-w-0 flex-1">
-        <div class="text-xs truncate"><b>${esc(from)}</b> <span class="text-subtext">→ ${esc(to)}</span></div>
-        <div class="text-subtext" style="font-size:10px">${esc(m.thread_title||m.platform)}</div>
+        <div class="font-mono text-xs truncate"><b class="text-gray-200">${esc(from)}</b> <span class="text-gray-500">→ ${esc(to)}</span></div>
+        <div class="font-mono text-gray-600" style="font-size:10px">${esc(m.thread_title || m.platform)}</div>
       </div>
-      <div class="text-subtext" style="font-size:10px" title="${esc(m.timestamp)}">${rel(m.timestamp)}</div>
+      <div class="flex flex-col items-end gap-1 flex-shrink-0">
+        <span class="font-mono text-gray-600 text-[10px]" title="${esc(m.timestamp)}">${rel(m.timestamp)}</span>
+        ${conn != null ? `<span class="conn-bar" style="width:40px" title="connectedness ${conn}%"><i style="width:${conn}%"></i></span>` : ""}
+      </div>
     </div>
-    <div class="clamp2 mt-2 text-text" style="font-size:12px">${esc(m.content||"")}</div>
-    <div class="flex items-center gap-2 mt-2 flex-wrap">
+    <div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(m.content || "")}</div>
+    ${(tags || vents || pc) ? `<div class="flex items-center gap-2 mt-2 flex-wrap">
       ${tags} ${vents}
-      <div class="ml-auto flex items-center gap-2">
-        ${conn!=null? `<div class="bar" style="width:46px" title="connectedness ${conn}%"><i style="width:${conn}%"></i></div>`:""}
-        ${pc? `<span class="badge" style="border-color:${pc};color:${pc}">${esc(m.priority_tier)}</span>`:""}
-      </div>
-    </div></div>`;
+      ${pc ? `<span class="ml-auto inline-block rounded-full px-2 py-0.5 font-mono text-[10px] border" style="border-color:${pc}66;color:${pc}">${esc(m.priority_tier)}</span>` : ""}
+    </div>` : ""}
+  </div>`;
 }
 
-async function api(path){ const r=await fetch(path); if(!r.ok) throw new Error(r.status); return r.json(); }
-function queryString(){
-  const u=new URLSearchParams();
-  if(state.platform) u.set("platform",state.platform);
-  if(state.direction) u.set("direction",state.direction);
-  if(state.since) u.set("since",state.since);
-  if(state.until) u.set("until",state.until);
-  u.set("limit",state.limit); u.set("offset",state.offset);
-  return u.toString();
+// ── Filter bar HTML ──
+function filterBarHTML(showSearch = false) {
+  const platformOpts = state.facets
+    ? state.facets.platforms.map(p => `<option value="${esc(p.value)}" ${state.platform === p.value ? "selected" : ""}>${esc(p.value)} (${fmt(p.count)})</option>`).join("")
+    : "";
+  return `<div class="rounded-xl border border-surface-border bg-surface-card p-3 mb-4 space-y-2">
+    <div class="flex gap-2 flex-wrap">
+      <input id="filter-q" type="text" class="input-field flex-1 min-w-[180px]" placeholder="${showSearch ? "Search messages (FTS)…" : "Filter messages…"}" value="${esc(state.q)}" />
+      <select id="filter-platform" class="input-field">
+        <option value="" ${!state.platform ? "selected" : ""}>all platforms</option>
+        ${platformOpts}
+      </select>
+      <select id="filter-direction" class="input-field">
+        <option value="" ${!state.direction ? "selected" : ""}>any direction</option>
+        <option value="received" ${state.direction === "received" ? "selected" : ""}>received</option>
+        <option value="sent" ${state.direction === "sent" ? "selected" : ""}>sent</option>
+      </select>
+    </div>
+    <div class="flex gap-2 flex-wrap">
+      <input id="filter-since" type="date" class="input-field" value="${esc(state.since ? state.since.slice(0,10) : "")}" />
+      <input id="filter-until" type="date" class="input-field" value="${esc(state.until ? state.until.slice(0,10) : "")}" />
+      <button id="filter-clear" class="input-field cursor-pointer hover:border-accent-red/60 hover:text-accent-red">clear</button>
+    </div>
+  </div>`;
 }
-async function fetchBatch(){
-  if(state.q.trim()){
-    const u=new URLSearchParams({q:state.q, limit:state.limit, offset:state.offset});
-    if(state.platform)u.set("platform",state.platform);
-    if(state.direction)u.set("direction",state.direction);
-    if(state.since)u.set("since",state.since);
-    if(state.until)u.set("until",state.until);
-    return api("/api/search?"+u.toString());
+
+function bindFilterBar(onChanged) {
+  const q = document.getElementById("filter-q");
+  const plat = document.getElementById("filter-platform");
+  const dir = document.getElementById("filter-direction");
+  const since = document.getElementById("filter-since");
+  const until = document.getElementById("filter-until");
+  const clear = document.getElementById("filter-clear");
+
+  let debounce;
+  function changed() {
+    state.q = q ? q.value : state.q;
+    state.platform = plat ? plat.value : state.platform;
+    state.direction = dir ? dir.value : state.direction;
+    state.since = since && since.value ? since.value + "T00:00:00Z" : "";
+    state.until = until && until.value ? until.value + "T23:59:59Z" : "";
+    persistFilters();
+    clearTimeout(debounce);
+    debounce = setTimeout(onChanged, 200);
   }
-  return api("/api/list?"+queryString());
-}
-async function render(reset=true){
-  if(reset){ state.offset=0; grid.innerHTML=""; }
-  const batch=await fetchBatch();
-  lastBatch=batch;
-  grid.insertAdjacentHTML("beforeend", batch.map(cardHTML).join(""));
-  more.style.display = batch.length>=state.limit ? "" : "none";
-  bindCards();
-}
-function bindCards(){
-  grid.querySelectorAll(".card").forEach(el=>{ el.onclick=()=>openDetail(el.dataset.id); });
+
+  if (q) q.oninput = changed;
+  if (plat) plat.onchange = changed;
+  if (dir) dir.onchange = changed;
+  if (since) since.onchange = changed;
+  if (until) until.onchange = changed;
+  if (clear) clear.onclick = () => {
+    for (const k of ["q","platform","direction","since","until"]) state[k] = "";
+    persistFilters();
+    onChanged();
+  };
 }
 
-async function openDetail(id, push=true){
-  const m=await api("/api/detail/"+encodeURIComponent(id));
-  const from=m.sender_name||m.sender_id||"unknown";
-  panelBody.innerHTML=`
-    <div class="flex items-center gap-3 mb-3">${glyph(m.platform)} ${identicon(from)}
-      <div><div class="text-sm"><b>${esc(from)}</b></div>
-      <div class="text-subtext" style="font-size:11px">${esc(m.thread_title||"")} · ${esc(m.timestamp)} · ${esc(m.direction)}</div></div>
-      <button class="input ml-auto cursor-pointer" onclick="closeDetail()">close</button></div>
-    ${m.reply_context? `<div class="card mb-2" style="cursor:default"><div class="text-subtext" style="font-size:10px">↩ replying to</div><div style="font-size:12px">${esc(m.reply_context.content)}</div></div>`:""}
-    <div style="font-size:13px;white-space:pre-wrap">${esc(m.content||"")}</div>
-    <div class="mt-3 flex gap-2 flex-wrap">
-      ${m.connectedness!=null? `<span class="badge">connectedness ${Math.round(m.connectedness*100)}%</span>`:""}
-      ${m.priority_tier? `<span class="badge">${esc(m.priority_tier)}</span>`:""}
-      <span class="badge">id ${esc(m.id)}</span>
+// ── Messages view ──
+function renderMessages() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5 flex items-end justify-between gap-4">
+      <div>
+        <h2 class="font-pixel text-accent-green text-sm tracking-wider">MESSAGES</h2>
+        <p class="font-mono text-sm text-gray-500 mt-2">Reverse-chronological feed</p>
+      </div>
+      <div id="new-indicator" class="font-mono text-[10px] text-accent-green hidden"></div>
+    </div>
+    ${filterBarHTML(false)}
+    <div id="msg-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
     </div>`;
-  detail.classList.add("open");
-  const _u=location.pathname+location.search+"#m/"+id;
-  if(push) history.pushState({detail:id}, "", _u); else history.replaceState({detail:id}, "", _u);
-}
-function closeDetail(){ detail.classList.remove("open");
-  if(location.hash) history.pushState({}, "", location.pathname+location.search); }
 
-// ── filter wiring ──
-let debounce;
-function onFilter(){
-  state.q=q.value; state.platform=platform.value; state.direction=direction.value;
-  state.since=since.value? since.value+"T00:00:00Z":""; state.until=until.value? until.value+"T23:59:59Z":"";
-  persist(); clearTimeout(debounce); debounce=setTimeout(()=>render(true),180);
-}
-q.oninput=onFilter; platform.onchange=onFilter; direction.onchange=onFilter;
-since.onchange=onFilter; until.onchange=onFilter;
-clear.onclick=()=>{ for(const k of ["q","platform","direction","since","until"]) state[k]=""; syncInputs(); persist(); render(true); };
-more.onclick=async()=>{ state.offset+=state.limit; const b=await fetchBatch();
-  const existing=new Set([...grid.querySelectorAll(".card")].map(e=>e.dataset.id));
-  const fresh=b.filter(m=>!existing.has(m.id));
-  grid.insertAdjacentHTML("beforeend", fresh.map(cardHTML).join("")); bindCards();
-  more.style.display=b.length>=state.limit?"":"none"; };
-window.onpopstate=()=>{ if(!location.hash) closeDetail(); };
+  bindFilterBar(() => {
+    state.offset = 0;
+    state.rows = [];
+    loadMessages(true);
+  });
 
-// ── live SSE: prepend new messages when not searching/paging ──
-function startSSE(){
-  try{
-    const es=new EventSource("/api/events");
-    es.onmessage=()=>{}; // generic
-    es.addEventListener("corpus-changed", async()=>{
-      if(state.q.trim()||state.offset>0) return; // don't disrupt an active search/scroll
-      const fresh=await api("/api/list?"+queryString());
-      const existing=new Set([...grid.querySelectorAll(".card")].map(e=>e.dataset.id));
-      const newOnes=fresh.filter(m=>!existing.has(m.id));
-      if(newOnes.length){ grid.insertAdjacentHTML("afterbegin", newOnes.map(cardHTML).join("")); bindCards();
-        live.textContent="● +"+newOnes.length; setTimeout(()=>live.textContent="● live",2500); }
+  state.offset = 0;
+  state.rows = [];
+  loadMessages(true);
+}
+
+async function loadMessages(reset = false) {
+  if (reset) {
+    state.rows = [];
+    state.offset = 0;
+  }
+  const list = document.getElementById("msg-list");
+  if (!list) return;
+
+  const u = new URLSearchParams();
+  if (state.platform) u.set("platform", state.platform);
+  if (state.direction) u.set("direction", state.direction);
+  if (state.since) u.set("since", state.since);
+  if (state.until) u.set("until", state.until);
+  u.set("limit", state.limit);
+  u.set("offset", state.offset);
+
+  let batch;
+  try {
+    if (state.q.trim()) {
+      const sq = new URLSearchParams({ q: state.q, limit: state.limit, offset: state.offset });
+      if (state.platform) sq.set("platform", state.platform);
+      if (state.direction) sq.set("direction", state.direction);
+      if (state.since) sq.set("since", state.since);
+      if (state.until) sq.set("until", state.until);
+      batch = await api("/api/search?" + sq.toString());
+    } else {
+      batch = await api("/api/list?" + u.toString());
+    }
+  } catch(e) {
+    if (list) list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading messages: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  // Dedupe
+  const existing = new Set(state.rows.map(m => m.id));
+  const fresh = batch.filter(m => !existing.has(m.id));
+  state.rows = reset ? batch : [...state.rows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.rows.map(m => msgRowHTML(m, m.id === state.selectedId)).join("");
+  } else {
+    list.insertAdjacentHTML("beforeend", fresh.map(m => msgRowHTML(m, m.id === state.selectedId)).join(""));
+  }
+
+  const moreBtn = document.getElementById("load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < state.limit);
+    moreBtn.onclick = () => {
+      state.offset += state.limit;
+      loadMessages(false);
+    };
+  }
+
+  bindRowClicks();
+}
+
+function bindRowClicks() {
+  document.querySelectorAll(".msg-row").forEach(el => {
+    el.onclick = () => openDetail(el.dataset.id, true);
+  });
+}
+
+// ── Search view ──
+function renderSearch() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-blue text-sm tracking-wider">SEARCH</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Full-text search across all messages</p>
+    </div>
+    ${filterBarHTML(true)}
+    <div id="search-count" class="font-mono text-[10px] text-gray-600 mb-3"></div>
+    <div id="msg-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
+    </div>`;
+
+  bindFilterBar(() => {
+    state.offset = 0;
+    state.rows = [];
+    runSearch(true);
+  });
+
+  if (state.q.trim()) {
+    state.offset = 0;
+    state.rows = [];
+    runSearch(true);
+  } else {
+    const list = document.getElementById("msg-list");
+    if (list) list.innerHTML = `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">Enter a search query above</div>`;
+  }
+}
+
+async function runSearch(reset = false) {
+  const q = state.q.trim();
+  const countEl = document.getElementById("search-count");
+  const list = document.getElementById("msg-list");
+  if (!list) return;
+
+  if (!q) {
+    list.innerHTML = `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">Enter a search query above</div>`;
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+
+  if (reset) { state.rows = []; state.offset = 0; }
+
+  const u = new URLSearchParams({ q, limit: state.limit, offset: state.offset });
+  if (state.platform) u.set("platform", state.platform);
+  if (state.direction) u.set("direction", state.direction);
+  if (state.since) u.set("since", state.since);
+  if (state.until) u.set("until", state.until);
+
+  let batch;
+  try {
+    batch = await api("/api/search?" + u.toString());
+  } catch(e) {
+    list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Search error: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const existing = new Set(state.rows.map(m => m.id));
+  const fresh = batch.filter(m => !existing.has(m.id));
+  state.rows = reset ? batch : [...state.rows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.rows.length
+      ? state.rows.map(m => msgRowHTML(m, m.id === state.selectedId)).join("")
+      : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No results for &ldquo;${esc(q)}&rdquo;</div>`;
+  } else {
+    list.insertAdjacentHTML("beforeend", fresh.map(m => msgRowHTML(m, m.id === state.selectedId)).join(""));
+  }
+
+  if (countEl) countEl.textContent = state.rows.length ? `${fmt(state.rows.length)} result${state.rows.length !== 1 ? "s" : ""} — showing ${reset ? "first" : "up to"} ${state.limit * (Math.floor(state.offset / state.limit) + 1)}` : "";
+
+  const moreBtn = document.getElementById("load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < state.limit);
+    moreBtn.onclick = () => {
+      state.offset += state.limit;
+      runSearch(false);
+    };
+  }
+
+  bindRowClicks();
+}
+
+// ── Stats view ──
+async function renderStats() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-yellow text-sm tracking-wider">STATS</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Corpus overview</p>
+    </div>
+    <div class="font-mono text-xs text-gray-600">Loading stats…</div>`;
+
+  let stats, facets;
+  try {
+    [stats, facets] = await Promise.all([api("/api/stats"), api("/api/facets")]);
+  } catch(e) {
+    root.innerHTML += `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red mt-4">Error: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const byPlatform = stats.by_platform || {};
+  const platformRows = facets.platforms || [];
+  const maxCount = platformRows.reduce((m, p) => Math.max(m, p.count), 1);
+
+  const platformHTML = platformRows.map(p => {
+    const g = PLATFORM_GLYPH[p.value] || PLATFORM_GLYPH.default;
+    const pct = Math.round((p.count / maxCount) * 100);
+    return `<div class="flex items-center gap-3 py-2 border-b border-surface-border last:border-0">
+      <span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;font-size:12px;background:${g.bg};color:#fff;flex-shrink:0">${g.e}</span>
+      <span class="font-mono text-xs text-gray-300 w-20 flex-shrink-0">${esc(p.value)}</span>
+      <div class="flex-1 bg-surface-border rounded-full overflow-hidden" style="height:6px">
+        <div style="width:${pct}%;height:100%;background:${g.bg};border-radius:999px"></div>
+      </div>
+      <span class="font-mono text-xs text-gray-500 w-16 text-right">${fmt(p.count)}</span>
+    </div>`;
+  }).join("");
+
+  const dirFacets = facets.directions || [];
+  const dirHTML = dirFacets.map(d => `<div class="flex justify-between font-mono text-xs py-1 border-b border-surface-border last:border-0">
+    <span class="text-gray-400">${esc(d.value)}</span>
+    <span class="text-gray-500">${fmt(d.count)}</span>
+  </div>`).join("");
+
+  const dunbarFacets = facets.dunbar_layers || [];
+  const dunbarHTML = dunbarFacets.length ? dunbarFacets.map(d => `<div class="flex justify-between font-mono text-xs py-1 border-b border-surface-border last:border-0">
+    <span class="text-gray-400">${esc(d.value || "unknown")}</span>
+    <span class="text-gray-500">${fmt(d.count)}</span>
+  </div>`).join("") : `<div class="font-mono text-xs text-gray-600">No Dunbar data</div>`;
+
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-yellow text-sm tracking-wider">STATS</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Corpus overview</p>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-5">
+      <div class="metric-card rounded-xl border border-surface-border bg-surface-card p-4 transition">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-1">Messages</div>
+        <div class="font-pixel text-accent-green text-lg">${fmt(stats.total_messages)}</div>
+      </div>
+      <div class="metric-card rounded-xl border border-surface-border bg-surface-card p-4 transition">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-1">Threads</div>
+        <div class="font-pixel text-accent-blue text-lg">${fmt(stats.total_threads)}</div>
+      </div>
+    </div>
+    <div class="rounded-xl border border-surface-border bg-surface-card p-5 mb-4">
+      <h3 class="font-pixel text-accent-purple text-[10px] tracking-wider mb-4">BY PLATFORM</h3>
+      ${platformHTML || `<div class="font-mono text-xs text-gray-600">No platform data</div>`}
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      <div class="rounded-xl border border-surface-border bg-surface-card p-5">
+        <h3 class="font-pixel text-accent-yellow text-[10px] tracking-wider mb-4">DIRECTION</h3>
+        ${dirHTML || `<div class="font-mono text-xs text-gray-600">No data</div>`}
+      </div>
+      <div class="rounded-xl border border-surface-border bg-surface-card p-5">
+        <h3 class="font-pixel text-accent-blue text-[10px] tracking-wider mb-4">DUNBAR LAYER</h3>
+        ${dunbarHTML}
+      </div>
+    </div>`;
+}
+
+// ── Detail panel ──
+async function openDetail(id, push = true) {
+  // URL fragment
+  const fragUrl = location.pathname + location.search + "#m/" + id;
+  if (push) history.pushState({ detail: id }, "", fragUrl);
+  else history.replaceState({ detail: id }, "", fragUrl);
+
+  // Mark selected row
+  document.querySelectorAll(".msg-row").forEach(el => {
+    el.classList.toggle("selected", el.dataset.id === id);
+  });
+  state.selectedId = id;
+
+  const panel = document.getElementById("detail-body");
+  const ctx = document.getElementById("detail-context");
+  if (panel) panel.innerHTML = `<div class="font-mono text-xs text-gray-600 animate-pulse">Loading…</div>`;
+  if (ctx) ctx.textContent = "Loading…";
+
+  let m;
+  try {
+    m = await api("/api/detail/" + encodeURIComponent(id));
+  } catch(e) {
+    if (panel) panel.innerHTML = `<div class="text-accent-red font-mono text-xs">${esc(e.message)}</div>`;
+    return;
+  }
+
+  const from = m.sender_name || m.sender_id || "unknown";
+  const conn = m.connectedness != null ? Math.round(m.connectedness * 100) : null;
+  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier] || "#a6adc8") : null;
+
+  if (ctx) ctx.textContent = esc(m.platform);
+
+  if (panel) panel.innerHTML = `
+    <div class="slide-in space-y-3">
+      <div class="flex items-center gap-2">
+        ${glyphHTML(m.platform)}
+        ${identiconHTML(from)}
+        <div class="min-w-0">
+          <div class="font-mono text-xs font-semibold text-gray-200 truncate">${esc(from)}</div>
+          <div class="font-mono text-[10px] text-gray-600">${esc(m.direction || "")}</div>
+        </div>
+      </div>
+      <div class="border-t border-surface-border pt-3 space-y-2">
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Thread</div>
+          <div class="font-mono text-xs text-gray-300 mt-1">${esc(m.thread_title || "—")}</div>
+        </div>
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Time</div>
+          <div class="font-mono text-xs text-gray-300 mt-1">${esc(m.timestamp || "")}</div>
+        </div>
+      </div>
+      ${m.reply_context ? `
+      <div class="rounded-lg border border-surface-border bg-surface p-3">
+        <div class="font-mono text-[10px] text-gray-600 mb-1">↩ replying to</div>
+        <div class="font-mono text-xs text-gray-400">${esc(m.reply_context.content || "")}</div>
+      </div>` : ""}
+      <div class="border-t border-surface-border pt-3">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Content</div>
+        <div class="font-mono text-xs text-gray-200 whitespace-pre-wrap leading-relaxed">${esc(m.content || "")}</div>
+      </div>
+      <div class="border-t border-surface-border pt-3 space-y-2">
+        ${conn != null ? `<div class="flex items-center gap-2">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider w-24">Connectedness</div>
+          <span class="conn-bar" style="width:60px"><i style="width:${conn}%"></i></span>
+          <span class="font-mono text-[10px] text-gray-400">${conn}%</span>
+        </div>` : ""}
+        ${pc ? `<div class="flex items-center gap-2">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider w-24">Priority</div>
+          <span class="inline-block rounded-full px-2 py-0.5 font-mono text-[10px] border" style="border-color:${pc}66;color:${pc}">${esc(m.priority_tier)}</span>
+        </div>` : ""}
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">ID</div>
+          <div class="font-mono text-[10px] text-gray-500 mt-1 break-all">${esc(m.id)}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function closeDetail() {
+  state.selectedId = null;
+  document.querySelectorAll(".msg-row").forEach(el => el.classList.remove("selected"));
+  const panel = document.getElementById("detail-body");
+  const ctx = document.getElementById("detail-context");
+  if (panel) panel.innerHTML = "Click any message row to view the full content here.";
+  if (ctx) ctx.textContent = "Select a message";
+  if (location.hash) history.pushState({}, "", location.pathname + location.search);
+}
+
+// ── SSE ──
+function startSSE() {
+  const ind = document.getElementById("sse-indicator");
+  try {
+    const es = new EventSource(apiPath("/api/events"));
+    es.addEventListener("corpus-changed", async () => {
+      // Only prepend if on messages view, no active search, no offset
+      if (state.view !== "messages" || state.q.trim() || state.offset > 0) return;
+      const u = new URLSearchParams({ limit: state.limit, offset: 0 });
+      if (state.platform) u.set("platform", state.platform);
+      if (state.direction) u.set("direction", state.direction);
+      if (state.since) u.set("since", state.since);
+      if (state.until) u.set("until", state.until);
+      let fresh;
+      try { fresh = await api("/api/list?" + u.toString()); } catch(e) { return; }
+      const list = document.getElementById("msg-list");
+      if (!list) return;
+      const existing = new Set(state.rows.map(m => m.id));
+      const newOnes = fresh.filter(m => !existing.has(m.id));
+      if (newOnes.length) {
+        list.insertAdjacentHTML("afterbegin", newOnes.map(m => msgRowHTML(m)).join(""));
+        state.rows = [...newOnes, ...state.rows];
+        bindRowClicks();
+        const ind2 = document.getElementById("sse-indicator");
+        if (ind2) { ind2.textContent = "● +" + newOnes.length; ind2.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+        setTimeout(() => {
+          const i = document.getElementById("sse-indicator");
+          if (i) { i.textContent = "● live"; i.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+        }, 2500);
+      }
     });
-    es.onerror=()=>{ live.textContent="○ offline"; };
-  }catch(e){ live.textContent="○ no sse"; }
+    es.onerror = () => {
+      if (ind) { ind.textContent = "○ offline"; ind.className = "font-mono text-xs text-gray-600 mt-1"; }
+    };
+    es.onopen = () => {
+      if (ind) { ind.textContent = "● live"; ind.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+    };
+  } catch(e) {
+    if (ind) { ind.textContent = "○ no sse"; ind.className = "font-mono text-xs text-gray-600 mt-1"; }
+  }
 }
 
-async function boot(){
-  loadState(); syncInputs();
-  try{ const f=await api("/api/facets");
-    for(const p of f.platforms){ const o=document.createElement("option"); o.value=p.value;
-      o.textContent=p.value+" ("+p.count+")"; platform.appendChild(o); }
-    platform.value=state.platform;
-  }catch(e){}
-  try{ const s=await api("/api/stats");
-    summary.textContent=(s.total_messages||0).toLocaleString()+" messages · "+(s.total_threads||0).toLocaleString()+" threads";
-  }catch(e){}
-  await render(true);
-  if(location.hash.startsWith("#m/")) openDetail(location.hash.slice(3), false);
+// ── popstate (back closes detail) ──
+window.onpopstate = (e) => {
+  if (!location.hash) closeDetail();
+  else if (e.state && e.state.detail) openDetail(e.state.detail, false);
+};
+
+// ── Boot ──
+async function boot() {
+  loadFilters();
+
+  // Wire nav
+  document.querySelectorAll(".nav-tab:not(.disabled)").forEach(btn => {
+    btn.addEventListener("click", () => setView(btn.dataset.view));
+  });
+
+  // Load facets + stats concurrently
+  try {
+    const [facets, stats] = await Promise.all([api("/api/facets"), api("/api/stats")]);
+    state.facets = facets;
+    state.stats = stats;
+    const hc = document.getElementById("header-counts");
+    if (hc) hc.textContent = `${fmt(stats.total_messages)} messages · ${fmt(stats.total_threads)} threads`;
+  } catch(e) {
+    const hc = document.getElementById("header-counts");
+    if (hc) hc.textContent = "Error loading stats";
+  }
+
+  // Restore view from state
+  const view = state.view;
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+
+  renderView();
+
+  // Deep-link: #m/<id>
+  if (location.hash.startsWith("#m/")) {
+    openDetail(decodeURIComponent(location.hash.slice(3)), false);
+  }
+
   startSSE();
 }
+
 boot();
 </script>
 </body>
