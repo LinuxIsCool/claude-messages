@@ -215,8 +215,8 @@ const state = {
   direction: "",
   since: "",
   until: "",
-  sort: "recent",
-  hideNoise: false,
+  sort: "signal",
+  hideNoise: true,
   offset: 0,
   limit: 50,
   selectedId: null,
@@ -472,7 +472,7 @@ function renderMessages() {
     <div class="mb-5 flex items-end justify-between gap-4">
       <div>
         <h2 class="font-pixel text-accent-green text-sm tracking-wider">MESSAGES</h2>
-        <p class="font-mono text-sm text-gray-500 mt-2">Reverse-chronological feed</p>
+        <p class="font-mono text-sm text-gray-500 mt-2">Signal-ranked feed · noise hidden · toggle Recent to see all</p>
       </div>
       <div id="new-indicator" class="font-mono text-[10px] text-accent-green hidden"></div>
     </div>
