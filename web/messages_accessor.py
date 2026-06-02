@@ -44,14 +44,17 @@ class MessagesAccessor:
     def healthz(self) -> dict[str, Any]:
         t0 = time.perf_counter()
         try:
-            self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            n = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             ms = (time.perf_counter() - t0) * 1000
-            return healthz_response(
+            resp = healthz_response(
                 namespace=NAMESPACE,
                 database=str(self._db_path),
                 elapsed_ms=ms,
                 ok=True,
             )
+            # Surface a key_metric so the claude-home aggregator tile shows a count.
+            resp["stats"] = {"key_metric": n, "key_metric_label": "messages"}
+            return resp
         except Exception as exc:  # noqa: BLE001
             ms = (time.perf_counter() - t0) * 1000
             return healthz_response(
