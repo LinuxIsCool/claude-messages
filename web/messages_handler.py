@@ -33,4 +33,21 @@ class MessagesHandler(WebuiHandler):
                 self._send_json({"error": str(exc)}, status=500)
             return
 
+        if path == "/api/threads":
+            raw = parse_qs(parsed.query, keep_blank_values=True)
+            params = {k: v[0] if v else "" for k, v in raw.items()}
+            try:
+                self._send_json(accessor.threads(params))
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+            return
+
+        if parsed.path.startswith("/api/thread/"):
+            thread_id = unquote(parsed.path[len("/api/thread/"):])
+            try:
+                self._send_json(accessor.thread(thread_id))
+            except Exception as exc:  # noqa: BLE001
+                self._send_json({"error": str(exc)}, status=500)
+            return
+
         super()._dispatch_get()

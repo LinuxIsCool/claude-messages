@@ -151,3 +151,34 @@ def test_card_has_thread_type(fixture_db: Path) -> None:
     rows = md.list_messages(conn, {"limit": 10})
     m2 = next(r for r in rows if r["id"] == "m2")
     assert m2["thread_type"] == "dm"
+
+
+def test_list_threads_recency_order_and_enrichment(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.list_threads(conn, {"limit": 10})
+    assert [r["id"] for r in rows] == ["t1", "t2"]   # updated_at desc
+    t1 = rows[0]
+    assert t1["title"] == "Darren ↔ Shawn"
+    assert t1["message_count"] == 3
+    assert t1["last_content"] == "ok sounds good"   # m4 newest
+
+
+def test_list_threads_platform_filter(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.list_threads(conn, {"platform": "signal", "limit": 10})
+    assert [r["id"] for r in rows] == ["t2"]
+
+
+def test_get_thread_returns_timeline(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    t = md.get_thread(conn, "t1")
+    assert t["title"] == "Darren ↔ Shawn"
+    ids = [m["id"] for m in t["messages"]]
+    assert ids == ["m4", "m2", "m1"]   # reverse-chron within thread
+    assert md.get_thread(conn, "nope") is None
+
+
+def test_filters_thread_id(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.list_messages(conn, {"thread": "t2", "limit": 10})
+    assert [r["id"] for r in rows] == ["m3"]

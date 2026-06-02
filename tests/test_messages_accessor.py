@@ -84,3 +84,20 @@ def test_detail_includes_salience(fixture_db) -> None:
     acc = MessagesAccessor(db_path=fixture_db)
     d = acc.detail("m2")
     assert "salience" in d and d["salience_reasons"]
+
+
+def test_threads_accessor_ranks_and_annotates(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    rows = acc.threads({"limit": 10})
+    assert [r["id"] for r in rows] == ["t1", "t2"]
+    for r in rows:
+        assert "salience" in r and isinstance(r["salience_reasons"], list)
+
+
+def test_thread_detail_accessor(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    t = acc.thread("t1")
+    assert t["title"] == "Darren ↔ Shawn"
+    assert [m["id"] for m in t["messages"]] == ["m4", "m2", "m1"]
+    assert all("salience" in m for m in t["messages"])
+    assert acc.thread("nope") == {"error": "not found", "id": "nope"}

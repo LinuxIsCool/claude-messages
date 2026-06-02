@@ -81,6 +81,9 @@ def _filters(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if params.get("platform"):
         clauses.append("AND m.platform = :platform")
         binds["platform"] = params["platform"]
+    if params.get("thread"):
+        clauses.append("AND m.thread_id = :thread")
+        binds["thread"] = params["thread"]
     if params.get("sender"):
         clauses.append("AND m.sender_id = :sender")
         binds["sender"] = params["sender"]
@@ -229,3 +232,91 @@ def engaged_thread_ids(conn: sqlite3.Connection) -> set[str]:
         "WHERE direction = 'sent' AND thread_id IS NOT NULL"
     ).fetchall()
     return {r[0] for r in rows}
+
+
+def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Threads, most-recently-updated first, enriched with count + last message.
+
+    Pages threads by updated_at (cheap, avoids a corpus-wide GROUP BY), then
+    enriches each page row with message_count + last message via small queries.
+    Filters: platform, thread_type, q (title LIKE).
+    """
+    clauses: list[str] = []
+    binds: dict[str, Any] = {}
+    if params.get("platform"):
+        clauses.append("AND t.platform = :platform")
+        binds["platform"] = params["platform"]
+    if params.get("thread_type"):
+        clauses.append("AND t.thread_type = :thread_type")
+        binds["thread_type"] = params["thread_type"]
+    if params.get("q"):
+        clauses.append("AND t.title LIKE :q")
+        binds["q"] = f"%{params['q']}%"
+    binds["limit"] = _clamp_limit(params)
+    binds["offset"] = _offset(params)
+    where = " ".join(clauses)
+    sql = (
+        "SELECT t.id, t.platform, t.title, t.thread_type, t.participants, t.updated_at "
+        f"FROM threads t WHERE 1=1 {where} "
+        "ORDER BY t.updated_at DESC LIMIT :limit OFFSET :offset"
+    )
+    out: list[dict[str, Any]] = []
+    for t in conn.execute(sql, binds).fetchall():
+        tid = t["id"]
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE thread_id = :tid", {"tid": tid}
+        ).fetchone()[0]
+        last = conn.execute(
+            "SELECT content, platform_ts, sender_id FROM messages "
+            "WHERE thread_id = :tid ORDER BY platform_ts DESC LIMIT 1",
+            {"tid": tid},
+        ).fetchone()
+        try:
+            import json as _json
+            parts = _json.loads(t["participants"] or "[]")
+            pcount = len(parts) if isinstance(parts, list) else 0
+        except Exception:
+            pcount = 0
+        out.append({
+            "id": tid,
+            "platform": t["platform"],
+            "title": t["title"],
+            "thread_type": t["thread_type"],
+            "participant_count": pcount,
+            "message_count": cnt,
+            "updated_at": t["updated_at"],
+            "last_ts": last["platform_ts"] if last else None,
+            "last_content": last["content"] if last else None,
+            "last_sender": last["sender_id"] if last else None,
+        })
+    return out
+
+
+def get_thread(conn: sqlite3.Connection, thread_id: str, limit: int = 200) -> dict[str, Any] | None:
+    """Thread header + its message timeline (reverse-chron) + summary if present."""
+    t = conn.execute(
+        "SELECT id, platform, title, thread_type, participants, created_at, updated_at "
+        "FROM threads WHERE id = :id", {"id": thread_id},
+    ).fetchone()
+    if t is None:
+        return None
+    messages = list_messages(conn, {"thread": thread_id, "limit": limit})
+    try:
+        summary_row = conn.execute(
+            "SELECT summary, message_count, last_message_ts, generated_at "
+            "FROM thread_summaries WHERE thread_id = :id", {"id": thread_id},
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # thread_summaries table absent (e.g. fixture DB) — degrade gracefully.
+        summary_row = None
+    return {
+        "id": t["id"],
+        "platform": t["platform"],
+        "title": t["title"],
+        "thread_type": t["thread_type"],
+        "participants": t["participants"],
+        "created_at": t["created_at"],
+        "updated_at": t["updated_at"],
+        "messages": messages,
+        "summary": dict(summary_row) if summary_row else None,
+    }

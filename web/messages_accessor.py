@@ -126,5 +126,26 @@ class MessagesAccessor:
     def facets(self) -> dict[str, Any]:
         return md.get_facets(self._conn)
 
+    def threads(self, params: dict[str, Any]) -> list[dict[str, Any]]:
+        cards = md.list_threads(self._conn, dict(params))
+        ctx = self._ctx()
+        for c in cards:
+            shaped = {
+                "thread_id": c["id"], "thread_type": c["thread_type"],
+                "sender_id": c.get("last_sender"), "sender_name": c.get("title"),
+                "content": c.get("last_content"), "connectedness": None,
+            }
+            s = sal.salience(shaped, ctx)
+            c["salience"] = s["salience"]
+            c["salience_reasons"] = s["reasons"]
+        return cards
+
+    def thread(self, thread_id: str) -> dict[str, Any]:
+        t = md.get_thread(self._conn, thread_id)
+        if t is None:
+            return {"error": "not found", "id": thread_id}
+        t["messages"] = self._annotate(t["messages"])
+        return t
+
     def signature(self) -> str:
         return md.signature(self._db_path)
