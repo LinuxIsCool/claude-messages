@@ -66,3 +66,11 @@ def test_connect_ro_is_read_only(fixture_db: Path) -> None:
     import pytest
     with pytest.raises(sqlite3.OperationalError):
         conn.execute("INSERT INTO messages(id,platform,platform_ts,synced_at) VALUES ('x','x','t','t')")
+
+
+def test_list_populates_thread_fields(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.list_messages(conn, {"limit": 10})
+    m2 = next(r for r in rows if r["id"] == "m2")
+    assert m2["thread_title"] == "Darren ↔ Shawn"
+    assert "thread_participants" in m2  # routed from the threads join, not dropped

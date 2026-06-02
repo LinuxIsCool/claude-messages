@@ -102,6 +102,7 @@ def _row_to_card(row: sqlite3.Row) -> dict[str, Any]:
         "platform": row["platform"],
         "thread_id": row["thread_id"],
         "thread_title": row["thread_title"],
+        "thread_participants": row["thread_participants"],
         "sender_id": row["sender_id"],
         "sender_name": row["sender_name"],
         "content": row["content"],
