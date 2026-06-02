@@ -1,6 +1,6 @@
 """claude-messages webui — thin satellite of claude_webui.WebuiKernel.
 
-Mode A standalone:   python web/server.py --port 8840
+Mode A standalone:   python web/server.py --port 8895
 Mode B mount:        build_kernel(port=0) for the claude-webui Platform.
 
 Phase 1: read-only Messages surface. Real-time SSE via signature poll on
@@ -23,7 +23,7 @@ from messages_accessor import MessagesAccessor  # noqa: E402
 from messages_handler import MessagesHandler  # noqa: E402
 
 __version__ = "0.1.0"
-DEFAULT_PORT = 8840
+DEFAULT_PORT = 8895
 
 
 class MessagesKernel(WebuiKernel):

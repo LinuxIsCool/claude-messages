@@ -1,11 +1,11 @@
 ---
-description: Launch the claude-messages webui at http://127.0.0.1:8840/ (read-only)
+description: Launch the claude-messages webui at http://127.0.0.1:8895/ (read-only)
 allowed-tools: ["Bash"]
 ---
 
 # /messages-web
 
-Launches the claude-messages webui at `http://127.0.0.1:8840/`.
+Launches the claude-messages webui at `http://127.0.0.1:8895/`.
 
 Kernel-pattern Python HTTP server (stdlib + claude_webui — no framework) that
 renders the 886K-message corpus as reverse-chronological cards with platform
