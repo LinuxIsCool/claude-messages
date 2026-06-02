@@ -34,6 +34,7 @@ _SELECT_COLS = """
 SELECT m.id, m.platform, m.thread_id, m.sender_id, m.content, m.content_type,
        m.reply_to, m.platform_ts AS timestamp, m.direction,
        t.title AS thread_title, t.participants AS thread_participants,
+       t.thread_type AS thread_type,
        il.identity_id AS sender_identity_id,
        COALESCE(idn.display_name, c.display_name, m.sender_id) AS sender_name,
        cs.composite AS connectedness, cs.dunbar_layer AS priority_tier
@@ -103,6 +104,7 @@ def _row_to_card(row: sqlite3.Row) -> dict[str, Any]:
         "thread_id": row["thread_id"],
         "thread_title": row["thread_title"],
         "thread_participants": row["thread_participants"],
+        "thread_type": row["thread_type"],
         "sender_id": row["sender_id"],
         "sender_name": row["sender_name"],
         "content": row["content"],
@@ -215,3 +217,15 @@ def signature(db_path: Path | str = DEFAULT_DB_PATH) -> str:
             st = f.stat()
             parts.append(f"{st.st_size}:{st.st_mtime_ns}")
     return "|".join(parts) or "missing"
+
+
+def engaged_thread_ids(conn: sqlite3.Connection) -> set[str]:
+    """Thread ids where Shawn has sent at least one message (reciprocity).
+
+    The single strongest cheap salience signal. Cached by the accessor.
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT thread_id FROM messages "
+        "WHERE direction = 'sent' AND thread_id IS NOT NULL"
+    ).fetchall()
+    return {r[0] for r in rows}

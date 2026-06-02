@@ -52,3 +52,35 @@ def test_feed_is_reverse_chron(fixture_db: Path) -> None:
     acc = MessagesAccessor(db_path=fixture_db)
     rows = acc.feed({"limit": 2})
     assert [r["id"] for r in rows] == ["m4", "m2"]
+
+
+def test_list_annotates_salience(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    rows = acc.list({"limit": 10})
+    for r in rows:
+        assert 0.0 <= r["salience"] <= 1.0
+        assert isinstance(r["salience_reasons"], list) and r["salience_reasons"]
+
+
+def test_signal_sort_ranks_high_salience_first(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    rows = acc.list({"sort": "signal", "limit": 10})
+    sals = [r["salience"] for r in rows]
+    assert sals == sorted(sals, reverse=True)
+    # m2 (Darren, dm, engaged, scored) must outrank m3 (group, never-replied, unscored)
+    ids = [r["id"] for r in rows]
+    assert ids.index("m2") < ids.index("m3")
+
+
+def test_hide_noise_drops_low_salience(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    full = acc.list({"limit": 10})
+    hidden = acc.list({"limit": 10, "hide_noise": "true"})
+    assert len(hidden) <= len(full)
+    assert all(r["salience"] >= 0.35 for r in hidden)
+
+
+def test_detail_includes_salience(fixture_db) -> None:
+    acc = MessagesAccessor(db_path=fixture_db)
+    d = acc.detail("m2")
+    assert "salience" in d and d["salience_reasons"]

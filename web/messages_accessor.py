@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import messages_data as md
+import salience as sal
 from claude_webui.healthz import healthz_response
 
 __version__ = "0.1.0"
@@ -21,25 +22,70 @@ NAMESPACE = "legion.claude-message"
 class MessagesAccessor:
     """Substrate accessor for the claude-messages webui (Phase 1: read-only)."""
 
+    NOISE_THRESHOLD = 0.35
+    SIGNAL_POOL_FACTOR = 6
+    SIGNAL_POOL_MAX = 600
+
     def __init__(self, db_path: Path | str | None = None) -> None:
         self._db_path = Path(db_path) if db_path is not None else Path(md.DEFAULT_DB_PATH)
         self._conn = md.connect_ro(self._db_path)
+        self._engaged: set[str] | None = None
+
+    # ── Salience helpers ─────────────────────────────────────────────
+    def _ctx(self) -> dict:
+        if self._engaged is None:
+            self._engaged = md.engaged_thread_ids(self._conn)
+        return {"engaged_threads": self._engaged}
+
+    def _annotate(self, cards: list[dict]) -> list[dict]:
+        ctx = self._ctx()
+        for c in cards:
+            s = sal.salience(c, ctx)
+            c["salience"] = s["salience"]
+            c["salience_reasons"] = s["reasons"]
+        return cards
 
     # ── Accessor Protocol ────────────────────────────────────────────
     def list(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        return md.list_messages(self._conn, dict(params))
+        p = dict(params)
+        sort = str(p.pop("sort", "recent")).lower()
+        hide = str(p.pop("hide_noise", "")).lower() in ("1", "true", "yes")
+        try:
+            limit = int(p.get("limit", md.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = md.DEFAULT_LIMIT
+        try:
+            offset = int(p.get("offset", 0))
+        except (TypeError, ValueError):
+            offset = 0
+        if sort == "signal":
+            pool = dict(p)
+            pool["limit"] = min(max(limit * self.SIGNAL_POOL_FACTOR, 120), self.SIGNAL_POOL_MAX)
+            pool["offset"] = 0
+            cards = self._annotate(md.list_messages(self._conn, pool))
+            cards.sort(key=lambda c: c["salience"], reverse=True)
+            if hide:
+                cards = [c for c in cards if c["salience"] >= self.NOISE_THRESHOLD]
+            return cards[offset:offset + limit]
+        cards = self._annotate(md.list_messages(self._conn, p))
+        if hide:
+            cards = [c for c in cards if c["salience"] >= self.NOISE_THRESHOLD]
+        return cards
 
     def detail(self, item_id: str) -> dict[str, Any]:
         rec = md.get_message_detail(self._conn, item_id)
         if rec is None:
             return {"error": "not found", "id": item_id}
+        s = sal.salience(rec, self._ctx())
+        rec["salience"] = s["salience"]
+        rec["salience_reasons"] = s["reasons"]
         return rec
 
     def stats(self) -> dict[str, Any]:
         return md.get_stats(self._conn)
 
     def feed(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        return md.list_messages(self._conn, dict(params))
+        return self.list(dict(params))
 
     def healthz(self) -> dict[str, Any]:
         t0 = time.perf_counter()
@@ -67,7 +113,15 @@ class MessagesAccessor:
 
     # ── Substrate-specific (routed by MessagesHandler) ───────────────
     def search(self, params: dict[str, Any]) -> list[dict[str, Any]]:
-        return md.search_messages(self._conn, dict(params))
+        p = dict(params)
+        sort = str(p.pop("sort", "recent")).lower()
+        hide = str(p.pop("hide_noise", "")).lower() in ("1", "true", "yes")
+        cards = self._annotate(md.search_messages(self._conn, p))
+        if sort == "signal":
+            cards.sort(key=lambda c: c["salience"], reverse=True)
+        if hide:
+            cards = [c for c in cards if c["salience"] >= self.NOISE_THRESHOLD]
+        return cards
 
     def facets(self) -> dict[str, Any]:
         return md.get_facets(self._conn)

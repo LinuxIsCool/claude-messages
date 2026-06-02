@@ -137,3 +137,17 @@ def test_signature_changes_when_file_changes(fixture_db: Path, tmp_path) -> None
     rw.commit(); rw.close()
     sig2 = md.signature(fixture_db)
     assert sig1 != sig2
+
+
+def test_engaged_thread_ids(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    engaged = md.engaged_thread_ids(conn)
+    assert "t1" in engaged   # m4 is direction='sent' in t1
+    assert "t2" not in engaged
+
+
+def test_card_has_thread_type(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.list_messages(conn, {"limit": 10})
+    m2 = next(r for r in rows if r["id"] == "m2")
+    assert m2["thread_type"] == "dm"
