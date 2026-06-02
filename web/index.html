@@ -120,7 +120,7 @@
           <button data-view="messages" class="nav-tab active w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Messages</button>
           <button data-view="search" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Search</button>
           <button data-view="stats" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Stats</button>
-          <button data-view="threads" class="nav-tab disabled w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Threads <span class="text-gray-700 text-[9px]">soon</span></button>
+          <button data-view="threads" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Threads</button>
         </nav>
       </div>
     </aside>
@@ -223,6 +223,13 @@ const state = {
   rows: [],         // current loaded rows
   facets: null,
   stats: null,
+  // Threads sub-state
+  threadsQ: "",
+  threadsPlatform: "",
+  threadsType: "",
+  threadsOffset: 0,
+  threadsRows: [],  // loaded thread cards
+  openThreadId: null, // currently open thread
 };
 
 const LS_KEY = "legion.messages.filters";
@@ -234,11 +241,17 @@ function loadFilters() {
     if (params.has(k)) { state[k] = params.get(k); any = true; }
   }
   if (params.has("hide_noise")) { state.hideNoise = params.get("hide_noise") === "true"; any = true; }
+  if (params.has("tq")) { state.threadsQ = params.get("tq"); any = true; }
+  if (params.has("tplatform")) { state.threadsPlatform = params.get("tplatform"); any = true; }
+  if (params.has("ttype")) { state.threadsType = params.get("ttype"); any = true; }
   if (!any) {
     try {
       const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
       for (const k of ["q","platform","direction","since","until","sort"]) if (s[k]) state[k] = s[k];
       if (s.hideNoise != null) state.hideNoise = !!s.hideNoise;
+      if (s.threadsQ) state.threadsQ = s.threadsQ;
+      if (s.threadsPlatform) state.threadsPlatform = s.threadsPlatform;
+      if (s.threadsType) state.threadsType = s.threadsType;
     } catch(e) {}
   }
 }
@@ -249,10 +262,19 @@ function persistFilters() {
   if (state.view !== "messages") u.set("view", state.view);
   if (state.sort && state.sort !== "recent") u.set("sort", state.sort);
   if (state.hideNoise) u.set("hide_noise", "true");
+  if (state.threadsQ) u.set("tq", state.threadsQ);
+  if (state.threadsPlatform) u.set("tplatform", state.threadsPlatform);
+  if (state.threadsType) u.set("ttype", state.threadsType);
   history.replaceState({}, "", u.toString() ? "?" + u.toString() : location.pathname);
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(
-      Object.fromEntries([...["q","platform","direction","since","until","sort"].map(k => [k, state[k]]), ["hideNoise", state.hideNoise]])
+      Object.fromEntries([
+        ...["q","platform","direction","since","until","sort"].map(k => [k, state[k]]),
+        ["hideNoise", state.hideNoise],
+        ["threadsQ", state.threadsQ],
+        ["threadsPlatform", state.threadsPlatform],
+        ["threadsType", state.threadsType],
+      ])
     ));
   } catch(e) {}
 }
@@ -271,6 +293,7 @@ function renderView() {
   if (state.view === "messages") renderMessages();
   else if (state.view === "search") renderSearch();
   else if (state.view === "stats") renderStats();
+  else if (state.view === "threads") renderThreads();
 }
 
 // ── Message row HTML ──
@@ -810,6 +833,259 @@ function closeDetail() {
   if (location.hash) history.pushState({}, "", location.pathname + location.search);
 }
 
+// ── Threads view ──
+
+const THREAD_TYPES = ["dm", "group", "supergroup", "channel"];
+
+function threadCardHTML(t) {
+  const titleText = t.title || t.id;
+  const safeId = esc(t.id);
+  const salienceId = "tsr-" + esc(t.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  // Build salience-like object from thread salience field (scalar)
+  const tMock = { id: t.id, salience: t.salience != null ? t.salience : null, salience_reasons: t.salience_reasons || [] };
+
+  return `<div class="msg-row rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer thread-card" data-thread-id="${safeId}">
+    <div class="flex items-start gap-2">
+      ${glyphHTML(t.platform)}
+      ${identiconHTML(titleText)}
+      <div class="min-w-0 flex-1">
+        <div class="font-mono text-xs truncate font-semibold text-gray-200">${esc(titleText)}</div>
+        <div class="font-mono text-gray-500" style="font-size:10px">${esc(t.thread_type || "—")} · ${fmt(t.participant_count || 0)} participants · ${fmt(t.message_count || 0)} msgs · ${rel(t.last_ts || t.updated_at)}</div>
+      </div>
+      <div class="flex flex-col items-end gap-1 flex-shrink-0">
+        ${saliencePillHTML(tMock)}
+      </div>
+    </div>
+    ${t.last_content ? `<div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(t.last_content)}</div>` : ""}
+    ${salienceReasonsHTML(tMock, salienceId)}
+  </div>`;
+}
+
+function renderThreads() {
+  // If openThreadId is set, show timeline instead
+  if (state.openThreadId) {
+    renderThreadTimeline(state.openThreadId);
+    return;
+  }
+
+  const root = document.getElementById("view-root");
+  const platformOpts = state.facets
+    ? state.facets.platforms.map(p => `<option value="${esc(p.value)}" ${state.threadsPlatform === p.value ? "selected" : ""}>${esc(p.value)}</option>`).join("")
+    : "";
+  const typeOpts = THREAD_TYPES.map(tt => `<option value="${esc(tt)}" ${state.threadsType === tt ? "selected" : ""}>${esc(tt)}</option>`).join("");
+
+  root.innerHTML = `
+    <div class="mb-5 flex items-end justify-between gap-4">
+      <div>
+        <h2 class="font-pixel text-accent-purple text-sm tracking-wider">THREADS</h2>
+        <p class="font-mono text-sm text-gray-500 mt-2">Conversations, ranked by recency</p>
+      </div>
+    </div>
+    <div class="rounded-xl border border-surface-border bg-surface-card p-3 mb-4">
+      <div class="flex gap-2 flex-wrap">
+        <input id="threads-q" type="text" class="input-field flex-1 min-w-[180px]" placeholder="Search threads…" value="${esc(state.threadsQ)}" />
+        <select id="threads-platform" class="input-field">
+          <option value="" ${!state.threadsPlatform ? "selected" : ""}>all platforms</option>
+          ${platformOpts}
+        </select>
+        <select id="threads-type" class="input-field">
+          <option value="" ${!state.threadsType ? "selected" : ""}>any type</option>
+          ${typeOpts}
+        </select>
+        <button id="threads-clear" class="input-field cursor-pointer hover:border-accent-red/60 hover:text-accent-red">clear</button>
+      </div>
+    </div>
+    <div id="threads-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="threads-load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
+    </div>`;
+
+  // Bind filter controls
+  const qEl = document.getElementById("threads-q");
+  const platEl = document.getElementById("threads-platform");
+  const typeEl = document.getElementById("threads-type");
+  const clearEl = document.getElementById("threads-clear");
+
+  let debounce;
+  function threadsChanged() {
+    state.threadsQ = qEl ? qEl.value : state.threadsQ;
+    state.threadsPlatform = platEl ? platEl.value : state.threadsPlatform;
+    state.threadsType = typeEl ? typeEl.value : state.threadsType;
+    persistFilters();
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      state.threadsOffset = 0;
+      state.threadsRows = [];
+      loadThreads(true);
+    }, 200);
+  }
+
+  if (qEl) qEl.oninput = threadsChanged;
+  if (platEl) platEl.onchange = threadsChanged;
+  if (typeEl) typeEl.onchange = threadsChanged;
+  if (clearEl) clearEl.onclick = () => {
+    state.threadsQ = "";
+    state.threadsPlatform = "";
+    state.threadsType = "";
+    if (qEl) qEl.value = "";
+    if (platEl) platEl.value = "";
+    if (typeEl) typeEl.value = "";
+    persistFilters();
+    state.threadsOffset = 0;
+    state.threadsRows = [];
+    loadThreads(true);
+  };
+
+  state.threadsOffset = 0;
+  state.threadsRows = [];
+  loadThreads(true);
+}
+
+async function loadThreads(reset = false) {
+  if (reset) {
+    state.threadsRows = [];
+    state.threadsOffset = 0;
+  }
+  const list = document.getElementById("threads-list");
+  if (!list) return;
+
+  const u = new URLSearchParams({ limit: 50, offset: state.threadsOffset });
+  if (state.threadsQ) u.set("q", state.threadsQ);
+  if (state.threadsPlatform) u.set("platform", state.threadsPlatform);
+  if (state.threadsType) u.set("thread_type", state.threadsType);
+
+  let batch;
+  try {
+    batch = await api("/api/threads?" + u.toString());
+  } catch(e) {
+    if (list) list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading threads: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  // Dedupe by id
+  const existing = new Set(state.threadsRows.map(t => t.id));
+  const fresh = batch.filter(t => !existing.has(t.id));
+  state.threadsRows = reset ? batch : [...state.threadsRows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.threadsRows.length
+      ? state.threadsRows.map(threadCardHTML).join("")
+      : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No threads found</div>`;
+  } else {
+    if (fresh.length) list.insertAdjacentHTML("beforeend", fresh.map(threadCardHTML).join(""));
+  }
+
+  const moreBtn = document.getElementById("threads-load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < 50);
+    moreBtn.onclick = () => {
+      state.threadsOffset += 50;
+      loadThreads(false);
+    };
+  }
+
+  // Bind card clicks
+  list.querySelectorAll(".thread-card").forEach(el => {
+    el.onclick = () => openThreadDetail(el.dataset.threadId);
+  });
+}
+
+async function openThreadDetail(id) {
+  state.openThreadId = id;
+  const fragUrl = location.pathname + location.search + "#t/" + encodeURIComponent(id);
+  history.pushState({ threadDetail: id }, "", fragUrl);
+  renderThreadTimeline(id);
+}
+
+async function renderThreadTimeline(id) {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-4 flex items-center gap-3">
+      <button id="threads-back" class="input-field cursor-pointer hover:border-accent-purple/60 hover:text-accent-purple px-3 py-1.5">← threads</button>
+      <div>
+        <h2 class="font-pixel text-accent-purple text-sm tracking-wider">THREAD</h2>
+      </div>
+    </div>
+    <div id="thread-timeline-content">
+      <div class="font-mono text-xs text-gray-600 animate-pulse">Loading thread…</div>
+    </div>`;
+
+  document.getElementById("threads-back").onclick = () => {
+    state.openThreadId = null;
+    history.pushState({ view: "threads" }, "", location.pathname + location.search.replace(/#.*$/, ""));
+    // Strip hash from URL cleanly
+    const noHash = location.pathname + location.search;
+    history.replaceState({ view: "threads" }, "", noHash);
+    renderThreads();
+  };
+
+  let thread;
+  try {
+    thread = await api("/api/thread/" + encodeURIComponent(id));
+  } catch(e) {
+    const content = document.getElementById("thread-timeline-content");
+    if (content) content.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading thread: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const title = thread.title || thread.id;
+  const msgs = Array.isArray(thread.messages) ? thread.messages : [];
+  const participants = Array.isArray(thread.participants) ? thread.participants : [];
+  const sum = thread.summary;
+
+  const summaryHTML = sum && sum.summary ? `
+    <div class="rounded-xl border border-surface-border bg-surface-card p-4 mb-4">
+      <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Summary · ${esc(sum.message_count || "")} msgs · ${rel(sum.last_message_ts)}</div>
+      <div class="font-mono text-xs text-gray-300 leading-relaxed">${esc(sum.summary)}</div>
+    </div>` : "";
+
+  const participantsHTML = participants.length ? `
+    <div class="font-mono text-[10px] text-gray-600 mb-1">Participants: ${participants.map(p => esc(p.display_name || p.id || p)).join(", ")}</div>` : "";
+
+  const msgsHTML = msgs.length ? msgs.map(m => {
+    const from = m.sender_name || m.sender_id || "unknown";
+    const salienceId = "tmsr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    return `<div class="msg-row rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer" data-id="${esc(m.id)}">
+      <div class="flex items-center gap-2">
+        ${glyphHTML(m.platform || thread.platform)}
+        ${identiconHTML(from)}
+        <div class="min-w-0 flex-1">
+          <div class="font-mono text-xs truncate"><b class="text-gray-200">${esc(from)}</b></div>
+          <div class="font-mono text-gray-600" style="font-size:10px">${esc(m.timestamp || "")}</div>
+        </div>
+        <div class="flex items-center gap-2 flex-shrink-0">
+          ${saliencePillHTML(m)}
+          <span class="font-mono text-gray-600 text-[10px]">${rel(m.timestamp)}</span>
+        </div>
+      </div>
+      <div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(m.content || "")}</div>
+      ${salienceReasonsHTML(m, salienceId)}
+    </div>`;
+  }).join("") : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No messages in this thread</div>`;
+
+  const content = document.getElementById("thread-timeline-content");
+  if (!content) return;
+  content.innerHTML = `
+    <div class="rounded-xl border border-surface-border bg-surface-card p-4 mb-4">
+      <div class="flex items-center gap-3 mb-2">
+        ${glyphHTML(thread.platform)}
+        ${identiconHTML(title)}
+        <div>
+          <div class="font-mono text-sm font-semibold text-gray-100">${esc(title)}</div>
+          <div class="font-mono text-[10px] text-gray-600">${esc(thread.thread_type || "—")} · ${fmt(participants.length)} participants · ${fmt(msgs.length)} msgs shown · updated ${rel(thread.updated_at)}</div>
+        </div>
+      </div>
+      ${participantsHTML}
+    </div>
+    ${summaryHTML}
+    <div class="space-y-2">${msgsHTML}</div>`;
+
+  // Bind message row clicks to open in right detail panel
+  content.querySelectorAll(".msg-row[data-id]").forEach(el => {
+    el.onclick = () => openDetail(el.dataset.id, true);
+  });
+}
+
 // ── SSE ──
 function startSSE() {
   const ind = document.getElementById("sse-indicator");
@@ -854,10 +1130,23 @@ function startSSE() {
   }
 }
 
-// ── popstate (back closes detail) ──
+// ── popstate (back closes detail / thread) ──
 window.onpopstate = (e) => {
-  if (!location.hash) closeDetail();
-  else if (e.state && e.state.detail) openDetail(e.state.detail, false);
+  if (location.hash.startsWith("#t/")) {
+    const tid = decodeURIComponent(location.hash.slice(3));
+    state.openThreadId = tid;
+    if (state.view !== "threads") setView("threads", false);
+    else renderThreadTimeline(tid);
+  } else if (!location.hash) {
+    if (state.openThreadId) {
+      state.openThreadId = null;
+      if (state.view === "threads") renderThreads();
+    } else {
+      closeDetail();
+    }
+  } else if (e.state && e.state.detail) {
+    openDetail(e.state.detail, false);
+  }
 };
 
 // ── Boot ──
@@ -865,8 +1154,10 @@ async function boot() {
   loadFilters();
 
   // Wire nav
-  document.querySelectorAll(".nav-tab:not(.disabled)").forEach(btn => {
-    btn.addEventListener("click", () => setView(btn.dataset.view));
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    if (!btn.classList.contains("disabled")) {
+      btn.addEventListener("click", () => setView(btn.dataset.view));
+    }
   });
 
   // Load facets + stats concurrently
@@ -889,9 +1180,14 @@ async function boot() {
 
   renderView();
 
-  // Deep-link: #m/<id>
+  // Deep-link: #m/<id> or #t/<id>
   if (location.hash.startsWith("#m/")) {
     openDetail(decodeURIComponent(location.hash.slice(3)), false);
+  } else if (location.hash.startsWith("#t/")) {
+    const tid = decodeURIComponent(location.hash.slice(3));
+    state.openThreadId = tid;
+    if (state.view !== "threads") setView("threads", false);
+    else renderThreadTimeline(tid);
   }
 
   startSSE();
