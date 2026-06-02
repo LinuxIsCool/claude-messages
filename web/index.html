@@ -58,6 +58,13 @@
     }
     .conn-bar { height: 4px; border-radius: 999px; background: #2a2a3e; overflow: hidden; display: inline-block; vertical-align: middle; }
     .conn-bar > i { display: block; height: 100%; background: #a6e3a1; }
+    .salience-bar { height: 4px; border-radius: 999px; background: #2a2a3e; overflow: hidden; display: inline-block; vertical-align: middle; }
+    .salience-bar > i { display: block; height: 100%; border-radius: 999px; }
+    .seg-btn { border: 1px solid #2a2a3e; background: #0f0f17; color: #6c7086; border-radius: 5px; padding: 3px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; cursor: pointer; transition: all .15s ease; }
+    .seg-btn.active { background: #a6e3a111; border-color: #a6e3a166; color: #a6e3a1; }
+    .seg-btn:hover:not(.active) { border-color: #89b4fa66; color: #89b4fa; }
+    .salience-reasons { display: none; border-top: 1px solid #2a2a3e; margin-top: 8px; padding-top: 8px; }
+    .salience-reasons.open { display: block; }
     .input-field {
       background: #161622;
       border: 1px solid #2a2a3e;
@@ -208,6 +215,8 @@ const state = {
   direction: "",
   since: "",
   until: "",
+  sort: "recent",
+  hideNoise: false,
   offset: 0,
   limit: 50,
   selectedId: null,
@@ -221,13 +230,15 @@ const LS_KEY = "legion.messages.filters";
 function loadFilters() {
   const params = new URLSearchParams(location.search);
   let any = false;
-  for (const k of ["q","platform","direction","since","until","view"]) {
+  for (const k of ["q","platform","direction","since","until","view","sort"]) {
     if (params.has(k)) { state[k] = params.get(k); any = true; }
   }
+  if (params.has("hide_noise")) { state.hideNoise = params.get("hide_noise") === "true"; any = true; }
   if (!any) {
     try {
       const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
-      for (const k of ["q","platform","direction","since","until"]) if (s[k]) state[k] = s[k];
+      for (const k of ["q","platform","direction","since","until","sort"]) if (s[k]) state[k] = s[k];
+      if (s.hideNoise != null) state.hideNoise = !!s.hideNoise;
     } catch(e) {}
   }
 }
@@ -236,10 +247,12 @@ function persistFilters() {
   const u = new URLSearchParams();
   for (const k of ["q","platform","direction","since","until"]) if (state[k]) u.set(k, state[k]);
   if (state.view !== "messages") u.set("view", state.view);
+  if (state.sort && state.sort !== "recent") u.set("sort", state.sort);
+  if (state.hideNoise) u.set("hide_noise", "true");
   history.replaceState({}, "", u.toString() ? "?" + u.toString() : location.pathname);
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(
-      Object.fromEntries(["q","platform","direction","since","until"].map(k => [k, state[k]]))
+      Object.fromEntries([...["q","platform","direction","since","until","sort"].map(k => [k, state[k]]), ["hideNoise", state.hideNoise]])
     ));
   } catch(e) {}
 }
@@ -269,6 +282,7 @@ function msgRowHTML(m, selected = false) {
   const tags = (m.tags || []).map(t => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]">#${esc(t)}</span>`).join(" ");
   const vents = (m.ventures || []).map(v => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]" style="border-color:#cba6f788;color:#cba6f7">◆ ${esc(v)}</span>`).join(" ");
   const selCls = selected ? "selected" : "";
+  const salienceId = "sr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
 
   return `<div class="msg-row ${selCls} rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer" data-id="${esc(m.id)}">
     <div class="flex items-center gap-2">
@@ -279,7 +293,10 @@ function msgRowHTML(m, selected = false) {
         <div class="font-mono text-gray-600" style="font-size:10px">${esc(m.thread_title || m.platform)}</div>
       </div>
       <div class="flex flex-col items-end gap-1 flex-shrink-0">
-        <span class="font-mono text-gray-600 text-[10px]" title="${esc(m.timestamp)}">${rel(m.timestamp)}</span>
+        <div class="flex items-center gap-2">
+          ${saliencePillHTML(m)}
+          <span class="font-mono text-gray-600 text-[10px]" title="${esc(m.timestamp)}">${rel(m.timestamp)}</span>
+        </div>
         ${conn != null ? `<span class="conn-bar" style="width:40px" title="connectedness ${conn}%"><i style="width:${conn}%"></i></span>` : ""}
       </div>
     </div>
@@ -288,7 +305,53 @@ function msgRowHTML(m, selected = false) {
       ${tags} ${vents}
       ${pc ? `<span class="ml-auto inline-block rounded-full px-2 py-0.5 font-mono text-[10px] border" style="border-color:${pc}66;color:${pc}">${esc(m.priority_tier)}</span>` : ""}
     </div>` : ""}
+    ${salienceReasonsHTML(m, salienceId)}
   </div>`;
+}
+
+// ── Salience helpers ── API params: sort=recent|signal, hide_noise=true ──
+function salienceColor(s) {
+  if (s == null) return "#45475a";
+  if (s >= 0.66) return "#a6e3a1"; // accent-green
+  if (s >= 0.35) return "#f9e2af"; // accent-yellow
+  return "#f38ba8";                // accent-red
+}
+
+function saliencePillHTML(m) {
+  if (m.salience == null) return "";
+  const pct = Math.round(m.salience * 100);
+  const color = salienceColor(m.salience);
+  const id = "sr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  // Build reasons tooltip text (attribute-safe via esc)
+  let titleStr = "";
+  if (Array.isArray(m.salience_reasons) && m.salience_reasons.length) {
+    titleStr = m.salience_reasons.map(r => esc(r.signal) + ": " + esc(String(r.reason || ""))).join(" | ");
+  }
+  return `<span class="salience-pill inline-flex items-center gap-1 cursor-pointer select-none" data-row-id="${esc(m.id)}" title="${titleStr}" style="flex-shrink:0" onclick="toggleSalienceReasons(event,'${id}')">
+    <span style="color:${color};font-size:11px">◆</span><span class="font-mono text-[10px]" style="color:${color}">${pct}</span>
+  </span>`;
+}
+
+function salienceReasonsHTML(m, containerId) {
+  if (!Array.isArray(m.salience_reasons) || !m.salience_reasons.length) return "";
+  const rows = m.salience_reasons.map(r => {
+    const c = salienceColor(r.contribution > 0 ? 0.7 : 0.2);
+    return `<div class="flex items-center gap-2 py-0.5">
+      <span class="font-mono text-[9px] w-28 flex-shrink-0" style="color:#6c7086">${esc(r.signal || "")}</span>
+      <span class="font-mono text-[9px] w-10 flex-shrink-0 text-right" style="color:${c}">${esc(String(typeof r.value === "number" ? r.value.toFixed(2) : (r.value || "")))}</span>
+      <span class="font-mono text-[9px] flex-1 text-gray-500">${esc(r.reason || "")}</span>
+    </div>`;
+  }).join("");
+  return `<div id="${containerId}" class="salience-reasons">
+    <div class="font-mono text-[9px] text-gray-600 uppercase tracking-wider mb-1">Signal breakdown</div>
+    ${rows}
+  </div>`;
+}
+
+function toggleSalienceReasons(event, id) {
+  event.stopPropagation();
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle("open");
 }
 
 // ── Filter bar HTML ──
@@ -309,10 +372,20 @@ function filterBarHTML(showSearch = false) {
         <option value="sent" ${state.direction === "sent" ? "selected" : ""}>sent</option>
       </select>
     </div>
-    <div class="flex gap-2 flex-wrap">
+    <div class="flex gap-2 flex-wrap items-center">
       <input id="filter-since" type="date" class="input-field" value="${esc(state.since ? state.since.slice(0,10) : "")}" />
       <input id="filter-until" type="date" class="input-field" value="${esc(state.until ? state.until.slice(0,10) : "")}" />
       <button id="filter-clear" class="input-field cursor-pointer hover:border-accent-red/60 hover:text-accent-red">clear</button>
+      <div class="ml-auto flex items-center gap-2 flex-wrap">
+        <div class="flex gap-1">
+          <button id="sort-recent" class="seg-btn ${state.sort !== "signal" ? "active" : ""}">Recent</button>
+          <button id="sort-signal" class="seg-btn ${state.sort === "signal" ? "active" : ""}">Signal</button>
+        </div>
+        <label class="flex items-center gap-1.5 cursor-pointer select-none" title="Hide messages with salience &lt; 0.35">
+          <input id="filter-hide-noise" type="checkbox" class="accent-accent-yellow w-3.5 h-3.5" ${state.hideNoise ? "checked" : ""} />
+          <span class="font-mono text-[11px] text-gray-400">Hide noise</span>
+        </label>
+      </div>
     </div>
   </div>`;
 }
@@ -324,6 +397,9 @@ function bindFilterBar(onChanged) {
   const since = document.getElementById("filter-since");
   const until = document.getElementById("filter-until");
   const clear = document.getElementById("filter-clear");
+  const sortRecent = document.getElementById("sort-recent");
+  const sortSignal = document.getElementById("sort-signal");
+  const hideNoise = document.getElementById("filter-hide-noise");
 
   let debounce;
   function changed() {
@@ -337,13 +413,30 @@ function bindFilterBar(onChanged) {
     debounce = setTimeout(onChanged, 200);
   }
 
+  function setSort(mode) {
+    state.sort = mode;
+    if (sortRecent) sortRecent.classList.toggle("active", mode !== "signal");
+    if (sortSignal) sortSignal.classList.toggle("active", mode === "signal");
+    persistFilters();
+    onChanged();
+  }
+
   if (q) q.oninput = changed;
   if (plat) plat.onchange = changed;
   if (dir) dir.onchange = changed;
   if (since) since.onchange = changed;
   if (until) until.onchange = changed;
+  if (sortRecent) sortRecent.onclick = () => setSort("recent");
+  if (sortSignal) sortSignal.onclick = () => setSort("signal");
+  if (hideNoise) hideNoise.onchange = () => {
+    state.hideNoise = hideNoise.checked;
+    persistFilters();
+    onChanged();
+  };
   if (clear) clear.onclick = () => {
     for (const k of ["q","platform","direction","since","until"]) state[k] = "";
+    state.sort = "recent";
+    state.hideNoise = false;
     persistFilters();
     onChanged();
   };
@@ -392,6 +485,8 @@ async function loadMessages(reset = false) {
   if (state.until) u.set("until", state.until);
   u.set("limit", state.limit);
   u.set("offset", state.offset);
+  u.set("sort", state.sort || "recent");
+  if (state.hideNoise) u.set("hide_noise", "true");
 
   let batch;
   try {
@@ -401,6 +496,8 @@ async function loadMessages(reset = false) {
       if (state.direction) sq.set("direction", state.direction);
       if (state.since) sq.set("since", state.since);
       if (state.until) sq.set("until", state.until);
+      sq.set("sort", state.sort || "recent");
+      if (state.hideNoise) sq.set("hide_noise", "true");
       batch = await api("/api/search?" + sq.toString());
     } else {
       batch = await api("/api/list?" + u.toString());
@@ -489,6 +586,8 @@ async function runSearch(reset = false) {
   if (state.direction) u.set("direction", state.direction);
   if (state.since) u.set("since", state.since);
   if (state.until) u.set("until", state.until);
+  u.set("sort", state.sort || "recent");
+  if (state.hideNoise) u.set("hide_noise", "true");
 
   let batch;
   try {
@@ -678,6 +777,26 @@ async function openDetail(id, push = true) {
           <div class="font-mono text-[10px] text-gray-500 mt-1 break-all">${esc(m.id)}</div>
         </div>
       </div>
+      ${m.salience != null ? (() => {
+        const salPct = Math.round(m.salience * 100);
+        const salColor = salienceColor(m.salience);
+        const reasonRows = Array.isArray(m.salience_reasons) && m.salience_reasons.length
+          ? m.salience_reasons.map(r => `<div class="flex items-start gap-2 py-0.5 border-b border-surface-border last:border-0">
+              <span class="font-mono text-[9px] w-28 flex-shrink-0" style="color:#6c7086">${esc(r.signal || "")}</span>
+              <span class="font-mono text-[9px] w-10 flex-shrink-0 text-right" style="color:${salienceColor(r.contribution > 0 ? 0.7 : 0.2)}">${esc(String(typeof r.value === "number" ? r.value.toFixed(2) : (r.value || "")))}</span>
+              <span class="font-mono text-[9px] flex-1" style="color:#6c7086">${esc(r.reason || "")}</span>
+            </div>`).join("")
+          : `<div class="font-mono text-[9px] text-gray-600">No breakdown available</div>`;
+        return `<div class="border-t border-surface-border pt-3">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Signal</div>
+          <div class="flex items-center gap-2 mb-3">
+            <span style="color:${salColor};font-size:14px">◆</span>
+            <span class="salience-bar" style="flex:1"><i style="width:${salPct}%;background:${salColor}"></i></span>
+            <span class="font-mono text-[11px]" style="color:${salColor}">${salPct}%</span>
+          </div>
+          <div class="space-y-0">${reasonRows}</div>
+        </div>`;
+      })() : ""}
     </div>`;
 }
 
@@ -697,13 +816,15 @@ function startSSE() {
   try {
     const es = new EventSource(apiPath("/api/events"));
     es.addEventListener("corpus-changed", async () => {
-      // Only prepend if on messages view, no active search, no offset
-      if (state.view !== "messages" || state.q.trim() || state.offset > 0) return;
+      // Only prepend if on messages view, no active search, no offset, and in recent mode
+      if (state.view !== "messages" || state.q.trim() || state.offset > 0 || state.sort === "signal") return;
       const u = new URLSearchParams({ limit: state.limit, offset: 0 });
       if (state.platform) u.set("platform", state.platform);
       if (state.direction) u.set("direction", state.direction);
       if (state.since) u.set("since", state.since);
       if (state.until) u.set("until", state.until);
+      u.set("sort", "recent");
+      if (state.hideNoise) u.set("hide_noise", "true");
       let fresh;
       try { fresh = await api("/api/list?" + u.toString()); } catch(e) { return; }
       const list = document.getElementById("msg-list");
