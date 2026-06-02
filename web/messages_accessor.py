@@ -21,8 +21,8 @@ NAMESPACE = "legion.claude-message"
 class MessagesAccessor:
     """Substrate accessor for the claude-messages webui (Phase 1: read-only)."""
 
-    def __init__(self, db_path: Path | str = md.DEFAULT_DB_PATH) -> None:
-        self._db_path = Path(db_path)
+    def __init__(self, db_path: Path | str | None = None) -> None:
+        self._db_path = Path(db_path) if db_path is not None else Path(md.DEFAULT_DB_PATH)
         self._conn = md.connect_ro(self._db_path)
 
     # ── Accessor Protocol ────────────────────────────────────────────
