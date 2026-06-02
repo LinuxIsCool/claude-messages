@@ -105,8 +105,8 @@ function identicon(name){
 }
 function glyph(p){ const g=PLATFORM_GLYPH[p]||PLATFORM_GLYPH.default;
   return `<span class="glyph" style="background:${g.bg};color:#fff" title="${esc(p)}">${g.e}</span>`; }
-function esc(s){ const d=document.createElement("div"); d.textContent=s==null?"":String(s); return d.innerHTML; }
-function rel(ts){ if(!ts) return ""; const d=new Date(ts); const s=(Date.now()-d.getTime())/1000;
+function esc(s){ return String(s==null?"":s).replace(/[&<>"'`=\/]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;","=":"&#61;","/":"&#47;"}[c])); }
+function rel(ts){ if(!ts) return ""; const d=new Date(ts); if(isNaN(d.getTime())) return ""; const s=(Date.now()-d.getTime())/1000;
   if(s<3600) return Math.floor(s/60)+"m"; if(s<86400) return Math.floor(s/3600)+"h";
   if(s<2592000) return Math.floor(s/86400)+"d"; return d.toISOString().slice(0,10); }
 
@@ -169,7 +169,7 @@ function bindCards(){
   grid.querySelectorAll(".card").forEach(el=>{ el.onclick=()=>openDetail(el.dataset.id); });
 }
 
-async function openDetail(id){
+async function openDetail(id, push=true){
   const m=await api("/api/detail/"+encodeURIComponent(id));
   const from=m.sender_name||m.sender_id||"unknown";
   panelBody.innerHTML=`
@@ -185,7 +185,8 @@ async function openDetail(id){
       <span class="badge">id ${esc(m.id)}</span>
     </div>`;
   detail.classList.add("open");
-  history.pushState({detail:id}, "", location.pathname+location.search+"#m/"+id);
+  const _u=location.pathname+location.search+"#m/"+id;
+  if(push) history.pushState({detail:id}, "", _u); else history.replaceState({detail:id}, "", _u);
 }
 function closeDetail(){ detail.classList.remove("open");
   if(location.hash) history.pushState({}, "", location.pathname+location.search); }
@@ -201,7 +202,9 @@ q.oninput=onFilter; platform.onchange=onFilter; direction.onchange=onFilter;
 since.onchange=onFilter; until.onchange=onFilter;
 clear.onclick=()=>{ for(const k of ["q","platform","direction","since","until"]) state[k]=""; syncInputs(); persist(); render(true); };
 more.onclick=async()=>{ state.offset+=state.limit; const b=await fetchBatch();
-  grid.insertAdjacentHTML("beforeend", b.map(cardHTML).join("")); bindCards();
+  const existing=new Set([...grid.querySelectorAll(".card")].map(e=>e.dataset.id));
+  const fresh=b.filter(m=>!existing.has(m.id));
+  grid.insertAdjacentHTML("beforeend", fresh.map(cardHTML).join("")); bindCards();
   more.style.display=b.length>=state.limit?"":"none"; };
 window.onpopstate=()=>{ if(!location.hash) closeDetail(); };
 
@@ -233,7 +236,7 @@ async function boot(){
     summary.textContent=(s.total_messages||0).toLocaleString()+" messages · "+(s.total_threads||0).toLocaleString()+" threads";
   }catch(e){}
   await render(true);
-  if(location.hash.startsWith("#m/")) openDetail(location.hash.slice(3));
+  if(location.hash.startsWith("#m/")) openDetail(location.hash.slice(3), false);
   startSSE();
 }
 boot();
