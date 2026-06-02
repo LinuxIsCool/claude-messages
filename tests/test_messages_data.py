@@ -101,3 +101,39 @@ def test_facets_reports_platforms_and_directions(fixture_db: Path) -> None:
     assert platforms == {"telegram": 3, "signal": 1}
     assert set(d["value"] for d in f["directions"]) == {"received", "sent"}
     assert "support_clique" in [d["value"] for d in f["dunbar_layers"]]
+
+
+def test_detail_returns_full_record_with_reply_context(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    d = md.get_message_detail(conn, "m2")
+    assert d["id"] == "m2"
+    assert d["sender_name"] == "Darren Zal"
+    assert d["content"] == "lets align on the multisig split"
+    assert d["thread_title"] == "Darren ↔ Shawn"
+
+
+def test_detail_missing_returns_none(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    assert md.get_message_detail(conn, "nope") is None
+
+
+def test_stats_reports_total_and_platform_breakdown(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    s = md.get_stats(conn)
+    assert s["total_messages"] == 4
+    assert s["by_platform"]["telegram"] == 3
+    assert s["total_threads"] == 2
+
+
+def test_signature_changes_when_file_changes(fixture_db: Path, tmp_path) -> None:
+    sig1 = md.signature(fixture_db)
+    # append a row via a separate RW connection to simulate a sync
+    import sqlite3
+    rw = sqlite3.connect(str(fixture_db))
+    rw.execute(
+        "INSERT INTO messages(id,platform,thread_id,sender_id,content,platform_ts,synced_at,direction) "
+        "VALUES ('m5','telegram','t1','telegram:user:000-me','later','2026-06-02T00:00:00Z','2026-06-02T00:00:00Z','sent')"
+    )
+    rw.commit(); rw.close()
+    sig2 = md.signature(fixture_db)
+    assert sig1 != sig2

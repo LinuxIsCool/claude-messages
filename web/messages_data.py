@@ -164,3 +164,54 @@ def get_facets(conn: sqlite3.Connection) -> dict[str, Any]:
             "SELECT dunbar_layer, COUNT(*) FROM contact_scores GROUP BY dunbar_layer ORDER BY 2 DESC"
         ),
     }
+
+
+def get_message_detail(conn: sqlite3.Connection, message_id: str) -> dict[str, Any] | None:
+    """Full record for one message, including reply parent content if present."""
+    sql = (
+        f"{_SELECT_COLS}, m.metadata AS metadata, m.thread_id AS thread_id_full "
+        f"FROM messages m {_LEFT_JOINS} WHERE m.id = :id"
+    )
+    row = conn.execute(sql, {"id": message_id}).fetchone()
+    if row is None:
+        return None
+    card = _row_to_card(row)
+    card["metadata"] = row["metadata"]
+    if row["reply_to"]:
+        parent = conn.execute(
+            "SELECT id, sender_id, content, platform_ts FROM messages WHERE id = :rid",
+            {"rid": row["reply_to"]},
+        ).fetchone()
+        card["reply_context"] = dict(parent) if parent else None
+    else:
+        card["reply_context"] = None
+    return card
+
+
+def get_stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Aggregate counts for the stats route + header summary."""
+    total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    threads = conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
+    by_platform = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT platform, COUNT(*) FROM messages GROUP BY platform ORDER BY 2 DESC"
+        ).fetchall()
+    }
+    return {
+        "total_messages": total,
+        "total_threads": threads,
+        "by_platform": by_platform,
+    }
+
+
+def signature(db_path: Path | str = DEFAULT_DB_PATH) -> str:
+    """A token that changes when the DB (or its WAL) changes — powers SSE poll."""
+    base = Path(db_path)
+    parts: list[str] = []
+    for suffix in ("", "-wal"):
+        f = Path(str(base) + suffix)
+        if f.exists():
+            st = f.stat()
+            parts.append(f"{st.st_size}:{st.st_mtime_ns}")
+    return "|".join(parts) or "missing"
