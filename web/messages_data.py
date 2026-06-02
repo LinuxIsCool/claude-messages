@@ -128,3 +128,39 @@ def list_messages(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict
         f"ORDER BY m.platform_ts DESC LIMIT :limit OFFSET :offset"
     )
     return [_row_to_card(r) for r in conn.execute(sql, binds).fetchall()]
+
+
+def search_messages(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[str, Any]]:
+    """FTS5 search over message content + optional filters, reverse-chron."""
+    q = str(params.get("q") or "").strip()
+    if not q:
+        return []
+    filt, binds = _filters(params)
+    binds["q"] = q
+    binds["limit"] = _clamp_limit(params)
+    binds["offset"] = _offset(params)
+    sql = (
+        f"{_SELECT_COLS} FROM messages_fts fts "
+        f"JOIN messages m ON m.rowid = fts.rowid {_LEFT_JOINS} "
+        f"WHERE messages_fts MATCH :q {filt} "
+        f"ORDER BY m.platform_ts DESC LIMIT :limit OFFSET :offset"
+    )
+    return [_row_to_card(r) for r in conn.execute(sql, binds).fetchall()]
+
+
+def get_facets(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Distinct filter values + counts for filter chips."""
+    def _counts(sql: str) -> list[dict[str, Any]]:
+        return [{"value": r[0], "count": r[1]} for r in conn.execute(sql).fetchall() if r[0]]
+
+    return {
+        "platforms": _counts(
+            "SELECT platform, COUNT(*) FROM messages GROUP BY platform ORDER BY 2 DESC"
+        ),
+        "directions": _counts(
+            "SELECT direction, COUNT(*) FROM messages GROUP BY direction ORDER BY 2 DESC"
+        ),
+        "dunbar_layers": _counts(
+            "SELECT dunbar_layer, COUNT(*) FROM contact_scores GROUP BY dunbar_layer ORDER BY 2 DESC"
+        ),
+    }

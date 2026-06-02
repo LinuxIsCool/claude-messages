@@ -74,3 +74,30 @@ def test_list_populates_thread_fields(fixture_db: Path) -> None:
     m2 = next(r for r in rows if r["id"] == "m2")
     assert m2["thread_title"] == "Darren ↔ Shawn"
     assert "thread_participants" in m2  # routed from the threads join, not dropped
+
+
+def test_search_matches_fts_and_orders_reverse_chron(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.search_messages(conn, {"q": "multisig", "limit": 10})
+    # m1 + m2 contain "multisig"; reverse-chron → m2 before m1
+    assert [r["id"] for r in rows] == ["m2", "m1"]
+
+
+def test_search_combines_with_filters(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    rows = md.search_messages(conn, {"q": "multisig", "since": "2026-05-15T00:00:00Z", "limit": 10})
+    assert [r["id"] for r in rows] == ["m2"]
+
+
+def test_search_empty_query_returns_empty(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    assert md.search_messages(conn, {"q": "   ", "limit": 10}) == []
+
+
+def test_facets_reports_platforms_and_directions(fixture_db: Path) -> None:
+    conn = md.connect_ro(fixture_db)
+    f = md.get_facets(conn)
+    platforms = {p["value"]: p["count"] for p in f["platforms"]}
+    assert platforms == {"telegram": 3, "signal": 1}
+    assert set(d["value"] for d in f["directions"]) == {"received", "sent"}
+    assert "support_clique" in [d["value"] for d in f["dunbar_layers"]]
