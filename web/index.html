@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Messages — Legion</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class", theme: { extend: { colors: {
+      base:"#1e1e2e", mantle:"#181825", surface:"#313244", overlay:"#45475a",
+      text:"#cdd6f4", subtext:"#a6adc8", green:"#a6e3a1", blue:"#89b4fa",
+      red:"#f38ba8", yellow:"#f9e2af", purple:"#cba6f7", pink:"#f5c2e7", teal:"#94e2d5",
+    }, fontFamily: { display:['"Press Start 2P"',"monospace"], mono:['"JetBrains Mono"',"monospace"] } } } };
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <style>
+    body { background:#1e1e2e; color:#cdd6f4; font-family:"JetBrains Mono",monospace; }
+    .input { background:#181825; border:1px solid #45475a; border-radius:6px; padding:6px 10px; color:#cdd6f4; font-size:12px; }
+    .input:focus { outline:none; border-color:#89b4fa; }
+    .card { background:#313244; border:1px solid #45475a; border-radius:10px; padding:12px; cursor:pointer; transition:border-color .12s; }
+    .card:hover { border-color:#89b4fa; }
+    .badge { font-size:10px; padding:1px 6px; border-radius:999px; border:1px solid #45475a; color:#a6adc8; }
+    .clamp2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .bar { height:5px; border-radius:999px; background:#45475a; overflow:hidden; }
+    .bar > i { display:block; height:100%; background:#a6e3a1; }
+    .glyph { width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center; border-radius:5px; font-size:12px; }
+    .ava { width:26px; height:26px; border-radius:6px; }
+    #detail { position:fixed; inset:0; background:rgba(17,17,27,.7); display:none; align-items:flex-start; justify-content:center; padding:5vh 16px; z-index:50; }
+    #detail.open { display:flex; }
+    .panel { background:#1e1e2e; border:1px solid #45475a; border-radius:12px; max-width:720px; width:100%; padding:20px; max-height:88vh; overflow:auto; }
+  </style>
+</head>
+<body>
+  <header class="sticky top-0 z-40 bg-mantle border-b border-overlay px-4 py-3">
+    <div class="flex items-center gap-3 flex-wrap">
+      <span style="font-family:'Press Start 2P',monospace" class="text-blue text-xs">MESSAGES</span>
+      <span id="summary" class="text-subtext text-xs"></span>
+      <span id="live" class="badge ml-auto">● live</span>
+    </div>
+    <div class="flex items-center gap-2 flex-wrap mt-3">
+      <input id="q" class="input flex-1 min-w-[200px]" placeholder="Search messages (FTS)…" />
+      <select id="platform" class="input"><option value="">all platforms</option></select>
+      <select id="direction" class="input">
+        <option value="">any direction</option>
+        <option value="received">received</option>
+        <option value="sent">sent</option>
+      </select>
+      <input id="since" type="date" class="input" />
+      <input id="until" type="date" class="input" />
+      <button id="clear" class="input cursor-pointer">clear</button>
+    </div>
+  </header>
+
+  <main id="grid" class="p-4 grid gap-3" style="grid-template-columns:repeat(auto-fill,minmax(320px,1fr))"></main>
+  <div class="flex justify-center pb-10">
+    <button id="more" class="input cursor-pointer" style="display:none">load more</button>
+  </div>
+
+  <div id="detail" onclick="if(event.target===this)closeDetail()"><div class="panel" id="panelBody"></div></div>
+
+<script>
+const PLATFORM_GLYPH = {
+  telegram:{e:"✈",bg:"#229ED9"}, signal:{e:"◎",bg:"#3A76F0"},
+  email:{e:"✉",bg:"#cba6f7"}, whatsapp:{e:"✆",bg:"#25D366"},
+  slack:{e:"#",bg:"#E01E5A"}, default:{e:"•",bg:"#45475a"}
+};
+const PRIORITY_COLOR = {
+  support_clique:"#f38ba8", sympathy_group:"#fab387", active_network:"#f9e2af",
+  acquaintance:"#94e2d5"
+};
+const state = { q:"", platform:"", direction:"", since:"", until:"", offset:0, limit:60 };
+const PAGE = 60;
+let lastBatch = [];
+
+function loadState() {
+  const u = new URLSearchParams(location.search);
+  let any = false;
+  for (const k of ["q","platform","direction","since","until"]) {
+    if (u.has(k)) { state[k]=u.get(k); any=true; }
+  }
+  if (!any) {
+    try { const s=JSON.parse(localStorage.getItem("messages.filters")||"{}");
+      for (const k of ["q","platform","direction","since","until"]) if(s[k]) state[k]=s[k];
+    } catch(e){}
+  }
+}
+function persist() {
+  const u = new URLSearchParams();
+  for (const k of ["q","platform","direction","since","until"]) if(state[k]) u.set(k,state[k]);
+  history.replaceState({}, "", u.toString()? "?"+u.toString() : location.pathname);
+  localStorage.setItem("messages.filters", JSON.stringify(
+    Object.fromEntries(["q","platform","direction","since","until"].map(k=>[k,state[k]]))));
+}
+function syncInputs() {
+  q.value=state.q; platform.value=state.platform; direction.value=state.direction;
+  since.value=state.since? state.since.slice(0,10):""; until.value=state.until? state.until.slice(0,10):"";
+}
+
+function hashHue(s){ let h=0; for(let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0; return h%360; }
+function identicon(name){
+  const hue=hashHue(name||"?"); const hue2=(hue+40)%360;
+  const initials=(name||"?").replace(/^[a-z]+:user:/,'').slice(0,2).toUpperCase();
+  return `<span class="ava" style="background:linear-gradient(135deg,hsl(${hue} 50% 45%),hsl(${hue2} 50% 35%));display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:#fff">${esc(initials)}</span>`;
+}
+function glyph(p){ const g=PLATFORM_GLYPH[p]||PLATFORM_GLYPH.default;
+  return `<span class="glyph" style="background:${g.bg};color:#fff" title="${esc(p)}">${g.e}</span>`; }
+function esc(s){ const d=document.createElement("div"); d.textContent=s==null?"":String(s); return d.innerHTML; }
+function rel(ts){ if(!ts) return ""; const d=new Date(ts); const s=(Date.now()-d.getTime())/1000;
+  if(s<3600) return Math.floor(s/60)+"m"; if(s<86400) return Math.floor(s/3600)+"h";
+  if(s<2592000) return Math.floor(s/86400)+"d"; return d.toISOString().slice(0,10); }
+
+function cardHTML(m){
+  const from = m.sender_name || m.sender_id || "unknown";
+  const to = m.direction==="sent" ? (m.thread_title||"—") : "me";
+  const conn = m.connectedness!=null ? Math.round(m.connectedness*100) : null;
+  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier]||"#a6adc8") : null;
+  const tags = (m.tags||[]).map(t=>`<span class="badge">#${esc(t)}</span>`).join(" ");
+  const vents = (m.ventures||[]).map(v=>`<span class="badge" style="border-color:#cba6f7;color:#cba6f7">◆ ${esc(v)}</span>`).join(" ");
+  return `<div class="card" data-id="${esc(m.id)}">
+    <div class="flex items-center gap-2">
+      ${glyph(m.platform)} ${identicon(from)}
+      <div class="min-w-0 flex-1">
+        <div class="text-xs truncate"><b>${esc(from)}</b> <span class="text-subtext">→ ${esc(to)}</span></div>
+        <div class="text-subtext" style="font-size:10px">${esc(m.thread_title||m.platform)}</div>
+      </div>
+      <div class="text-subtext" style="font-size:10px" title="${esc(m.timestamp)}">${rel(m.timestamp)}</div>
+    </div>
+    <div class="clamp2 mt-2 text-text" style="font-size:12px">${esc(m.content||"")}</div>
+    <div class="flex items-center gap-2 mt-2 flex-wrap">
+      ${tags} ${vents}
+      <div class="ml-auto flex items-center gap-2">
+        ${conn!=null? `<div class="bar" style="width:46px" title="connectedness ${conn}%"><i style="width:${conn}%"></i></div>`:""}
+        ${pc? `<span class="badge" style="border-color:${pc};color:${pc}">${esc(m.priority_tier)}</span>`:""}
+      </div>
+    </div></div>`;
+}
+
+async function api(path){ const r=await fetch(path); if(!r.ok) throw new Error(r.status); return r.json(); }
+function queryString(){
+  const u=new URLSearchParams();
+  if(state.platform) u.set("platform",state.platform);
+  if(state.direction) u.set("direction",state.direction);
+  if(state.since) u.set("since",state.since);
+  if(state.until) u.set("until",state.until);
+  u.set("limit",state.limit); u.set("offset",state.offset);
+  return u.toString();
+}
+async function fetchBatch(){
+  if(state.q.trim()){
+    const u=new URLSearchParams({q:state.q, limit:state.limit, offset:state.offset});
+    if(state.platform)u.set("platform",state.platform);
+    if(state.direction)u.set("direction",state.direction);
+    if(state.since)u.set("since",state.since);
+    if(state.until)u.set("until",state.until);
+    return api("/api/search?"+u.toString());
+  }
+  return api("/api/list?"+queryString());
+}
+async function render(reset=true){
+  if(reset){ state.offset=0; grid.innerHTML=""; }
+  const batch=await fetchBatch();
+  lastBatch=batch;
+  grid.insertAdjacentHTML("beforeend", batch.map(cardHTML).join(""));
+  more.style.display = batch.length>=state.limit ? "" : "none";
+  bindCards();
+}
+function bindCards(){
+  grid.querySelectorAll(".card").forEach(el=>{ el.onclick=()=>openDetail(el.dataset.id); });
+}
+
+async function openDetail(id){
+  const m=await api("/api/detail/"+encodeURIComponent(id));
+  const from=m.sender_name||m.sender_id||"unknown";
+  panelBody.innerHTML=`
+    <div class="flex items-center gap-3 mb-3">${glyph(m.platform)} ${identicon(from)}
+      <div><div class="text-sm"><b>${esc(from)}</b></div>
+      <div class="text-subtext" style="font-size:11px">${esc(m.thread_title||"")} · ${esc(m.timestamp)} · ${esc(m.direction)}</div></div>
+      <button class="input ml-auto cursor-pointer" onclick="closeDetail()">close</button></div>
+    ${m.reply_context? `<div class="card mb-2" style="cursor:default"><div class="text-subtext" style="font-size:10px">↩ replying to</div><div style="font-size:12px">${esc(m.reply_context.content)}</div></div>`:""}
+    <div style="font-size:13px;white-space:pre-wrap">${esc(m.content||"")}</div>
+    <div class="mt-3 flex gap-2 flex-wrap">
+      ${m.connectedness!=null? `<span class="badge">connectedness ${Math.round(m.connectedness*100)}%</span>`:""}
+      ${m.priority_tier? `<span class="badge">${esc(m.priority_tier)}</span>`:""}
+      <span class="badge">id ${esc(m.id)}</span>
+    </div>`;
+  detail.classList.add("open");
+  history.pushState({detail:id}, "", location.pathname+location.search+"#m/"+id);
+}
+function closeDetail(){ detail.classList.remove("open");
+  if(location.hash) history.pushState({}, "", location.pathname+location.search); }
+
+// ── filter wiring ──
+let debounce;
+function onFilter(){
+  state.q=q.value; state.platform=platform.value; state.direction=direction.value;
+  state.since=since.value? since.value+"T00:00:00Z":""; state.until=until.value? until.value+"T23:59:59Z":"";
+  persist(); clearTimeout(debounce); debounce=setTimeout(()=>render(true),180);
+}
+q.oninput=onFilter; platform.onchange=onFilter; direction.onchange=onFilter;
+since.onchange=onFilter; until.onchange=onFilter;
+clear.onclick=()=>{ for(const k of ["q","platform","direction","since","until"]) state[k]=""; syncInputs(); persist(); render(true); };
+more.onclick=async()=>{ state.offset+=state.limit; const b=await fetchBatch();
+  grid.insertAdjacentHTML("beforeend", b.map(cardHTML).join("")); bindCards();
+  more.style.display=b.length>=state.limit?"":"none"; };
+window.onpopstate=()=>{ if(!location.hash) closeDetail(); };
+
+// ── live SSE: prepend new messages when not searching/paging ──
+function startSSE(){
+  try{
+    const es=new EventSource("/api/events");
+    es.onmessage=()=>{}; // generic
+    es.addEventListener("corpus-changed", async()=>{
+      if(state.q.trim()||state.offset>0) return; // don't disrupt an active search/scroll
+      const fresh=await api("/api/list?"+queryString());
+      const existing=new Set([...grid.querySelectorAll(".card")].map(e=>e.dataset.id));
+      const newOnes=fresh.filter(m=>!existing.has(m.id));
+      if(newOnes.length){ grid.insertAdjacentHTML("afterbegin", newOnes.map(cardHTML).join("")); bindCards();
+        live.textContent="● +"+newOnes.length; setTimeout(()=>live.textContent="● live",2500); }
+    });
+    es.onerror=()=>{ live.textContent="○ offline"; };
+  }catch(e){ live.textContent="○ no sse"; }
+}
+
+async function boot(){
+  loadState(); syncInputs();
+  try{ const f=await api("/api/facets");
+    for(const p of f.platforms){ const o=document.createElement("option"); o.value=p.value;
+      o.textContent=p.value+" ("+p.count+")"; platform.appendChild(o); }
+    platform.value=state.platform;
+  }catch(e){}
+  try{ const s=await api("/api/stats");
+    summary.textContent=(s.total_messages||0).toLocaleString()+" messages · "+(s.total_threads||0).toLocaleString()+" threads";
+  }catch(e){}
+  await render(true);
+  if(location.hash.startsWith("#m/")) openDetail(location.hash.slice(3));
+  startSSE();
+}
+boot();
+</script>
+</body>
+</html>
