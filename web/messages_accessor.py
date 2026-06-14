@@ -154,6 +154,18 @@ class MessagesAccessor:
             s = sal.salience(shaped, ctx)
             c["salience"] = s["salience"]
             c["salience_reasons"] = s["reasons"]
+        sort = str(params.get("sort") or "last_activity").lower()
+        if sort == "salience":
+            cards.sort(key=lambda c: c.get("salience", 0), reverse=True)
+        elif sort == "activity":
+            cards.sort(key=lambda c: c.get("message_count", 0), reverse=True)
+        elif sort == "people":
+            tier_rank = {"support_clique": 5, "sympathy_group": 4, "affinity_group": 3,
+                         "active_network": 2, "acquaintance": 1}
+            cards.sort(key=lambda c: max([0] + [tier_rank.get(p.get("dunbar_layer"), 0)
+                                                for p in c.get("participants", [])]), reverse=True)
+        elif sort == "unread":
+            cards.sort(key=lambda c: c.get("needs_reply", False), reverse=True)
         return cards
 
     def thread(self, thread_id: str) -> dict[str, Any]:
