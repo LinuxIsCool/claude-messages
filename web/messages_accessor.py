@@ -30,11 +30,27 @@ class MessagesAccessor:
         self._db_path = Path(db_path) if db_path is not None else Path(md.DEFAULT_DB_PATH)
         self._conn = md.connect_ro(self._db_path)
         self._engaged: set[str] | None = None
+        self._engaged_sig: str | None = None
+        # signature-keyed memo for cheap-but-not-free aggregates (facets/stats).
+        # They only change when the DB changes, so a stable DB → instant repeats.
+        self._cache: dict[str, tuple[str, Any]] = {}
+
+    def _cached(self, key: str, fn: Any) -> Any:
+        sig = self.signature()
+        hit = self._cache.get(key)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        val = fn()
+        self._cache[key] = (sig, val)
+        return val
 
     # ── Salience helpers ─────────────────────────────────────────────
     def _ctx(self) -> dict:
-        if self._engaged is None:
+        # Recompute the engaged-thread set only when the DB actually changes.
+        sig = self.signature()
+        if self._engaged is None or self._engaged_sig != sig:
             self._engaged = md.engaged_thread_ids(self._conn)
+            self._engaged_sig = sig
         return {"engaged_threads": self._engaged}
 
     def _annotate(self, cards: list[dict]) -> list[dict]:
@@ -82,7 +98,7 @@ class MessagesAccessor:
         return rec
 
     def stats(self) -> dict[str, Any]:
-        return md.get_stats(self._conn)
+        return self._cached("stats", lambda: md.get_stats(self._conn))
 
     def feed(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         return self.list(dict(params))
@@ -124,7 +140,7 @@ class MessagesAccessor:
         return cards
 
     def facets(self) -> dict[str, Any]:
-        return md.get_facets(self._conn)
+        return self._cached("facets", lambda: md.get_facets(self._conn))
 
     def threads(self, params: dict[str, Any]) -> list[dict[str, Any]]:
         cards = md.list_threads(self._conn, dict(params))
