@@ -200,7 +200,12 @@ function identiconHTML(name) {
 }
 
 // ── API helper ──
-function apiPath(p) { return p.replace(/^\//, ""); }
+// Resolve an API path against the page's own directory, so it works both
+// standalone (:8895/) and mounted under the hub (:8800/messages/).
+function apiPath(p) {
+  const u = new URL(p.replace(/^\//, ""), document.baseURI);
+  return u.pathname + (u.search || "");
+}
 async function api(path) {
   const r = await fetch(apiPath(path));
   if (!r.ok) throw new Error(path + " -> " + r.status);
