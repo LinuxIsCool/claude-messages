@@ -234,12 +234,32 @@ def engaged_thread_ids(conn: sqlite3.Connection) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _thread_participants(conn: sqlite3.Connection, thread_id: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Resolved participant names + Dunbar tiers for a thread's senders (for faces)."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT COALESCE(idn.display_name, m.sender_id) AS name,
+               cs.dunbar_layer AS dunbar_layer
+        FROM messages m
+        LEFT JOIN identity_links il ON il.platform = m.platform
+               AND il.platform_id = substr(m.sender_id, length(m.platform) + 2)
+        LEFT JOIN identities idn ON idn.id = il.identity_id
+        LEFT JOIN contact_scores cs ON cs.identity_id = il.identity_id
+        WHERE m.thread_id = :tid LIMIT :lim
+        """,
+        {"tid": thread_id, "lim": limit},
+    ).fetchall()
+    return [{"name": r["name"], "dunbar_layer": r["dunbar_layer"]} for r in rows if r["name"]]
+
+
 def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[str, Any]]:
     """Threads, most-recently-updated first, enriched with count + last message.
 
     Pages threads by updated_at (cheap, avoids a corpus-wide GROUP BY), then
     enriches each page row with message_count + last message via small queries.
-    Filters: platform, thread_type, q (title LIKE).
+    Filters: platform, platforms (CSV), thread_type, q (title LIKE).
+    Sort modes: last_activity, salience, activity, people, unread (all map to
+    updated_at DESC here — re-sorts happen in the accessor layer).
     """
     clauses: list[str] = []
     binds: dict[str, Any] = {}
@@ -252,13 +272,23 @@ def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[
     if params.get("q"):
         clauses.append("AND t.title LIKE :q")
         binds["q"] = f"%{params['q']}%"
+    if params.get("platforms"):
+        plats = [p for p in str(params["platforms"]).split(",") if p]
+        if plats:
+            ph = ",".join(f":p{i}" for i in range(len(plats)))
+            clauses.append(f"AND t.platform IN ({ph})")
+            binds.update({f"p{i}": p for i, p in enumerate(plats)})
+    sort = str(params.get("sort") or "last_activity").lower()
+    order = {"last_activity": "t.updated_at DESC", "salience": "t.updated_at DESC",
+             "activity": "t.updated_at DESC", "people": "t.updated_at DESC",
+             "unread": "t.updated_at DESC"}.get(sort, "t.updated_at DESC")
     binds["limit"] = _clamp_limit(params)
     binds["offset"] = _offset(params)
     where = " ".join(clauses)
     sql = (
         "SELECT t.id, t.platform, t.title, t.thread_type, t.participants, t.updated_at "
         f"FROM threads t WHERE 1=1 {where} "
-        "ORDER BY t.updated_at DESC LIMIT :limit OFFSET :offset"
+        f"ORDER BY {order} LIMIT :limit OFFSET :offset"
     )
     out: list[dict[str, Any]] = []
     for t in conn.execute(sql, binds).fetchall():
@@ -267,16 +297,18 @@ def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[
             "SELECT COUNT(*) FROM messages WHERE thread_id = :tid", {"tid": tid}
         ).fetchone()[0]
         last = conn.execute(
-            "SELECT content, platform_ts, sender_id FROM messages "
+            "SELECT content, platform_ts, sender_id, direction FROM messages "
             "WHERE thread_id = :tid ORDER BY platform_ts DESC LIMIT 1",
             {"tid": tid},
         ).fetchone()
         try:
             import json as _json
-            parts = _json.loads(t["participants"] or "[]")
-            pcount = len(parts) if isinstance(parts, list) else 0
+            raw_parts = _json.loads(t["participants"] or "[]")
+            pcount = len(raw_parts) if isinstance(raw_parts, list) else 0
         except Exception:
             pcount = 0
+        needs_reply = bool(last and last["direction"] != "sent")
+        parts = _thread_participants(conn, tid)
         out.append({
             "id": tid,
             "platform": t["platform"],
@@ -288,6 +320,8 @@ def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[
             "last_ts": last["platform_ts"] if last else None,
             "last_content": last["content"] if last else None,
             "last_sender": last["sender_id"] if last else None,
+            "needs_reply": needs_reply,
+            "participants": parts,
         })
     return out
 
