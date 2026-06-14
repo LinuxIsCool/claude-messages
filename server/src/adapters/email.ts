@@ -1,9 +1,25 @@
 import { ImapFlow } from 'imapflow';
+import { simpleParser } from 'mailparser';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { Adapter } from './base.js';
 import type { SyncEvent, AdapterConfig, Contact, Thread, Message } from '../types.js';
+
+/** Decode a raw MIME body part (or whole message) to plain text.
+ * Handles base64 / quoted-printable transfer-encodings + multipart trees.
+ * Falls back to the raw string if it isn't MIME. */
+export async function decodeEmailBody(raw: string): Promise<string> {
+  if (!raw) return '';
+  const looksMime = /content-transfer-encoding:/i.test(raw) || /^content-type:/im.test(raw);
+  if (!looksMime) return raw;
+  try {
+    const parsed = await simpleParser(Buffer.from(raw));
+    return (parsed.text || parsed.html || raw).toString();
+  } catch {
+    return raw;
+  }
+}
 
 interface AccountConfig {
   id: string;
@@ -419,9 +435,9 @@ export class EmailAdapter implements Adapter {
         };
         yield { type: 'thread', data: thread };
 
-        // Get text content from first body part
+        // Get text content from first body part, decoded via mailparser
         const textPart = msg.bodyParts?.get('1');
-        const textContent = textPart ? textPart.toString() : null;
+        const textContent = textPart ? await decodeEmailBody(textPart.toString()) : null;
 
         const senderEmail = fromAddrs[0]?.address?.toLowerCase() ?? null;
         const metadata: Record<string, unknown> = {
