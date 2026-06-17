@@ -2,6 +2,8 @@
 
 Unified messaging backbone. Syncs Telegram, Signal, Email, and Slack into SQLite with FTS5 search.
 
+> **Rendering contract (CANONICAL):** Any agent displaying messages from this plugin MUST use the header-block + table format (Platform · Thread · Group Members · Summary header; `marker | Author | Day | Timestamp-with-year | full untruncated Message` rows; ascending order; `...` gap rows; ≥1 context buffer each side). Spec: `~/.claude/projects/-home-shawn/memory/message-rendering-contract.md`. (Shawn directive 2026-06-16; see backlog task-4151.)
+
 ## Quick Start
 - `/messages <query>` — search messages
 - `/messages-status` — daemon + sync health
