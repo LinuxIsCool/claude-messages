@@ -47,4 +47,13 @@ describe('priority scoring functions', () => {
     expect(detectUrgencySignals('cool, thanks')).toBe(0);
     expect(detectUrgencySignals(null)).toBe(0);
   });
+
+  it('detects a bare "by <full weekday>" deadline without other signals', () => {
+    expect(detectUrgencySignals('let us finalize by Friday')).toBeGreaterThan(0);
+    expect(detectUrgencySignals('review by Wednesday please')).toBeGreaterThan(0);
+  });
+
+  it('caps combined signals at 1.0', () => {
+    expect(detectUrgencySignals('urgent — can you send it by Monday?')).toBe(1);
+  });
 });

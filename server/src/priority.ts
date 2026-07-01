@@ -26,7 +26,7 @@ export function blendAttention(importance: number, urgency: number): number {
   return Math.max(0, Math.min(1, a));
 }
 
-const DEADLINE_WORDS = /\b(asap|urgent|today|tonight|tomorrow|by (mon|tue|wed|thu|fri|sat|sun)|deadline|eod|end of day)\b/i;
+const DEADLINE_WORDS = /\b(asap|urgent|today|tonight|tomorrow|deadline|eod|end of day|by (mon|tues|tue|wednes|wed|thurs|thur|thu|fri|satur|sat|sun)(day)?)\b/i;
 
 export function detectUrgencySignals(content: string | null): number {
   if (!content) return 0;
