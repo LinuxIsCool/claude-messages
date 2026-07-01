@@ -402,7 +402,11 @@ export class MessageDB {
       JSON.stringify(msg.metadata), msg.platform_ts, msg.synced_at,
       msg.direction ?? 'unknown'
     );
-    return result.changes > 0;
+    const inserted = result.changes > 0;
+    if (inserted) {
+      try { this.scoreMessage(msg.id); } catch { /* scoring must never break ingestion */ }
+    }
+    return inserted;
   }
 
   updateCursor(adapter: string, cursorValue: string): void {

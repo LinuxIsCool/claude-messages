@@ -248,3 +248,20 @@ describe('inbox + feedback', () => {
     expect(db.getPriorityInbox({ unseenOnly: true }).some(e => e.message_id === 'mA')).toBe(false);
   });
 });
+
+describe('auto-score on insert', () => {
+  let db: MessageDB;
+  const now = new Date().toISOString();
+  beforeEach(() => { db = new MessageDB(':memory:'); db.addPriorityRule('thread', 'signal:gpu-thread', 'critical'); });
+
+  it('scores a message when inserted via insertMessage', () => {
+    db.insertMessage({
+      id: 'mZ', platform: 'signal', thread_id: 'signal:gpu-thread', sender_id: 'signal:x',
+      content: 'ping?', content_type: 'text', reply_to: null, metadata: {},
+      platform_ts: now, synced_at: now, direction: 'received',
+    });
+    const sp = db.explainPriority('mZ');
+    expect(sp).not.toBeNull();
+    expect(sp!.tier).toBe('critical');
+  });
+});
