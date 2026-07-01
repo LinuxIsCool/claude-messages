@@ -57,3 +57,28 @@ describe('priority scoring functions', () => {
     expect(detectUrgencySignals('urgent — can you send it by Monday?')).toBe(1);
   });
 });
+
+describe('priority rule + cohort storage', () => {
+  let db: MessageDB;
+  beforeEach(() => { db = new MessageDB(':memory:'); });
+
+  it('adds, lists, and disables rules', () => {
+    const id = db.addPriorityRule('thread', 'signal:gpu-thread', 'critical', 'GPU thread');
+    let rules = db.listPriorityRules();
+    expect(rules).toHaveLength(1);
+    expect(rules[0].tier_floor).toBe('critical');
+    expect(rules[0].importance_floor).toBeCloseTo(0.95);
+
+    db.disablePriorityRule(id);
+    expect(db.listPriorityRules()).toHaveLength(0);
+    expect(db.listPriorityRules(true)).toHaveLength(1);
+  });
+
+  it('creates cohorts and stores members', () => {
+    const cohortId = db.createCohort('Telus', 'Telus contacts');
+    const identity = (db as any).createIdentity('Someone At Telus');
+    db.addCohortMember(cohortId, identity.id);
+    expect(db.getCohortMembers(cohortId)).toEqual([identity.id]);
+    expect(db.listCohorts()[0].name).toBe('Telus');
+  });
+});

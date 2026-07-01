@@ -269,3 +269,21 @@ export interface DaemonHealth {
   cycle_duration_ms: number;         // duration of last full syncAll()
   adapters: Record<string, AdapterHealth>;
 }
+
+export interface PriorityRule {
+  id: number;
+  rule_type: string;
+  match_value: string;
+  importance_floor: number;
+  tier_floor: string;
+  note: string | null;
+  enabled: number;
+  created_at: string;
+}
+
+export interface Cohort {
+  id: number;
+  name: string;
+  description: string | null;
+  created_at: string;
+}

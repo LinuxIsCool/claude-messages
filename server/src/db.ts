@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
+import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
+import type { PriorityTier, RuleType } from './priority.js';
 // @ts-ignore — esbuild text loader inlines CSV as string
 import nicknamesCsv from '../data/nicknames.csv';
 
@@ -1404,6 +1406,53 @@ export class MessageDB {
   getTierOverrides(): Map<string, DunbarLayer> {
     const rows = this.db.prepare('SELECT identity_id, dunbar_layer FROM tier_overrides').all() as Array<{ identity_id: string; dunbar_layer: string }>;
     return new Map(rows.map(r => [r.identity_id, r.dunbar_layer as DunbarLayer]));
+  }
+
+  // --- PRIORITY RULES & COHORTS ---
+
+  addPriorityRule(ruleType: RuleType, matchValue: string, tierFloor: PriorityTier, note?: string): number {
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      `INSERT INTO priority_rules (rule_type, match_value, importance_floor, tier_floor, note, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`
+    ).run(ruleType, matchValue, tierToImportance(tierFloor), tierFloor, note ?? null, now);
+    return Number(info.lastInsertRowid);
+  }
+
+  listPriorityRules(includeDisabled = false): PriorityRule[] {
+    const sql = includeDisabled
+      ? 'SELECT * FROM priority_rules ORDER BY id'
+      : 'SELECT * FROM priority_rules WHERE enabled = 1 ORDER BY id';
+    return this.db.prepare(sql).all() as PriorityRule[];
+  }
+
+  disablePriorityRule(id: number): void {
+    this.db.prepare('UPDATE priority_rules SET enabled = 0 WHERE id = ?').run(id);
+  }
+
+  createCohort(name: string, description?: string): number {
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      'INSERT INTO cohorts (name, description, created_at) VALUES (?, ?, ?)'
+    ).run(name, description ?? null, now);
+    return Number(info.lastInsertRowid);
+  }
+
+  addCohortMember(cohortId: number, identityId: string): void {
+    this.db.prepare(
+      'INSERT OR IGNORE INTO cohort_members (cohort_id, identity_id) VALUES (?, ?)'
+    ).run(cohortId, identityId);
+  }
+
+  getCohortMembers(cohortId: number): string[] {
+    const rows = this.db.prepare(
+      'SELECT identity_id FROM cohort_members WHERE cohort_id = ?'
+    ).all(cohortId) as Array<{ identity_id: string }>;
+    return rows.map(r => r.identity_id);
+  }
+
+  listCohorts(): Cohort[] {
+    return this.db.prepare('SELECT * FROM cohorts ORDER BY name').all() as Cohort[];
   }
 
   close(): void {
