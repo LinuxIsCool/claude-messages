@@ -220,11 +220,31 @@ describe('inbox + feedback', () => {
     expect(db.explainPriority('mB')!.tier).toBe('exceptional');
   });
 
-  it('markPrioritySeen clears unseen count', () => {
+  it('markPrioritySeen clears the unseen count (not just the row flag)', () => {
     db.rescoreAllPriority();
-    expect(db.priorityStats().unseen).toBeGreaterThan(0);
+    expect(db.priorityStats().unseen).toBe(1); // only mA is critical + unseen
     db.markPrioritySeen({ messageId: 'mA' });
-    const seenRow = db.explainPriority('mA');
-    expect(seenRow!.seen).toBe(1);
+    expect(db.explainPriority('mA')!.seen).toBe(1);
+    expect(db.priorityStats().unseen).toBe(0);
+  });
+
+  it('markPrioritySeen marks an entire thread and returns rows changed', () => {
+    db.rescoreAllPriority();
+    const changed = db.markPrioritySeen({ threadId: 'signal:gpu-thread' });
+    expect(changed).toBeGreaterThanOrEqual(1);
+    expect(db.explainPriority('mA')!.seen).toBe(1);
+    expect(db.priorityStats().unseen).toBe(0);
+  });
+
+  it('markPrioritySeen with no target changes nothing', () => {
+    db.rescoreAllPriority();
+    expect(db.markPrioritySeen({})).toBe(0);
+  });
+
+  it('getPriorityInbox respects tier and unseenOnly filters', () => {
+    db.rescoreAllPriority();
+    expect(db.getPriorityInbox({ tier: 'critical' }).every(e => e.tier === 'critical')).toBe(true);
+    db.markPrioritySeen({ messageId: 'mA' });
+    expect(db.getPriorityInbox({ unseenOnly: true }).some(e => e.message_id === 'mA')).toBe(false);
   });
 });
