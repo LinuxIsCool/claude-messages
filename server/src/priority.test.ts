@@ -82,3 +82,41 @@ describe('priority rule + cohort storage', () => {
     expect(db.listCohorts()[0].name).toBe('Telus');
   });
 });
+
+describe('scoreMessage', () => {
+  let db: MessageDB;
+  const now = new Date().toISOString();
+
+  beforeEach(() => {
+    db = db = new MessageDB(':memory:');
+    // minimal message + thread + identity link so rules can match
+    (db as any).db.prepare(
+      `INSERT INTO messages (id, platform, thread_id, sender_id, content, content_type, platform_ts, synced_at, direction)
+       VALUES (?, ?, ?, ?, ?, 'text', ?, ?, 'received')`
+    ).run('m1', 'signal', 'signal:gpu-thread', 'signal:alice', 'when is the GPU arriving?', now, now);
+  });
+
+  it('applies a matching thread rule as a critical floor', () => {
+    db.addPriorityRule('thread', 'signal:gpu-thread', 'critical');
+    const sp = db.scoreMessage('m1');
+    expect(sp).not.toBeNull();
+    expect(sp!.tier).toBe('critical');
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.95);
+    expect(sp!.urgency).toBeGreaterThan(0); // has a '?'
+  });
+
+  it('scores an unmatched message as low tier', () => {
+    const sp = db.scoreMessage('m1');
+    expect(sp!.tier === 'somewhat' || sp!.tier === 'irrelevant').toBe(true);
+  });
+
+  it('matches identity and cohort rules via sender identity', () => {
+    const identity = (db as any).createIdentity('Alice');
+    (db as any).linkContact(identity.id, 'signal', 'alice', 1.0, 'manual');
+    const cohortId = db.createCohort('Telus');
+    db.addCohortMember(cohortId, identity.id);
+    db.addPriorityRule('cohort', String(cohortId), 'exceptional');
+    const sp = db.scoreMessage('m1');
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
+  });
+});

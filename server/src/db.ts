@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
 import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
@@ -1453,6 +1453,82 @@ export class MessageDB {
 
   listCohorts(): Cohort[] {
     return this.db.prepare('SELECT * FROM cohorts ORDER BY name').all() as Cohort[];
+  }
+
+  identityForSender(senderId: string): string | null {
+    const idx = senderId.indexOf(':');
+    if (idx < 0) return null;
+    const platform = senderId.slice(0, idx);
+    const platformId = senderId.slice(idx + 1);
+    const row = this.db.prepare(
+      'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+    ).get(platform, platformId) as { identity_id: string } | undefined;
+    return row?.identity_id ?? null;
+  }
+
+  scoreMessage(messageId: string): MessagePriority | null {
+    const msg = this.db.prepare(
+      'SELECT id, thread_id, sender_id, content, platform, direction FROM messages WHERE id = ?'
+    ).get(messageId) as
+      | { id: string; thread_id: string | null; sender_id: string | null; content: string | null; platform: string; direction: string }
+      | undefined;
+    if (!msg) return null;
+
+    const identityId = msg.sender_id ? this.identityForSender(msg.sender_id) : null;
+
+    // --- rule floor: max importance_floor over matching enabled rules ---
+    const rules = this.listPriorityRules();
+    let ruleFloor = 0;
+    let matchedNote: string | null = null;
+    for (const r of rules) {
+      let hit = false;
+      switch (r.rule_type) {
+        case 'thread': hit = msg.thread_id === r.match_value; break;
+        case 'identity': hit = identityId !== null && identityId === r.match_value; break;
+        case 'cohort':
+          hit = identityId !== null &&
+            this.getCohortMembers(Number(r.match_value)).includes(identityId);
+          break;
+        case 'platform_folder': hit = `${msg.platform}:${msg.thread_id ?? ''}`.startsWith(r.match_value); break;
+        case 'keyword': hit = !!msg.content && new RegExp(r.match_value, 'i').test(msg.content); break;
+      }
+      if (hit && r.importance_floor > ruleFloor) {
+        ruleFloor = r.importance_floor;
+        matchedNote = r.note ?? `${r.rule_type}:${r.match_value}`;
+      }
+    }
+
+    // --- relationship importance from ContactRank composite ---
+    let relImportance = 0;
+    if (identityId) {
+      const cs = this.db.prepare(
+        'SELECT composite FROM contact_scores WHERE identity_id = ?'
+      ).get(identityId) as { composite: number } | undefined;
+      if (cs) relImportance = Math.min(1, cs.composite);
+    }
+
+    const importance = Math.max(ruleFloor, relImportance);
+
+    // --- urgency: unanswered inbound + textual signals ---
+    const urgReply = msg.direction === 'received' ? 0.5 : 0;
+    const urgency = Math.min(1, urgReply + detectUrgencySignals(msg.content));
+
+    const attention = blendAttention(importance, urgency);
+    const tier = importanceToTier(importance);
+    const source = ruleFloor > 0 ? 'rule' : 'heuristic';
+    const rationale = matchedNote;
+    const now = new Date().toISOString();
+
+    this.db.prepare(
+      `INSERT INTO message_priority
+        (message_id, importance, urgency, attention, tier, source, model_version, rationale, needs_llm, seen, scored_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, ?)
+       ON CONFLICT(message_id) DO UPDATE SET
+         importance=excluded.importance, urgency=excluded.urgency, attention=excluded.attention,
+         tier=excluded.tier, source=excluded.source, rationale=excluded.rationale, scored_at=excluded.scored_at`
+    ).run(messageId, importance, urgency, attention, tier, source, rationale, now);
+
+    return this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority;
   }
 
   close(): void {

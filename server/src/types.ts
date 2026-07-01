@@ -287,3 +287,17 @@ export interface Cohort {
   description: string | null;
   created_at: string;
 }
+
+export interface MessagePriority {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+}
