@@ -160,6 +160,58 @@ export class MessageDB {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS priority_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_type TEXT NOT NULL,
+        match_value TEXT NOT NULL,
+        importance_floor REAL NOT NULL,
+        tier_floor TEXT NOT NULL,
+        note TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cohorts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cohort_members (
+        cohort_id INTEGER NOT NULL REFERENCES cohorts(id) ON DELETE CASCADE,
+        identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+        PRIMARY KEY (cohort_id, identity_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS message_priority (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        importance REAL NOT NULL,
+        urgency REAL NOT NULL,
+        attention REAL NOT NULL,
+        tier TEXT NOT NULL,
+        source TEXT NOT NULL,
+        model_version TEXT,
+        rationale TEXT,
+        needs_llm INTEGER NOT NULL DEFAULT 1,
+        seen INTEGER NOT NULL DEFAULT 0,
+        scored_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_mp_tier ON message_priority(tier);
+      CREATE INDEX IF NOT EXISTS idx_mp_attention ON message_priority(attention DESC);
+      CREATE INDEX IF NOT EXISTS idx_mp_unseen ON message_priority(seen, tier);
+
+      CREATE TABLE IF NOT EXISTS priority_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_tier TEXT,
+        user_importance REAL,
+        user_urgency REAL,
+        note TEXT,
+        created_at TEXT NOT NULL
+      );
     `);
 
     // --- Phase 0: direction column + self-identity links + backfill ---
