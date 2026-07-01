@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority, InboxEntry } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
 import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
@@ -1474,6 +1474,10 @@ export class MessageDB {
       | undefined;
     if (!msg) return null;
 
+    if (this.hasFeedback(messageId)) {
+      return this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority ?? null;
+    }
+
     const identityId = msg.sender_id ? this.identityForSender(msg.sender_id) : null;
 
     // --- rule floor: max importance_floor over matching enabled rules ---
@@ -1533,6 +1537,88 @@ export class MessageDB {
     ).run(messageId, importance, urgency, attention, tier, source, rationale, now);
 
     return this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority;
+  }
+
+  private hasFeedback(messageId: string): boolean {
+    const row = this.db.prepare(
+      'SELECT 1 FROM priority_feedback WHERE message_id = ? LIMIT 1'
+    ).get(messageId);
+    return !!row;
+  }
+
+  rescoreAllPriority(): number {
+    const ids = this.db.prepare('SELECT id FROM messages').all() as Array<{ id: string }>;
+    let n = 0;
+    const tx = this.db.transaction((rows: Array<{ id: string }>) => {
+      for (const r of rows) { if (this.scoreMessage(r.id)) n++; }
+    });
+    tx(ids);
+    return n;
+  }
+
+  getPriorityInbox(opts: { tier?: PriorityTier; limit?: number; unseenOnly?: boolean } = {}): InboxEntry[] {
+    const { tier, limit = 30, unseenOnly = false } = opts;
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (tier) { clauses.push('mp.tier = ?'); params.push(tier); }
+    if (unseenOnly) { clauses.push('mp.seen = 0'); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    params.push(limit);
+    return this.db.prepare(
+      `SELECT mp.*, m.content, m.sender_id, m.thread_id
+       FROM message_priority mp JOIN messages m ON m.id = mp.message_id
+       ${where}
+       ORDER BY mp.attention DESC, mp.scored_at DESC
+       LIMIT ?`
+    ).all(...params) as InboxEntry[];
+  }
+
+  explainPriority(messageId: string): MessagePriority | null {
+    return (this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority) ?? null;
+  }
+
+  setPriorityFeedback(messageId: string, fb: { tier?: PriorityTier; importance?: number; urgency?: number; note?: string }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `INSERT INTO priority_feedback (message_id, user_tier, user_importance, user_urgency, note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(messageId, fb.tier ?? null, fb.importance ?? null, fb.urgency ?? null, fb.note ?? null, now);
+
+    const importance = fb.importance ?? (fb.tier ? tierToImportance(fb.tier) : undefined);
+    const existing = this.explainPriority(messageId);
+    const urgency = fb.urgency ?? existing?.urgency ?? 0;
+    const finalImp = importance ?? existing?.importance ?? 0;
+    const tier = fb.tier ?? importanceToTier(finalImp);
+    const attention = blendAttention(finalImp, urgency);
+    this.db.prepare(
+      `INSERT INTO message_priority
+         (message_id, importance, urgency, attention, tier, source, model_version, rationale, needs_llm, seen, scored_at)
+       VALUES (?, ?, ?, ?, ?, 'feedback', NULL, ?, 0, 0, ?)
+       ON CONFLICT(message_id) DO UPDATE SET
+         importance=excluded.importance, urgency=excluded.urgency, attention=excluded.attention,
+         tier=excluded.tier, source='feedback', rationale=excluded.rationale, needs_llm=0, scored_at=excluded.scored_at`
+    ).run(messageId, finalImp, urgency, attention, tier, fb.note ?? 'user feedback', now);
+  }
+
+  markPrioritySeen(target: { messageId?: string; threadId?: string }): number {
+    if (target.messageId) {
+      return this.db.prepare('UPDATE message_priority SET seen = 1 WHERE message_id = ?').run(target.messageId).changes;
+    }
+    if (target.threadId) {
+      return this.db.prepare(
+        `UPDATE message_priority SET seen = 1 WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ?)`
+      ).run(target.threadId).changes;
+    }
+    return 0;
+  }
+
+  priorityStats(): { byTier: Record<string, number>; scored: number; unseen: number } {
+    const rows = this.db.prepare('SELECT tier, COUNT(*) as c FROM message_priority GROUP BY tier').all() as Array<{ tier: string; c: number }>;
+    const byTier: Record<string, number> = {};
+    let scored = 0;
+    for (const r of rows) { byTier[r.tier] = r.c; scored += r.c; }
+    const unseen = (this.db.prepare("SELECT COUNT(*) as c FROM message_priority WHERE seen = 0 AND tier IN ('critical','exceptional')").get() as { c: number }).c;
+    return { byTier, scored, unseen };
   }
 
   close(): void {

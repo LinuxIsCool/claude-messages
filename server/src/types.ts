@@ -301,3 +301,20 @@ export interface MessagePriority {
   seen: number;
   scored_at: string;
 }
+
+export interface InboxEntry {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+  content: string | null;
+  sender_id: string | null;
+  thread_id: string | null;
+}

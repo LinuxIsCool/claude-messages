@@ -187,3 +187,44 @@ describe('scoreMessage', () => {
     expect(sp!.urgency).toBeCloseTo(0.5, 5);
   });
 });
+
+describe('inbox + feedback', () => {
+  let db: MessageDB;
+  const now = new Date().toISOString();
+  beforeEach(() => {
+    db = new MessageDB(':memory:');
+    const ins = (db as any).db.prepare(
+      `INSERT INTO messages (id, platform, thread_id, sender_id, content, content_type, platform_ts, synced_at, direction)
+       VALUES (?, 'signal', ?, 'signal:x', ?, 'text', ?, ?, 'received')`
+    );
+    ins.run('mA', 'signal:gpu-thread', 'gpu?', now, now);
+    ins.run('mB', 'signal:random', 'hi', now, now);
+    db.addPriorityRule('thread', 'signal:gpu-thread', 'critical');
+  });
+
+  it('rescoreAll scores all messages and inbox ranks critical first', () => {
+    expect(db.rescoreAllPriority()).toBe(2);
+    const inbox = db.getPriorityInbox({ limit: 10 });
+    expect(inbox[0].message_id).toBe('mA');
+    expect(inbox[0].tier).toBe('critical');
+  });
+
+  it('feedback overrides tier and persists through rescore', () => {
+    db.rescoreAllPriority();
+    db.setPriorityFeedback('mB', { tier: 'exceptional', note: 'actually important' });
+    const sp = db.explainPriority('mB');
+    expect(sp!.tier).toBe('exceptional');
+    expect(sp!.source).toBe('feedback');
+    // rescore must NOT clobber feedback
+    db.scoreMessage('mB');
+    expect(db.explainPriority('mB')!.tier).toBe('exceptional');
+  });
+
+  it('markPrioritySeen clears unseen count', () => {
+    db.rescoreAllPriority();
+    expect(db.priorityStats().unseen).toBeGreaterThan(0);
+    db.markPrioritySeen({ messageId: 'mA' });
+    const seenRow = db.explainPriority('mA');
+    expect(seenRow!.seen).toBe(1);
+  });
+});
