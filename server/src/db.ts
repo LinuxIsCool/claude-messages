@@ -1498,11 +1498,9 @@ export class MessageDB {
             this.getCohortMembers(Number(r.match_value)).includes(identityId);
           break;
         case 'platform_folder': hit = `${msg.platform}:${msg.thread_id ?? ''}`.startsWith(r.match_value); break;
-        case 'keyword': {
-          try { hit = !!msg.content && new RegExp(r.match_value, 'i').test(msg.content); }
-          catch { hit = false; }
+        case 'keyword':
+          hit = !!msg.content && msg.content.toLowerCase().includes(r.match_value.toLowerCase());
           break;
-        }
       }
       if (hit && r.importance_floor > ruleFloor) {
         ruleFloor = r.importance_floor;

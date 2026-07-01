@@ -146,11 +146,17 @@ describe('scoreMessage', () => {
     expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
   });
 
-  it('does not crash on a malformed keyword regex; skips the bad rule', () => {
+  it('treats a regex-special keyword literally (no crash, no match)', () => {
     db.addPriorityRule('keyword', '(unbalanced', 'critical');
     expect(() => db.scoreMessage('m1')).not.toThrow();
     const sp = db.scoreMessage('m1');
-    expect(sp!.tier).not.toBe('critical'); // bad rule skipped => no critical floor
+    expect(sp!.tier).not.toBe('critical'); // literal '(unbalanced' doesn't match => no critical floor
+  });
+
+  it('treats keyword regex metacharacters as literal text', () => {
+    db.addPriorityRule('keyword', '.*', 'critical');
+    const sp = db.scoreMessage('m1'); // content 'when is the GPU arriving?' has no literal '.*'
+    expect(sp!.tier).not.toBe('critical');
   });
 
   it('rule floor overrides a lower relationship score (hard-floor invariant)', () => {

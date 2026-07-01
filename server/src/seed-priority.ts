@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { MessageDB } from './db.js';
 
@@ -6,6 +7,7 @@ function resolveHome(p: string): string {
 }
 
 const dataDir = process.env.MESSAGES_DATA_DIR ?? resolveHome('~/.claude/local/messages');
+fs.mkdirSync(dataDir, { recursive: true });
 const db = new MessageDB(path.join(dataDir, 'messages.db'));
 
 // Idempotent: only create cohorts if absent.
