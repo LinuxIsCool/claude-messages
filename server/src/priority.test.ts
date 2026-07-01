@@ -110,7 +110,7 @@ describe('scoreMessage', () => {
     expect(sp!.tier === 'somewhat' || sp!.tier === 'irrelevant').toBe(true);
   });
 
-  it('matches identity and cohort rules via sender identity', () => {
+  it('matches a cohort rule via sender identity', () => {
     const identity = (db as any).createIdentity('Alice');
     (db as any).linkContact(identity.id, 'signal', 'alice', 1.0, 'manual');
     const cohortId = db.createCohort('Telus');
@@ -118,5 +118,72 @@ describe('scoreMessage', () => {
     db.addPriorityRule('cohort', String(cohortId), 'exceptional');
     const sp = db.scoreMessage('m1');
     expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('matches an identity rule via resolved sender identity', () => {
+    const identity = (db as any).createIdentity('Alice');
+    (db as any).linkContact(identity.id, 'signal', 'alice', 1.0, 'manual');
+    db.addPriorityRule('identity', identity.id, 'exceptional');
+    const sp = db.scoreMessage('m1');
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
+    expect(sp!.source).toBe('rule');
+  });
+
+  it('matches a keyword rule against message content', () => {
+    db.addPriorityRule('keyword', 'gpu', 'exceptional');
+    const sp = db.scoreMessage('m1'); // content: 'when is the GPU arriving?'
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('matches a platform_folder rule by platform:thread prefix', () => {
+    const now2 = new Date().toISOString();
+    (db as any).db.prepare(
+      `INSERT INTO messages (id, platform, thread_id, sender_id, content, content_type, platform_ts, synced_at, direction)
+       VALUES ('mMail', 'email', 'INBOX/Telus', 'email:boss@telus.com', 'hi', 'text', ?, ?, 'received')`
+    ).run(now2, now2);
+    db.addPriorityRule('platform_folder', 'email:INBOX/Telus', 'exceptional');
+    const sp = db.scoreMessage('mMail'); // computed 'email:INBOX/Telus' startsWith rule value
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it('does not crash on a malformed keyword regex; skips the bad rule', () => {
+    db.addPriorityRule('keyword', '(unbalanced', 'critical');
+    expect(() => db.scoreMessage('m1')).not.toThrow();
+    const sp = db.scoreMessage('m1');
+    expect(sp!.tier).not.toBe('critical'); // bad rule skipped => no critical floor
+  });
+
+  it('rule floor overrides a lower relationship score (hard-floor invariant)', () => {
+    const identity = (db as any).createIdentity('Alice');
+    (db as any).linkContact(identity.id, 'signal', 'alice', 1.0, 'manual');
+    const now2 = new Date().toISOString();
+    (db as any).db.prepare(
+      'INSERT INTO contact_scores (identity_id, composite, computed_at) VALUES (?, ?, ?)'
+    ).run(identity.id, 0.30, now2);
+    db.addPriorityRule('thread', 'signal:gpu-thread', 'critical');
+    const sp = db.scoreMessage('m1');
+    expect(sp!.importance).toBeGreaterThanOrEqual(0.95); // floor wins over 0.30
+  });
+
+  it('uses relationship score when no rule matches', () => {
+    const identity = (db as any).createIdentity('Alice');
+    (db as any).linkContact(identity.id, 'signal', 'alice', 1.0, 'manual');
+    const now2 = new Date().toISOString();
+    (db as any).db.prepare(
+      'INSERT INTO contact_scores (identity_id, composite, computed_at) VALUES (?, ?, ?)'
+    ).run(identity.id, 0.30, now2);
+    const sp = db.scoreMessage('m1'); // no rules added
+    expect(sp!.importance).toBeCloseTo(0.30, 5);
+    expect(sp!.source).toBe('heuristic');
+  });
+
+  it('question mark contributes urgency independent of direction', () => {
+    const now2 = new Date().toISOString();
+    (db as any).db.prepare(
+      `INSERT INTO messages (id, platform, thread_id, sender_id, content, content_type, platform_ts, synced_at, direction)
+       VALUES ('mSent', 'signal', 'signal:random', 'signal:alice', 'ready?', 'text', ?, ?, 'sent')`
+    ).run(now2, now2);
+    const sp = db.scoreMessage('mSent'); // direction 'sent' => urgReply 0; '?' => 0.5
+    expect(sp!.urgency).toBeCloseTo(0.5, 5);
   });
 });
