@@ -35,6 +35,12 @@ await Promise.all([
     outfile: 'build/import-whatsapp-export.mjs',
     banner: { js: "// WhatsApp chat export importer — bundled with esbuild" },
   }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/seed-priority.ts'],
+    outfile: 'build/seed-priority.mjs',
+    banner: { js: "// claude-messages priority seed — bundled with esbuild" },
+  }),
 ]);
 
-console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, and import-whatsapp-export.mjs');
+console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, import-whatsapp-export.mjs, and seed-priority.mjs');
