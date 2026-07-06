@@ -53,7 +53,7 @@ export class DesktopSink {
     this.spawn = spawn;
   }
   notify(title: string, body: string): void {
-    this.spawn('notify-send', ['--urgency=critical', '--app-name=Messages', title, body]);
+    this.spawn('notify-send', ['--urgency=critical', '--app-name=Messages', '--', title, body]);
   }
 }
 
@@ -80,17 +80,18 @@ export class AwarenessEmitter {
 
   emit(): void {
     const cfg = this.opts.config ?? {};
-    const now = (this.opts.now ?? (() => new Date()))();
+
+    // Master switch: awareness.enabled === false disables ALL sinks (desktop + statusline).
+    if (cfg.enabled === false) return;
 
     // Statusline: always publish current counts (unless explicitly disabled).
     if (cfg.statusline?.enabled !== false) {
       this.opts.statusline.write(this.db.awarenessCounts());
     }
 
-    // Desktop: gated by enabled flags + quiet hours.
-    const awarenessOn = cfg.enabled !== false;
-    const desktopOn = cfg.desktop?.enabled !== false;
-    if (!awarenessOn || !desktopOn) return;
+    // Desktop: gated by its own flag + quiet hours.
+    if (cfg.desktop?.enabled === false) return;
+    const now = (this.opts.now ?? (() => new Date()))();
     if (isQuietHours(now, cfg.desktop?.quiet_hours)) return;
 
     const criticals = this.db.getUnnotifiedCritical();

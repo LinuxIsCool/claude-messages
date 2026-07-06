@@ -17,6 +17,8 @@ awareness:
   statusline:
     enabled: true          # write awareness.json (default true)
 ```
+> Criticals that arrive during quiet hours are held and notify once per thread at the first sync cycle after the window ends.
+
 Omit the whole block to accept defaults (all on, no quiet hours). Restart the
 daemon after editing: `systemctl --user restart legion-messages`.
 

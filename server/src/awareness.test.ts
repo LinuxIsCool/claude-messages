@@ -182,4 +182,16 @@ describe('AwarenessEmitter', () => {
     expect(desktop.calls).toHaveLength(0);
     expect(statusline.last.critical).toBe(3);
   });
+
+  it('master switch enabled=false suppresses desktop AND statusline', () => {
+    const desktop = new FakeDesktop();
+    const statusline = new FakeStatusline();
+    const emitter = new AwarenessEmitter(db, {
+      config: { enabled: false },
+      desktop: desktop as any, statusline: statusline as any,
+    });
+    emitter.emit();
+    expect(desktop.calls).toHaveLength(0);
+    expect(statusline.last).toBeNull(); // master switch off => statusline NOT written
+  });
 });
