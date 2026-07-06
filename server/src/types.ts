@@ -302,6 +302,11 @@ export interface MessagePriority {
   scored_at: string;
 }
 
+export interface AwarenessCounts {
+  critical: number;
+  exceptional: number;
+}
+
 export interface InboxEntry {
   message_id: string;
   importance: number;

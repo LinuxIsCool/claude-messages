@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority, InboxEntry } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority, InboxEntry, AwarenessCounts } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
 import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
@@ -275,6 +275,13 @@ export class MessageDB {
           this.db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('direction_backfill_v1', 'done')").run();
         }
       }
+    }
+
+    // --- Phase A1 (awareness): notified_at column ---
+    try {
+      this.db.exec("ALTER TABLE message_priority ADD COLUMN notified_at TEXT");
+    } catch (e: any) {
+      if (!e.message.includes('duplicate column')) throw e;
     }
 
     // --- Phase 3: thread_summaries table ---
@@ -1621,6 +1628,36 @@ export class MessageDB {
     for (const r of rows) { byTier[r.tier] = r.c; scored += r.c; }
     const unseen = (this.db.prepare("SELECT COUNT(*) as c FROM message_priority WHERE seen = 0 AND tier IN ('critical','exceptional')").get() as { c: number }).c;
     return { byTier, scored, unseen };
+  }
+
+  getUnnotifiedCritical(limit = 50): InboxEntry[] {
+    return this.db.prepare(
+      `SELECT mp.*, m.content, m.sender_id, m.thread_id
+       FROM message_priority mp JOIN messages m ON m.id = mp.message_id
+       WHERE mp.tier = 'critical' AND mp.seen = 0 AND mp.notified_at IS NULL
+       ORDER BY mp.scored_at ASC
+       LIMIT ?`
+    ).all(limit) as InboxEntry[];
+  }
+
+  markNotified(messageIds: string[]): void {
+    if (messageIds.length === 0) return;
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare('UPDATE message_priority SET notified_at = ? WHERE message_id = ?');
+    const tx = this.db.transaction((ids: string[]) => {
+      for (const id of ids) stmt.run(now, id);
+    });
+    tx(messageIds);
+  }
+
+  awarenessCounts(): AwarenessCounts {
+    const row = this.db.prepare(
+      `SELECT
+         SUM(CASE WHEN tier = 'critical' THEN 1 ELSE 0 END) AS critical,
+         SUM(CASE WHEN tier = 'exceptional' THEN 1 ELSE 0 END) AS exceptional
+       FROM message_priority WHERE seen = 0`
+    ).get() as { critical: number | null; exceptional: number | null };
+    return { critical: row.critical ?? 0, exceptional: row.exceptional ?? 0 };
   }
 
   close(): void {
