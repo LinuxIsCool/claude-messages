@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MessageDB } from './db.js';
+import { isQuietHours, dedupeByThread, formatNotification } from './awareness.js';
+import type { InboxEntry } from './types.js';
 
 const now = new Date().toISOString();
 
@@ -46,5 +48,40 @@ describe('awareness DB layer', () => {
   it('markNotified([]) is a no-op and does not throw', () => {
     expect(() => db.markNotified([])).not.toThrow();
     expect(db.getUnnotifiedCritical().map(e => e.message_id).sort()).toEqual(['c1', 'c2']);
+  });
+});
+
+function entry(id: string, thread: string, content = 'hello'): InboxEntry {
+  return {
+    message_id: id, importance: 0.95, urgency: 0.5, attention: 0.8, tier: 'critical',
+    source: 'rule', model_version: null, rationale: null, needs_llm: 1, seen: 0,
+    scored_at: now, content, sender_id: 'signal:x', thread_id: thread,
+  };
+}
+
+describe('awareness pure helpers', () => {
+  it('isQuietHours handles a window crossing midnight', () => {
+    const q = { start: '22:00', end: '07:00' };
+    expect(isQuietHours(new Date('2026-07-06T23:30:00'), q)).toBe(true);
+    expect(isQuietHours(new Date('2026-07-06T03:00:00'), q)).toBe(true);
+    expect(isQuietHours(new Date('2026-07-06T12:00:00'), q)).toBe(false);
+  });
+
+  it('isQuietHours handles a same-day window and no-config', () => {
+    expect(isQuietHours(new Date('2026-07-06T13:00:00'), { start: '09:00', end: '17:00' })).toBe(true);
+    expect(isQuietHours(new Date('2026-07-06T20:00:00'), { start: '09:00', end: '17:00' })).toBe(false);
+    expect(isQuietHours(new Date('2026-07-06T03:00:00'), undefined)).toBe(false);
+  });
+
+  it('dedupeByThread keeps one entry per thread, in order', () => {
+    const out = dedupeByThread([entry('a', 't1'), entry('b', 't1'), entry('c', 't2')]);
+    expect(out.map(e => e.message_id)).toEqual(['a', 'c']);
+  });
+
+  it('formatNotification builds title + truncated body', () => {
+    const long = 'x'.repeat(200);
+    const n = formatNotification(entry('a', 't1', long), 'Carole Anne');
+    expect(n.title).toBe('⚡ Carole Anne');
+    expect(n.body.length).toBeLessThanOrEqual(140);
   });
 });

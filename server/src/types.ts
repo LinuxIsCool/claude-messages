@@ -50,9 +50,16 @@ export interface AdapterConfig {
   [key: string]: unknown;
 }
 
+export interface AwarenessConfig {
+  enabled?: boolean;
+  desktop?: { enabled?: boolean; quiet_hours?: { start: string; end: string } };
+  statusline?: { enabled?: boolean };
+}
+
 export interface AppConfig {
   data_dir: string;
   adapters: Record<string, AdapterConfig>;
+  awareness?: AwarenessConfig;
 }
 
 export interface SyncCursor {
