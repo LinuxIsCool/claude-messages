@@ -37,4 +37,14 @@ describe('awareness DB layer', () => {
     db.markNotified(['c1']);
     expect(db.awarenessCounts().critical).toBe(2); // still unseen
   });
+
+  it('awarenessCounts returns zeros on an empty DB (null-safe branch)', () => {
+    const fresh = new MessageDB(':memory:');
+    expect(fresh.awarenessCounts()).toEqual({ critical: 0, exceptional: 0 });
+  });
+
+  it('markNotified([]) is a no-op and does not throw', () => {
+    expect(() => db.markNotified([])).not.toThrow();
+    expect(db.getUnnotifiedCritical().map(e => e.message_id).sort()).toEqual(['c1', 'c2']);
+  });
 });
