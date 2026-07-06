@@ -84,4 +84,14 @@ describe('awareness pure helpers', () => {
     expect(n.title).toBe('⚡ Carole Anne');
     expect(n.body.length).toBeLessThanOrEqual(140);
   });
+
+  it('isQuietHours boundaries: inclusive start, exclusive end, equal start/end', () => {
+    const overnight = { start: '22:00', end: '07:00' };
+    expect(isQuietHours(new Date('2026-07-06T22:00:00'), overnight)).toBe(true);  // exact start = quiet
+    expect(isQuietHours(new Date('2026-07-06T07:00:00'), overnight)).toBe(false); // exact end = not quiet
+    const daytime = { start: '09:00', end: '17:00' };
+    expect(isQuietHours(new Date('2026-07-06T09:00:00'), daytime)).toBe(true);    // exact start
+    expect(isQuietHours(new Date('2026-07-06T17:00:00'), daytime)).toBe(false);   // exact end
+    expect(isQuietHours(new Date('2026-07-06T09:00:00'), { start: '09:00', end: '09:00' })).toBe(false); // start===end
+  });
 });
