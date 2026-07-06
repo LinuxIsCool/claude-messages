@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MessageDB } from './db.js';
-import { isQuietHours, dedupeByThread, formatNotification, DesktopSink, StatuslineSink } from './awareness.js';
+import { isQuietHours, dedupeByThread, formatNotification, DesktopSink, StatuslineSink, AwarenessEmitter } from './awareness.js';
 import { readFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -119,5 +119,67 @@ describe('awareness sinks', () => {
     expect(parsed.critical).toBe(2);
     expect(parsed.exceptional).toBe(5);
     expect(typeof parsed.updated_at).toBe('string');
+  });
+});
+
+class FakeDesktop {
+  calls: Array<{ title: string; body: string }> = [];
+  notify(title: string, body: string) { this.calls.push({ title, body }); }
+}
+class FakeStatusline {
+  last: any = null;
+  write(counts: any) { this.last = counts; }
+}
+
+describe('AwarenessEmitter', () => {
+  let db: MessageDB;
+  beforeEach(() => {
+    db = new MessageDB(':memory:');
+    db.addPriorityRule('thread', 'signal:gpu-thread', 'critical');
+    seedCritical(db, 'c1', 'signal:gpu-thread');
+    seedCritical(db, 'c2', 'signal:gpu-thread'); // same thread → deduped
+    seedCritical(db, 'c3', 'signal:other-crit');
+    db.addPriorityRule('thread', 'signal:other-crit', 'critical');
+    db.rescoreAllPriority();
+  });
+
+  it('notifies once per thread, marks all fetched criticals, writes statusline', () => {
+    const desktop = new FakeDesktop();
+    const statusline = new FakeStatusline();
+    const emitter = new AwarenessEmitter(db, {
+      desktop: desktop as any, statusline: statusline as any,
+      now: () => new Date('2026-07-06T12:00:00'),
+    });
+    emitter.emit();
+    expect(desktop.calls).toHaveLength(2);        // one per thread (c1/c2 collapsed)
+    expect(statusline.last.critical).toBe(3);
+    // re-emit: nothing new to notify (all marked), statusline still written
+    emitter.emit();
+    expect(desktop.calls).toHaveLength(2);
+  });
+
+  it('suppresses desktop during quiet hours but still writes statusline', () => {
+    const desktop = new FakeDesktop();
+    const statusline = new FakeStatusline();
+    const emitter = new AwarenessEmitter(db, {
+      config: { desktop: { quiet_hours: { start: '22:00', end: '07:00' } } },
+      desktop: desktop as any, statusline: statusline as any,
+      now: () => new Date('2026-07-06T23:30:00'),
+    });
+    emitter.emit();
+    expect(desktop.calls).toHaveLength(0);
+    expect(statusline.last.critical).toBe(3);
+  });
+
+  it('respects desktop.enabled = false', () => {
+    const desktop = new FakeDesktop();
+    const statusline = new FakeStatusline();
+    const emitter = new AwarenessEmitter(db, {
+      config: { desktop: { enabled: false } },
+      desktop: desktop as any, statusline: statusline as any,
+    });
+    emitter.emit();
+    expect(desktop.calls).toHaveLength(0);
+    expect(statusline.last.critical).toBe(3);
   });
 });

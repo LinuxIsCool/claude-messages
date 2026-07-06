@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { writeFileSync, renameSync } from 'node:fs';
-import type { InboxEntry, AwarenessCounts } from './types.js';
+import type { InboxEntry, AwarenessCounts, AwarenessConfig } from './types.js';
+import type { MessageDB } from './db.js';
 
 export type QuietHours = { start: string; end: string };
 
@@ -64,5 +65,48 @@ export class StatuslineSink {
     const tmp = `${this.filePath}.tmp`;
     writeFileSync(tmp, payload);
     renameSync(tmp, this.filePath);
+  }
+}
+
+export interface EmitterOpts {
+  config?: AwarenessConfig;
+  desktop: DesktopSink;
+  statusline: StatuslineSink;
+  now?: () => Date;
+}
+
+export class AwarenessEmitter {
+  constructor(private db: MessageDB, private opts: EmitterOpts) {}
+
+  emit(): void {
+    const cfg = this.opts.config ?? {};
+    const now = (this.opts.now ?? (() => new Date()))();
+
+    // Statusline: always publish current counts (unless explicitly disabled).
+    if (cfg.statusline?.enabled !== false) {
+      this.opts.statusline.write(this.db.awarenessCounts());
+    }
+
+    // Desktop: gated by enabled flags + quiet hours.
+    const awarenessOn = cfg.enabled !== false;
+    const desktopOn = cfg.desktop?.enabled !== false;
+    if (!awarenessOn || !desktopOn) return;
+    if (isQuietHours(now, cfg.desktop?.quiet_hours)) return;
+
+    const criticals = this.db.getUnnotifiedCritical();
+    if (criticals.length === 0) return;
+
+    const names = this.db.resolveContactNames(
+      [...new Set(criticals.map(c => c.sender_id).filter(Boolean) as string[])]
+    );
+    for (const e of dedupeByThread(criticals)) {
+      const name = names.get(e.sender_id ?? '') ?? e.sender_id ?? 'Someone';
+      const { title, body } = formatNotification(e, name);
+      this.opts.desktop.notify(title, body);
+    }
+
+    // Mark ALL fetched criticals notified (incl. same-thread ones we collapsed),
+    // so a thread that already pinged doesn't re-ping next cycle for old messages.
+    this.db.markNotified(criticals.map(c => c.message_id));
   }
 }
