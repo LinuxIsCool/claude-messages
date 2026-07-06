@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MessageDB } from './db.js';
-import { isQuietHours, dedupeByThread, formatNotification } from './awareness.js';
+import { isQuietHours, dedupeByThread, formatNotification, DesktopSink, StatuslineSink } from './awareness.js';
+import { readFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { InboxEntry } from './types.js';
 
 const now = new Date().toISOString();
@@ -93,5 +96,28 @@ describe('awareness pure helpers', () => {
     expect(isQuietHours(new Date('2026-07-06T09:00:00'), daytime)).toBe(true);    // exact start
     expect(isQuietHours(new Date('2026-07-06T17:00:00'), daytime)).toBe(false);   // exact end
     expect(isQuietHours(new Date('2026-07-06T09:00:00'), { start: '09:00', end: '09:00' })).toBe(false); // start===end
+  });
+});
+
+describe('awareness sinks', () => {
+  it('DesktopSink passes title/body to the spawner with critical urgency', () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const sink = new DesktopSink((cmd, args) => calls.push({ cmd, args }));
+    sink.notify('⚡ Carole Anne', 'the GPU shipped');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toBe('notify-send');
+    expect(calls[0].args).toContain('--urgency=critical');
+    expect(calls[0].args).toContain('⚡ Carole Anne');
+    expect(calls[0].args).toContain('the GPU shipped');
+  });
+
+  it('StatuslineSink writes counts JSON to the file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'aware-'));
+    const file = join(dir, 'awareness.json');
+    new StatuslineSink(file).write({ critical: 2, exceptional: 5 });
+    const parsed = JSON.parse(readFileSync(file, 'utf-8'));
+    expect(parsed.critical).toBe(2);
+    expect(parsed.exceptional).toBe(5);
+    expect(typeof parsed.updated_at).toBe('string');
   });
 });

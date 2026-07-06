@@ -1,4 +1,6 @@
-import type { InboxEntry } from './types.js';
+import { execFile } from 'node:child_process';
+import { writeFileSync, renameSync } from 'node:fs';
+import type { InboxEntry, AwarenessCounts } from './types.js';
 
 export type QuietHours = { start: string; end: string };
 
@@ -35,4 +37,32 @@ export function dedupeByThread(entries: InboxEntry[]): InboxEntry[] {
 export function formatNotification(entry: InboxEntry, senderName: string): { title: string; body: string } {
   const body = (entry.content ?? '').trim().slice(0, 140);
   return { title: `⚡ ${senderName}`, body };
+}
+
+export type Spawner = (cmd: string, args: string[]) => void;
+
+const defaultSpawner: Spawner = (cmd, args) => {
+  // fire-and-forget; swallow errors so a missing notify-send can't crash the daemon
+  execFile(cmd, args, () => {});
+};
+
+export class DesktopSink {
+  private spawn: Spawner;
+  constructor(spawn: Spawner = defaultSpawner) {
+    this.spawn = spawn;
+  }
+  notify(title: string, body: string): void {
+    this.spawn('notify-send', ['--urgency=critical', '--app-name=Messages', title, body]);
+  }
+}
+
+export class StatuslineSink {
+  constructor(private filePath: string) {}
+  write(counts: AwarenessCounts): void {
+    const payload = JSON.stringify({ ...counts, updated_at: new Date().toISOString() });
+    // atomic write: temp file + rename so a statusline reader never sees a partial file
+    const tmp = `${this.filePath}.tmp`;
+    writeFileSync(tmp, payload);
+    renameSync(tmp, this.filePath);
+  }
 }
