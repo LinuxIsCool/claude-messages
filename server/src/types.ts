@@ -50,9 +50,16 @@ export interface AdapterConfig {
   [key: string]: unknown;
 }
 
+export interface AwarenessConfig {
+  enabled?: boolean;
+  desktop?: { enabled?: boolean; quiet_hours?: { start: string; end: string } };
+  statusline?: { enabled?: boolean };
+}
+
 export interface AppConfig {
   data_dir: string;
   adapters: Record<string, AdapterConfig>;
+  awareness?: AwarenessConfig;
 }
 
 export interface SyncCursor {
@@ -268,4 +275,58 @@ export interface DaemonHealth {
   cycle_count: number;               // total sync cycles since start
   cycle_duration_ms: number;         // duration of last full syncAll()
   adapters: Record<string, AdapterHealth>;
+}
+
+export interface PriorityRule {
+  id: number;
+  rule_type: string;
+  match_value: string;
+  importance_floor: number;
+  tier_floor: string;
+  note: string | null;
+  enabled: number;
+  created_at: string;
+}
+
+export interface Cohort {
+  id: number;
+  name: string;
+  description: string | null;
+  created_at: string;
+}
+
+export interface MessagePriority {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+}
+
+export interface AwarenessCounts {
+  critical: number;
+  exceptional: number;
+}
+
+export interface InboxEntry {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+  content: string | null;
+  sender_id: string | null;
+  thread_id: string | null;
 }

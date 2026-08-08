@@ -853,6 +853,135 @@ server.tool(
   }
 );
 
+const tierEnum = z.enum(['critical', 'exceptional', 'somewhat', 'irrelevant']);
+
+server.tool(
+  'priority_inbox',
+  'Messages ranked by attention (importance + urgency), grouped by priority tier',
+  {
+    tier: tierEnum.optional().describe('Filter to a single tier'),
+    limit: z.number().optional().default(30).describe('Max results'),
+    unseen_only: z.boolean().optional().default(false).describe('Only messages not yet marked seen'),
+  },
+  async ({ tier, limit, unseen_only }) => {
+    const rows = db.getPriorityInbox({ tier, limit, unseenOnly: unseen_only });
+    const names = db.resolveContactNames([...new Set(rows.map(r => r.sender_id).filter(Boolean) as string[])]);
+    const lines = rows.map(r =>
+      `[${r.tier}] a=${r.attention.toFixed(2)} ${names.get(r.sender_id ?? '') ?? r.sender_id ?? '?'}: ${(r.content ?? '').slice(0, 120)}${r.rationale ? `  (${r.rationale})` : ''}`
+    );
+    return { content: [{ type: 'text' as const, text: lines.join('\n') || 'No scored messages.' }] };
+  }
+);
+
+server.tool(
+  'priority_explain',
+  'Show the priority score breakdown for a message',
+  { message_id: z.string().describe('Message id') },
+  async ({ message_id }) => {
+    const sp = db.explainPriority(message_id);
+    return { content: [{ type: 'text' as const, text: sp ? JSON.stringify(sp, null, 2) : 'Not scored.' }] };
+  }
+);
+
+server.tool(
+  'priority_feedback',
+  'Correct a message\'s priority (active-learning signal; overrides scoring)',
+  {
+    message_id: z.string(),
+    tier: tierEnum.optional(),
+    importance: z.number().min(0).max(1).optional(),
+    urgency: z.number().min(0).max(1).optional(),
+    note: z.string().optional(),
+  },
+  async ({ message_id, tier, importance, urgency, note }) => {
+    db.setPriorityFeedback(message_id, { tier, importance, urgency, note });
+    return { content: [{ type: 'text' as const, text: `Recorded feedback for ${message_id}.` }] };
+  }
+);
+
+server.tool(
+  'priority_mark_seen',
+  'Mark a message or an entire thread as seen (clears awareness)',
+  { message_id: z.string().optional(), thread_id: z.string().optional() },
+  async ({ message_id, thread_id }) => {
+    const n = db.markPrioritySeen({ messageId: message_id, threadId: thread_id });
+    return { content: [{ type: 'text' as const, text: `Marked ${n} message(s) seen.` }] };
+  }
+);
+
+server.tool(
+  'priority_rule_add',
+  'Add a priority rule (hard importance floor for matching messages)',
+  {
+    rule_type: z.enum(['thread', 'identity', 'cohort', 'platform_folder', 'keyword']),
+    match_value: z.string().describe('thread_id | identity_id | cohort_id | "platform:prefix" | regex'),
+    tier_floor: tierEnum,
+    note: z.string().optional(),
+  },
+  async ({ rule_type, match_value, tier_floor, note }) => {
+    const id = db.addPriorityRule(rule_type, match_value, tier_floor, note);
+    return { content: [{ type: 'text' as const, text: `Added rule #${id}.` }] };
+  }
+);
+
+server.tool(
+  'priority_rule_list',
+  'List priority rules',
+  { include_disabled: z.boolean().optional().default(false) },
+  async ({ include_disabled }) => {
+    const rules = db.listPriorityRules(include_disabled);
+    return { content: [{ type: 'text' as const, text: JSON.stringify(rules, null, 2) }] };
+  }
+);
+
+server.tool(
+  'priority_rule_disable',
+  'Disable a priority rule by id',
+  { id: z.number() },
+  async ({ id }) => {
+    db.disablePriorityRule(id);
+    return { content: [{ type: 'text' as const, text: `Disabled rule #${id}.` }] };
+  }
+);
+
+server.tool(
+  'cohort_create',
+  'Create a named cohort of identities (e.g. "Telus")',
+  { name: z.string(), description: z.string().optional() },
+  async ({ name, description }) => {
+    const id = db.createCohort(name, description);
+    return { content: [{ type: 'text' as const, text: `Created cohort #${id} (${name}).` }] };
+  }
+);
+
+server.tool(
+  'cohort_add_member',
+  'Add an identity to a cohort',
+  { cohort_id: z.number(), identity_id: z.string() },
+  async ({ cohort_id, identity_id }) => {
+    db.addCohortMember(cohort_id, identity_id);
+    return { content: [{ type: 'text' as const, text: `Added ${identity_id} to cohort #${cohort_id}.` }] };
+  }
+);
+
+server.tool(
+  'cohort_list',
+  'List cohorts',
+  {},
+  async () => {
+    return { content: [{ type: 'text' as const, text: JSON.stringify(db.listCohorts(), null, 2) }] };
+  }
+);
+
+server.tool(
+  'priority_stats',
+  'Priority tier distribution and unseen counts',
+  {},
+  async () => {
+    return { content: [{ type: 'text' as const, text: JSON.stringify(db.priorityStats(), null, 2) }] };
+  }
+);
+
 // Start
 const transport = new StdioServerTransport();
 await server.connect(transport);

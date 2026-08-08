@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
-import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer } from './types.js';
+import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority, InboxEntry, AwarenessCounts } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
 import type { IdentityCandidate } from './fuzzy.js';
+import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
+import type { PriorityTier, RuleType } from './priority.js';
 // @ts-ignore — esbuild text loader inlines CSV as string
 import nicknamesCsv from '../data/nicknames.csv';
 
@@ -160,6 +162,58 @@ export class MessageDB {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS priority_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_type TEXT NOT NULL,
+        match_value TEXT NOT NULL,
+        importance_floor REAL NOT NULL,
+        tier_floor TEXT NOT NULL,
+        note TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cohorts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        description TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cohort_members (
+        cohort_id INTEGER NOT NULL REFERENCES cohorts(id) ON DELETE CASCADE,
+        identity_id TEXT NOT NULL REFERENCES identities(id) ON DELETE CASCADE,
+        PRIMARY KEY (cohort_id, identity_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS message_priority (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        importance REAL NOT NULL,
+        urgency REAL NOT NULL,
+        attention REAL NOT NULL,
+        tier TEXT NOT NULL,
+        source TEXT NOT NULL,
+        model_version TEXT,
+        rationale TEXT,
+        needs_llm INTEGER NOT NULL DEFAULT 1,
+        seen INTEGER NOT NULL DEFAULT 0,
+        scored_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_mp_tier ON message_priority(tier);
+      CREATE INDEX IF NOT EXISTS idx_mp_attention ON message_priority(attention DESC);
+      CREATE INDEX IF NOT EXISTS idx_mp_unseen ON message_priority(seen, tier);
+
+      CREATE TABLE IF NOT EXISTS priority_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        user_tier TEXT,
+        user_importance REAL,
+        user_urgency REAL,
+        note TEXT,
+        created_at TEXT NOT NULL
+      );
     `);
 
     // --- Phase 0: direction column + self-identity links + backfill ---
@@ -221,6 +275,13 @@ export class MessageDB {
           this.db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('direction_backfill_v1', 'done')").run();
         }
       }
+    }
+
+    // --- Phase A1 (awareness): notified_at column ---
+    try {
+      this.db.exec("ALTER TABLE message_priority ADD COLUMN notified_at TEXT");
+    } catch (e: any) {
+      if (!e.message.includes('duplicate column')) throw e;
     }
 
     // --- Phase 3: thread_summaries table ---
@@ -348,7 +409,11 @@ export class MessageDB {
       JSON.stringify(msg.metadata), msg.platform_ts, msg.synced_at,
       msg.direction ?? 'unknown'
     );
-    return result.changes > 0;
+    const inserted = result.changes > 0;
+    if (inserted) {
+      try { this.scoreMessage(msg.id); } catch { /* scoring must never break ingestion */ }
+    }
+    return inserted;
   }
 
   updateCursor(adapter: string, cursorValue: string): void {
@@ -1352,6 +1417,247 @@ export class MessageDB {
   getTierOverrides(): Map<string, DunbarLayer> {
     const rows = this.db.prepare('SELECT identity_id, dunbar_layer FROM tier_overrides').all() as Array<{ identity_id: string; dunbar_layer: string }>;
     return new Map(rows.map(r => [r.identity_id, r.dunbar_layer as DunbarLayer]));
+  }
+
+  // --- PRIORITY RULES & COHORTS ---
+
+  addPriorityRule(ruleType: RuleType, matchValue: string, tierFloor: PriorityTier, note?: string): number {
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      `INSERT INTO priority_rules (rule_type, match_value, importance_floor, tier_floor, note, enabled, created_at)
+       VALUES (?, ?, ?, ?, ?, 1, ?)`
+    ).run(ruleType, matchValue, tierToImportance(tierFloor), tierFloor, note ?? null, now);
+    return Number(info.lastInsertRowid);
+  }
+
+  listPriorityRules(includeDisabled = false): PriorityRule[] {
+    const sql = includeDisabled
+      ? 'SELECT * FROM priority_rules ORDER BY id'
+      : 'SELECT * FROM priority_rules WHERE enabled = 1 ORDER BY id';
+    return this.db.prepare(sql).all() as PriorityRule[];
+  }
+
+  disablePriorityRule(id: number): void {
+    this.db.prepare('UPDATE priority_rules SET enabled = 0 WHERE id = ?').run(id);
+  }
+
+  createCohort(name: string, description?: string): number {
+    const now = new Date().toISOString();
+    const info = this.db.prepare(
+      'INSERT INTO cohorts (name, description, created_at) VALUES (?, ?, ?)'
+    ).run(name, description ?? null, now);
+    return Number(info.lastInsertRowid);
+  }
+
+  addCohortMember(cohortId: number, identityId: string): void {
+    this.db.prepare(
+      'INSERT OR IGNORE INTO cohort_members (cohort_id, identity_id) VALUES (?, ?)'
+    ).run(cohortId, identityId);
+  }
+
+  getCohortMembers(cohortId: number): string[] {
+    const rows = this.db.prepare(
+      'SELECT identity_id FROM cohort_members WHERE cohort_id = ?'
+    ).all(cohortId) as Array<{ identity_id: string }>;
+    return rows.map(r => r.identity_id);
+  }
+
+  listCohorts(): Cohort[] {
+    return this.db.prepare('SELECT * FROM cohorts ORDER BY name').all() as Cohort[];
+  }
+
+  identityForSender(senderId: string): string | null {
+    const idx = senderId.indexOf(':');
+    if (idx < 0) return null;
+    const platform = senderId.slice(0, idx);
+    const platformId = senderId.slice(idx + 1);
+    const row = this.db.prepare(
+      'SELECT identity_id FROM identity_links WHERE platform = ? AND platform_id = ?'
+    ).get(platform, platformId) as { identity_id: string } | undefined;
+    return row?.identity_id ?? null;
+  }
+
+  scoreMessage(messageId: string): MessagePriority | null {
+    const msg = this.db.prepare(
+      'SELECT id, thread_id, sender_id, content, platform, direction FROM messages WHERE id = ?'
+    ).get(messageId) as
+      | { id: string; thread_id: string | null; sender_id: string | null; content: string | null; platform: string; direction: string }
+      | undefined;
+    if (!msg) return null;
+
+    if (this.hasFeedback(messageId)) {
+      return this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority ?? null;
+    }
+
+    const identityId = msg.sender_id ? this.identityForSender(msg.sender_id) : null;
+
+    // --- rule floor: max importance_floor over matching enabled rules ---
+    const rules = this.listPriorityRules();
+    let ruleFloor = 0;
+    let matchedNote: string | null = null;
+    for (const r of rules) {
+      let hit = false;
+      switch (r.rule_type) {
+        case 'thread': hit = msg.thread_id === r.match_value; break;
+        case 'identity': hit = identityId !== null && identityId === r.match_value; break;
+        case 'cohort':
+          hit = identityId !== null &&
+            this.getCohortMembers(Number(r.match_value)).includes(identityId);
+          break;
+        case 'platform_folder': hit = `${msg.platform}:${msg.thread_id ?? ''}`.startsWith(r.match_value); break;
+        case 'keyword':
+          hit = !!msg.content && msg.content.toLowerCase().includes(r.match_value.toLowerCase());
+          break;
+      }
+      if (hit && r.importance_floor > ruleFloor) {
+        ruleFloor = r.importance_floor;
+        matchedNote = r.note ?? `${r.rule_type}:${r.match_value}`;
+      }
+    }
+
+    // --- relationship importance from ContactRank composite ---
+    let relImportance = 0;
+    if (identityId) {
+      const cs = this.db.prepare(
+        'SELECT composite FROM contact_scores WHERE identity_id = ?'
+      ).get(identityId) as { composite: number } | undefined;
+      if (cs) relImportance = Math.min(1, cs.composite);
+    }
+
+    const importance = Math.max(ruleFloor, relImportance);
+
+    // --- urgency: unanswered inbound + textual signals ---
+    const urgReply = msg.direction === 'received' ? 0.5 : 0;
+    const urgency = Math.min(1, urgReply + detectUrgencySignals(msg.content));
+
+    const attention = blendAttention(importance, urgency);
+    const tier = importanceToTier(importance);
+    const source = ruleFloor > 0 ? 'rule' : 'heuristic';
+    const rationale = matchedNote;
+    const now = new Date().toISOString();
+
+    this.db.prepare(
+      `INSERT INTO message_priority
+        (message_id, importance, urgency, attention, tier, source, model_version, rationale, needs_llm, seen, scored_at)
+       VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 1, 0, ?)
+       ON CONFLICT(message_id) DO UPDATE SET
+         importance=excluded.importance, urgency=excluded.urgency, attention=excluded.attention,
+         tier=excluded.tier, source=excluded.source, rationale=excluded.rationale, scored_at=excluded.scored_at`
+    ).run(messageId, importance, urgency, attention, tier, source, rationale, now);
+
+    return this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority;
+  }
+
+  private hasFeedback(messageId: string): boolean {
+    const row = this.db.prepare(
+      'SELECT 1 FROM priority_feedback WHERE message_id = ? LIMIT 1'
+    ).get(messageId);
+    return !!row;
+  }
+
+  rescoreAllPriority(): number {
+    const ids = this.db.prepare('SELECT id FROM messages').all() as Array<{ id: string }>;
+    let n = 0;
+    const tx = this.db.transaction((rows: Array<{ id: string }>) => {
+      for (const r of rows) { if (this.scoreMessage(r.id)) n++; }
+    });
+    tx(ids);
+    return n;
+  }
+
+  getPriorityInbox(opts: { tier?: PriorityTier; limit?: number; unseenOnly?: boolean } = {}): InboxEntry[] {
+    const { tier, limit = 30, unseenOnly = false } = opts;
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (tier) { clauses.push('mp.tier = ?'); params.push(tier); }
+    if (unseenOnly) { clauses.push('mp.seen = 0'); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    params.push(limit);
+    return this.db.prepare(
+      `SELECT mp.*, m.content, m.sender_id, m.thread_id
+       FROM message_priority mp JOIN messages m ON m.id = mp.message_id
+       ${where}
+       ORDER BY mp.attention DESC, mp.scored_at DESC
+       LIMIT ?`
+    ).all(...params) as InboxEntry[];
+  }
+
+  explainPriority(messageId: string): MessagePriority | null {
+    return (this.db.prepare('SELECT * FROM message_priority WHERE message_id = ?').get(messageId) as MessagePriority) ?? null;
+  }
+
+  setPriorityFeedback(messageId: string, fb: { tier?: PriorityTier; importance?: number; urgency?: number; note?: string }): void {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `INSERT INTO priority_feedback (message_id, user_tier, user_importance, user_urgency, note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(messageId, fb.tier ?? null, fb.importance ?? null, fb.urgency ?? null, fb.note ?? null, now);
+
+    const importance = fb.importance ?? (fb.tier ? tierToImportance(fb.tier) : undefined);
+    const existing = this.explainPriority(messageId);
+    const urgency = fb.urgency ?? existing?.urgency ?? 0;
+    const finalImp = importance ?? existing?.importance ?? 0;
+    const tier = fb.tier ?? importanceToTier(finalImp);
+    const attention = blendAttention(finalImp, urgency);
+    this.db.prepare(
+      `INSERT INTO message_priority
+         (message_id, importance, urgency, attention, tier, source, model_version, rationale, needs_llm, seen, scored_at)
+       VALUES (?, ?, ?, ?, ?, 'feedback', NULL, ?, 0, 0, ?)
+       ON CONFLICT(message_id) DO UPDATE SET
+         importance=excluded.importance, urgency=excluded.urgency, attention=excluded.attention,
+         tier=excluded.tier, source='feedback', rationale=excluded.rationale, needs_llm=0, scored_at=excluded.scored_at`
+    ).run(messageId, finalImp, urgency, attention, tier, fb.note ?? 'user feedback', now);
+  }
+
+  markPrioritySeen(target: { messageId?: string; threadId?: string }): number {
+    if (target.messageId) {
+      return this.db.prepare('UPDATE message_priority SET seen = 1 WHERE message_id = ?').run(target.messageId).changes;
+    }
+    if (target.threadId) {
+      return this.db.prepare(
+        `UPDATE message_priority SET seen = 1 WHERE message_id IN (SELECT id FROM messages WHERE thread_id = ?)`
+      ).run(target.threadId).changes;
+    }
+    return 0;
+  }
+
+  priorityStats(): { byTier: Record<string, number>; scored: number; unseen: number } {
+    const rows = this.db.prepare('SELECT tier, COUNT(*) as c FROM message_priority GROUP BY tier').all() as Array<{ tier: string; c: number }>;
+    const byTier: Record<string, number> = {};
+    let scored = 0;
+    for (const r of rows) { byTier[r.tier] = r.c; scored += r.c; }
+    const unseen = (this.db.prepare("SELECT COUNT(*) as c FROM message_priority WHERE seen = 0 AND tier IN ('critical','exceptional')").get() as { c: number }).c;
+    return { byTier, scored, unseen };
+  }
+
+  getUnnotifiedCritical(limit = 50): InboxEntry[] {
+    return this.db.prepare(
+      `SELECT mp.*, m.content, m.sender_id, m.thread_id
+       FROM message_priority mp JOIN messages m ON m.id = mp.message_id
+       WHERE mp.tier = 'critical' AND mp.seen = 0 AND mp.notified_at IS NULL
+       ORDER BY mp.scored_at ASC
+       LIMIT ?`
+    ).all(limit) as InboxEntry[];
+  }
+
+  markNotified(messageIds: string[]): void {
+    if (messageIds.length === 0) return;
+    const now = new Date().toISOString();
+    const stmt = this.db.prepare('UPDATE message_priority SET notified_at = ? WHERE message_id = ?');
+    const tx = this.db.transaction((ids: string[]) => {
+      for (const id of ids) stmt.run(now, id);
+    });
+    tx(messageIds);
+  }
+
+  awarenessCounts(): AwarenessCounts {
+    const row = this.db.prepare(
+      `SELECT
+         SUM(CASE WHEN tier = 'critical' THEN 1 ELSE 0 END) AS critical,
+         SUM(CASE WHEN tier = 'exceptional' THEN 1 ELSE 0 END) AS exceptional
+       FROM message_priority WHERE seen = 0`
+    ).get() as { critical: number | null; exceptional: number | null };
+    return { critical: row.critical ?? 0, exceptional: row.exceptional ?? 0 };
   }
 
   close(): void {

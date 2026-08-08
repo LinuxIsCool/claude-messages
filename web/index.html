@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Messages</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><text x='50%' y='52' font-size='52' text-anchor='middle'>%F0%9F%92%AC</text></svg>">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            pixel: ['"Press Start 2P"', 'monospace'],
+            mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+          },
+          colors: {
+            surface: { DEFAULT: '#0f0f17', card: '#161622', border: '#2a2a3e', raised: '#1e1e30' },
+            accent: { green: '#a6e3a1', blue: '#89b4fa', red: '#f38ba8', yellow: '#f9e2af', purple: '#cba6f7' },
+          },
+          animation: {
+            'fade-in': 'fade-in 0.2s ease-out',
+          },
+          keyframes: {
+            'fade-in': {
+              from: { opacity: 0, transform: 'translateY(5px)' },
+              to: { opacity: 1, transform: 'translateY(0)' },
+            },
+          },
+        }
+      }
+    }
+  </script>
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { background: #0f0f17; color: #cdd6f4; }
+    ::-webkit-scrollbar { width: 7px; height: 7px; }
+    ::-webkit-scrollbar-track { background: #0f0f17; }
+    ::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 4px; }
+    button, input, select, a { transition: all .15s ease; }
+    .nav-tab:hover { transform: translateY(-1px); border-color: #89b4fa66; color: #89b4fa; }
+    .nav-tab.active { border-color: #a6e3a166; color: #a6e3a1; background: #a6e3a111; }
+    .nav-tab.disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+    .msg-row { transition: background .15s ease, border-color .15s ease, transform .15s ease; }
+    .msg-row:hover { transform: translateX(3px); background: #1e1e30; border-color: #89b4fa55; }
+    .msg-row.selected { background: #a6e3a10d; border-color: #a6e3a166; }
+    .badge { border: 1px solid #2a2a3e; background: #0f0f17; color: #bac2de; }
+    .metric-card:hover { border-color: #89b4fa66; transform: translateY(-1px); }
+    mark { background: #f9e2af33; color: #f9e2af; border-radius: 3px; padding: 0 2px; }
+    .line-clamp-2 {
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+    }
+    .conn-bar { height: 4px; border-radius: 999px; background: #2a2a3e; overflow: hidden; display: inline-block; vertical-align: middle; }
+    .conn-bar > i { display: block; height: 100%; background: #a6e3a1; }
+    .salience-bar { height: 4px; border-radius: 999px; background: #2a2a3e; overflow: hidden; display: inline-block; vertical-align: middle; }
+    .salience-bar > i { display: block; height: 100%; border-radius: 999px; }
+    .seg-btn { border: 1px solid #2a2a3e; background: #0f0f17; color: #6c7086; border-radius: 5px; padding: 3px 10px; font-family: 'JetBrains Mono', monospace; font-size: 11px; cursor: pointer; transition: all .15s ease; }
+    .seg-btn.active { background: #a6e3a111; border-color: #a6e3a166; color: #a6e3a1; }
+    .seg-btn:hover:not(.active) { border-color: #89b4fa66; color: #89b4fa; }
+    .salience-reasons { display: none; border-top: 1px solid #2a2a3e; margin-top: 8px; padding-top: 8px; }
+    .salience-reasons.open { display: block; }
+    .input-field {
+      background: #161622;
+      border: 1px solid #2a2a3e;
+      border-radius: 6px;
+      padding: 5px 10px;
+      color: #cdd6f4;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .input-field:focus { outline: none; border-color: #89b4fa; }
+    .input-field::placeholder { color: #45475a; }
+    @keyframes livePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .live-on { animation: livePulse 1.6s ease-in-out infinite; }
+    @keyframes slideIn { from { opacity:0; transform: translateX(8px); } to { opacity:1; transform: translateX(0); } }
+    .slide-in { animation: slideIn 0.2s ease-out; }
+  </style>
+</head>
+<body class="min-h-screen overflow-x-hidden">
+
+  <header class="w-full max-w-[1800px] mx-auto px-5 2xl:px-6 pt-6 pb-4">
+    <div class="flex items-start justify-between gap-6 flex-wrap">
+      <div>
+        <h1 class="font-pixel text-accent-green text-lg tracking-wider">MESSAGES</h1>
+        <p class="font-mono text-sm text-gray-500 mt-2">Unified messaging corpus browser</p>
+      </div>
+      <div class="flex items-center gap-3">
+        <a href="http://127.0.0.1:8800/home/?embedded=1" title="Legion Webui Hub"
+           class="rounded-lg border border-surface-border bg-surface-card hover:border-accent-blue transition-colors px-3 py-2 min-w-24 no-underline">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Legion</div>
+          <div class="font-mono text-xs text-accent-blue mt-1">⌂ Hub</div>
+        </a>
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-52">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Corpus</div>
+          <div id="header-counts" class="font-mono text-xs text-gray-400 mt-1">Loading…</div>
+        </div>
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-28">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Mode</div>
+          <div class="font-mono text-xs text-accent-blue mt-1">Read-only · :8895</div>
+        </div>
+        <div class="rounded-lg border border-surface-border bg-surface-card px-3 py-2 min-w-20">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Live</div>
+          <div id="sse-indicator" class="font-mono text-xs text-gray-500 mt-1">● connecting</div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="w-full max-w-[1800px] mx-auto px-5 2xl:px-6 pb-8 grid grid-cols-1 xl:grid-cols-12 gap-5 2xl:gap-6">
+    <!-- Left nav -->
+    <aside class="xl:col-span-2 min-w-0">
+      <div class="sticky top-6 space-y-4">
+        <nav id="nav" class="rounded-xl border border-surface-border bg-surface-card p-2 space-y-1.5">
+          <button data-view="messages" class="nav-tab active w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Messages</button>
+          <button data-view="search" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Search</button>
+          <button data-view="stats" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Stats</button>
+          <button data-view="threads" class="nav-tab w-full text-left rounded-lg border border-transparent px-3 py-3 font-mono text-xs">Threads</button>
+        </nav>
+      </div>
+    </aside>
+
+    <!-- Center view -->
+    <section class="xl:col-span-7 min-w-0">
+      <div id="view-root" class="animate-fade-in"></div>
+    </section>
+
+    <!-- Right detail panel -->
+    <aside class="xl:col-span-3 min-w-0">
+      <div class="sticky top-6 space-y-4">
+        <section id="detail-panel" class="rounded-xl border border-surface-border bg-surface-card overflow-hidden">
+          <div class="p-4 border-b border-surface-border flex items-center justify-between">
+            <h2 class="font-pixel text-accent-purple text-[10px] tracking-wider">MESSAGE</h2>
+            <span id="detail-context" class="font-mono text-[10px] text-gray-600">Select a message</span>
+          </div>
+          <div id="detail-body" class="p-4 font-mono text-sm text-gray-500">
+            Click any message row to view the full content here.
+          </div>
+        </section>
+      </div>
+    </aside>
+  </main>
+
+<script>
+// ── Security escaper — KEEP EXACT: attribute-safe, encodes all injection chars ──
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"'`=\/]/g, c => (
+    {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;","`":"&#96;","=":"&#61;","/":"&#47;"}[c]
+  ));
+}
+
+// ── Relative time with NaN guard ──
+function rel(ts) {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  const s = (Date.now() - d.getTime()) / 1000;
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  if (s < 2592000) return Math.floor(s / 86400) + "d";
+  return d.toISOString().slice(0, 10);
+}
+
+function fmt(n) { return Number(n || 0).toLocaleString(); }
+
+// ── Platform glyph map ──
+const PLATFORM_GLYPH = {
+  telegram:  { e: "✈", bg: "#229ED9" },
+  signal:    { e: "◎", bg: "#3A76F0" },
+  email:     { e: "✉", bg: "#cba6f7" },
+  whatsapp:  { e: "✆", bg: "#25D366" },
+  slack:     { e: "#", bg: "#E01E5A" },
+  default:   { e: "•", bg: "#45475a" },
+};
+
+const PRIORITY_COLOR = {
+  support_clique:  "#f38ba8",
+  sympathy_group:  "#fab387",
+  active_network:  "#f9e2af",
+  acquaintance:    "#94e2d5",
+};
+
+function glyphHTML(p) {
+  const g = PLATFORM_GLYPH[p] || PLATFORM_GLYPH.default;
+  return `<span title="${esc(p)}" style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;font-size:12px;background:${g.bg};color:#fff;flex-shrink:0">${g.e}</span>`;
+}
+
+function hashHue(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; }
+
+function identiconHTML(name) {
+  const hue = hashHue(name || "?");
+  const hue2 = (hue + 40) % 360;
+  const initials = esc((name || "?").replace(/^[a-z]+:user:/, "").slice(0, 2).toUpperCase());
+  return `<span style="width:26px;height:26px;border-radius:6px;background:linear-gradient(135deg,hsl(${hue} 50% 45%),hsl(${hue2} 50% 35%));display:inline-flex;align-items:center;justify-content:center;font-size:10px;color:#fff;flex-shrink:0">${initials}</span>`;
+}
+
+// ── API helper ──
+function apiPath(p) { return p.replace(/^\//, ""); }
+async function api(path) {
+  const r = await fetch(apiPath(path));
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+// ── State ──
+const state = {
+  view: "messages",
+  q: "",
+  platform: "",
+  direction: "",
+  since: "",
+  until: "",
+  sort: "signal",
+  hideNoise: true,
+  offset: 0,
+  limit: 50,
+  selectedId: null,
+  rows: [],         // current loaded rows
+  facets: null,
+  stats: null,
+  // Threads sub-state
+  threadsQ: "",
+  threadsPlatform: "",
+  threadsType: "",
+  threadsOffset: 0,
+  threadsRows: [],  // loaded thread cards
+  openThreadId: null, // currently open thread
+};
+
+const LS_KEY = "legion.messages.filters";
+
+function loadFilters() {
+  const params = new URLSearchParams(location.search);
+  let any = false;
+  for (const k of ["q","platform","direction","since","until","view","sort"]) {
+    if (params.has(k)) { state[k] = params.get(k); any = true; }
+  }
+  if (params.has("hide_noise")) { state.hideNoise = params.get("hide_noise") === "true"; any = true; }
+  if (params.has("tq")) { state.threadsQ = params.get("tq"); any = true; }
+  if (params.has("tplatform")) { state.threadsPlatform = params.get("tplatform"); any = true; }
+  if (params.has("ttype")) { state.threadsType = params.get("ttype"); any = true; }
+  if (!any) {
+    try {
+      const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
+      for (const k of ["q","platform","direction","since","until","sort"]) if (s[k]) state[k] = s[k];
+      if (s.hideNoise != null) state.hideNoise = !!s.hideNoise;
+      if (s.threadsQ) state.threadsQ = s.threadsQ;
+      if (s.threadsPlatform) state.threadsPlatform = s.threadsPlatform;
+      if (s.threadsType) state.threadsType = s.threadsType;
+    } catch(e) {}
+  }
+}
+
+function persistFilters() {
+  const u = new URLSearchParams();
+  for (const k of ["q","platform","direction","since","until"]) if (state[k]) u.set(k, state[k]);
+  if (state.view !== "messages") u.set("view", state.view);
+  if (state.sort && state.sort !== "recent") u.set("sort", state.sort);
+  if (state.hideNoise) u.set("hide_noise", "true");
+  if (state.threadsQ) u.set("tq", state.threadsQ);
+  if (state.threadsPlatform) u.set("tplatform", state.threadsPlatform);
+  if (state.threadsType) u.set("ttype", state.threadsType);
+  history.replaceState({}, "", u.toString() ? "?" + u.toString() : location.pathname);
+  try {
+    localStorage.setItem(LS_KEY, JSON.stringify(
+      Object.fromEntries([
+        ...["q","platform","direction","since","until","sort"].map(k => [k, state[k]]),
+        ["hideNoise", state.hideNoise],
+        ["threadsQ", state.threadsQ],
+        ["threadsPlatform", state.threadsPlatform],
+        ["threadsType", state.threadsType],
+      ])
+    ));
+  } catch(e) {}
+}
+
+// ── Nav routing ──
+function setView(view, persist = true) {
+  state.view = view;
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+  if (persist) persistFilters();
+  renderView();
+}
+
+function renderView() {
+  if (state.view === "messages") renderMessages();
+  else if (state.view === "search") renderSearch();
+  else if (state.view === "stats") renderStats();
+  else if (state.view === "threads") renderThreads();
+}
+
+// ── Message row HTML ──
+function msgRowHTML(m, selected = false) {
+  const from = m.sender_name || m.sender_id || "unknown";
+  const to = m.direction === "sent" ? (m.thread_title || "—") : "me";
+  const conn = m.connectedness != null ? Math.round(m.connectedness * 100) : null;
+  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier] || "#a6adc8") : null;
+  const tags = (m.tags || []).map(t => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]">#${esc(t)}</span>`).join(" ");
+  const vents = (m.ventures || []).map(v => `<span class="badge inline-block rounded-full px-2 py-0.5 font-mono text-[10px]" style="border-color:#cba6f788;color:#cba6f7">◆ ${esc(v)}</span>`).join(" ");
+  const selCls = selected ? "selected" : "";
+  const salienceId = "sr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+
+  return `<div class="msg-row ${selCls} rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer" data-id="${esc(m.id)}">
+    <div class="flex items-center gap-2">
+      ${glyphHTML(m.platform)}
+      ${identiconHTML(from)}
+      <div class="min-w-0 flex-1">
+        <div class="font-mono text-xs truncate"><b class="text-gray-200">${esc(from)}</b> <span class="text-gray-500">→ ${esc(to)}</span></div>
+        <div class="font-mono text-gray-600" style="font-size:10px">${esc(m.thread_title || m.platform)}</div>
+      </div>
+      <div class="flex flex-col items-end gap-1 flex-shrink-0">
+        <div class="flex items-center gap-2">
+          ${saliencePillHTML(m)}
+          <span class="font-mono text-gray-600 text-[10px]" title="${esc(m.timestamp)}">${rel(m.timestamp)}</span>
+        </div>
+        ${conn != null ? `<span class="conn-bar" style="width:40px" title="connectedness ${conn}%"><i style="width:${conn}%"></i></span>` : ""}
+      </div>
+    </div>
+    <div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(m.content || "")}</div>
+    ${(tags || vents || pc) ? `<div class="flex items-center gap-2 mt-2 flex-wrap">
+      ${tags} ${vents}
+      ${pc ? `<span class="ml-auto inline-block rounded-full px-2 py-0.5 font-mono text-[10px] border" style="border-color:${pc}66;color:${pc}">${esc(m.priority_tier)}</span>` : ""}
+    </div>` : ""}
+    ${salienceReasonsHTML(m, salienceId)}
+  </div>`;
+}
+
+// ── Salience helpers ── API params: sort=recent|signal, hide_noise=true ──
+function salienceColor(s) {
+  if (s == null) return "#45475a";
+  if (s >= 0.66) return "#a6e3a1"; // accent-green
+  if (s >= 0.35) return "#f9e2af"; // accent-yellow
+  return "#f38ba8";                // accent-red
+}
+
+function saliencePillHTML(m) {
+  if (m.salience == null) return "";
+  const pct = Math.round(m.salience * 100);
+  const color = salienceColor(m.salience);
+  const id = "sr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  // Build reasons tooltip text (attribute-safe via esc)
+  let titleStr = "";
+  if (Array.isArray(m.salience_reasons) && m.salience_reasons.length) {
+    titleStr = m.salience_reasons.map(r => esc(r.signal) + ": " + esc(String(r.reason || ""))).join(" | ");
+  }
+  return `<span class="salience-pill inline-flex items-center gap-1 cursor-pointer select-none" data-row-id="${esc(m.id)}" title="${titleStr}" style="flex-shrink:0" onclick="toggleSalienceReasons(event,'${id}')">
+    <span style="color:${color};font-size:11px">◆</span><span class="font-mono text-[10px]" style="color:${color}">${pct}</span>
+  </span>`;
+}
+
+function salienceReasonsHTML(m, containerId) {
+  if (!Array.isArray(m.salience_reasons) || !m.salience_reasons.length) return "";
+  const rows = m.salience_reasons.map(r => {
+    const c = salienceColor(r.contribution > 0 ? 0.7 : 0.2);
+    return `<div class="flex items-center gap-2 py-0.5">
+      <span class="font-mono text-[9px] w-28 flex-shrink-0" style="color:#6c7086">${esc(r.signal || "")}</span>
+      <span class="font-mono text-[9px] w-10 flex-shrink-0 text-right" style="color:${c}">${esc(String(typeof r.value === "number" ? r.value.toFixed(2) : (r.value || "")))}</span>
+      <span class="font-mono text-[9px] flex-1 text-gray-500">${esc(r.reason || "")}</span>
+    </div>`;
+  }).join("");
+  return `<div id="${containerId}" class="salience-reasons">
+    <div class="font-mono text-[9px] text-gray-600 uppercase tracking-wider mb-1">Signal breakdown</div>
+    ${rows}
+  </div>`;
+}
+
+function toggleSalienceReasons(event, id) {
+  event.stopPropagation();
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle("open");
+}
+
+// ── Filter bar HTML ──
+function filterBarHTML(showSearch = false) {
+  const platformOpts = state.facets
+    ? state.facets.platforms.map(p => `<option value="${esc(p.value)}" ${state.platform === p.value ? "selected" : ""}>${esc(p.value)} (${fmt(p.count)})</option>`).join("")
+    : "";
+  return `<div class="rounded-xl border border-surface-border bg-surface-card p-3 mb-4 space-y-2">
+    <div class="flex gap-2 flex-wrap">
+      <input id="filter-q" type="text" class="input-field flex-1 min-w-[180px]" placeholder="${showSearch ? "Search messages (FTS)…" : "Filter messages…"}" value="${esc(state.q)}" />
+      <select id="filter-platform" class="input-field">
+        <option value="" ${!state.platform ? "selected" : ""}>all platforms</option>
+        ${platformOpts}
+      </select>
+      <select id="filter-direction" class="input-field">
+        <option value="" ${!state.direction ? "selected" : ""}>any direction</option>
+        <option value="received" ${state.direction === "received" ? "selected" : ""}>received</option>
+        <option value="sent" ${state.direction === "sent" ? "selected" : ""}>sent</option>
+      </select>
+    </div>
+    <div class="flex gap-2 flex-wrap items-center">
+      <input id="filter-since" type="date" class="input-field" value="${esc(state.since ? state.since.slice(0,10) : "")}" />
+      <input id="filter-until" type="date" class="input-field" value="${esc(state.until ? state.until.slice(0,10) : "")}" />
+      <button id="filter-clear" class="input-field cursor-pointer hover:border-accent-red/60 hover:text-accent-red">clear</button>
+      <div class="ml-auto flex items-center gap-2 flex-wrap">
+        <div class="flex gap-1">
+          <button id="sort-recent" class="seg-btn ${state.sort !== "signal" ? "active" : ""}">Recent</button>
+          <button id="sort-signal" class="seg-btn ${state.sort === "signal" ? "active" : ""}">Signal</button>
+        </div>
+        <label class="flex items-center gap-1.5 cursor-pointer select-none" title="Hide messages with salience &lt; 0.35">
+          <input id="filter-hide-noise" type="checkbox" class="accent-accent-yellow w-3.5 h-3.5" ${state.hideNoise ? "checked" : ""} />
+          <span class="font-mono text-[11px] text-gray-400">Hide noise</span>
+        </label>
+      </div>
+    </div>
+  </div>`;
+}
+
+function bindFilterBar(onChanged) {
+  const q = document.getElementById("filter-q");
+  const plat = document.getElementById("filter-platform");
+  const dir = document.getElementById("filter-direction");
+  const since = document.getElementById("filter-since");
+  const until = document.getElementById("filter-until");
+  const clear = document.getElementById("filter-clear");
+  const sortRecent = document.getElementById("sort-recent");
+  const sortSignal = document.getElementById("sort-signal");
+  const hideNoise = document.getElementById("filter-hide-noise");
+
+  let debounce;
+  function changed() {
+    state.q = q ? q.value : state.q;
+    state.platform = plat ? plat.value : state.platform;
+    state.direction = dir ? dir.value : state.direction;
+    state.since = since && since.value ? since.value + "T00:00:00Z" : "";
+    state.until = until && until.value ? until.value + "T23:59:59Z" : "";
+    persistFilters();
+    clearTimeout(debounce);
+    debounce = setTimeout(onChanged, 200);
+  }
+
+  function setSort(mode) {
+    state.sort = mode;
+    if (sortRecent) sortRecent.classList.toggle("active", mode !== "signal");
+    if (sortSignal) sortSignal.classList.toggle("active", mode === "signal");
+    persistFilters();
+    onChanged();
+  }
+
+  if (q) q.oninput = changed;
+  if (plat) plat.onchange = changed;
+  if (dir) dir.onchange = changed;
+  if (since) since.onchange = changed;
+  if (until) until.onchange = changed;
+  if (sortRecent) sortRecent.onclick = () => setSort("recent");
+  if (sortSignal) sortSignal.onclick = () => setSort("signal");
+  if (hideNoise) hideNoise.onchange = () => {
+    state.hideNoise = hideNoise.checked;
+    persistFilters();
+    onChanged();
+  };
+  if (clear) clear.onclick = () => {
+    for (const k of ["q","platform","direction","since","until"]) state[k] = "";
+    state.sort = "recent";
+    state.hideNoise = false;
+    persistFilters();
+    onChanged();
+  };
+}
+
+// ── Messages view ──
+function renderMessages() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5 flex items-end justify-between gap-4">
+      <div>
+        <h2 class="font-pixel text-accent-green text-sm tracking-wider">MESSAGES</h2>
+        <p class="font-mono text-sm text-gray-500 mt-2">Signal-ranked feed · noise hidden · toggle Recent to see all</p>
+      </div>
+      <div id="new-indicator" class="font-mono text-[10px] text-accent-green hidden"></div>
+    </div>
+    ${filterBarHTML(false)}
+    <div id="msg-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
+    </div>`;
+
+  bindFilterBar(() => {
+    state.offset = 0;
+    state.rows = [];
+    loadMessages(true);
+  });
+
+  state.offset = 0;
+  state.rows = [];
+  loadMessages(true);
+}
+
+async function loadMessages(reset = false) {
+  if (reset) {
+    state.rows = [];
+    state.offset = 0;
+  }
+  const list = document.getElementById("msg-list");
+  if (!list) return;
+
+  const u = new URLSearchParams();
+  if (state.platform) u.set("platform", state.platform);
+  if (state.direction) u.set("direction", state.direction);
+  if (state.since) u.set("since", state.since);
+  if (state.until) u.set("until", state.until);
+  u.set("limit", state.limit);
+  u.set("offset", state.offset);
+  u.set("sort", state.sort || "recent");
+  if (state.hideNoise) u.set("hide_noise", "true");
+
+  let batch;
+  try {
+    if (state.q.trim()) {
+      const sq = new URLSearchParams({ q: state.q, limit: state.limit, offset: state.offset });
+      if (state.platform) sq.set("platform", state.platform);
+      if (state.direction) sq.set("direction", state.direction);
+      if (state.since) sq.set("since", state.since);
+      if (state.until) sq.set("until", state.until);
+      sq.set("sort", state.sort || "recent");
+      if (state.hideNoise) sq.set("hide_noise", "true");
+      batch = await api("/api/search?" + sq.toString());
+    } else {
+      batch = await api("/api/list?" + u.toString());
+    }
+  } catch(e) {
+    if (list) list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading messages: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  // Dedupe
+  const existing = new Set(state.rows.map(m => m.id));
+  const fresh = batch.filter(m => !existing.has(m.id));
+  state.rows = reset ? batch : [...state.rows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.rows.map(m => msgRowHTML(m, m.id === state.selectedId)).join("");
+  } else {
+    list.insertAdjacentHTML("beforeend", fresh.map(m => msgRowHTML(m, m.id === state.selectedId)).join(""));
+  }
+
+  const moreBtn = document.getElementById("load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < state.limit);
+    moreBtn.onclick = () => {
+      state.offset += state.limit;
+      loadMessages(false);
+    };
+  }
+
+  bindRowClicks();
+}
+
+function bindRowClicks() {
+  document.querySelectorAll(".msg-row").forEach(el => {
+    el.onclick = () => openDetail(el.dataset.id, true);
+  });
+}
+
+// ── Search view ──
+function renderSearch() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-blue text-sm tracking-wider">SEARCH</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Full-text search across all messages</p>
+    </div>
+    ${filterBarHTML(true)}
+    <div id="search-count" class="font-mono text-[10px] text-gray-600 mb-3"></div>
+    <div id="msg-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
+    </div>`;
+
+  bindFilterBar(() => {
+    state.offset = 0;
+    state.rows = [];
+    runSearch(true);
+  });
+
+  if (state.q.trim()) {
+    state.offset = 0;
+    state.rows = [];
+    runSearch(true);
+  } else {
+    const list = document.getElementById("msg-list");
+    if (list) list.innerHTML = `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">Enter a search query above</div>`;
+  }
+}
+
+async function runSearch(reset = false) {
+  const q = state.q.trim();
+  const countEl = document.getElementById("search-count");
+  const list = document.getElementById("msg-list");
+  if (!list) return;
+
+  if (!q) {
+    list.innerHTML = `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">Enter a search query above</div>`;
+    if (countEl) countEl.textContent = "";
+    return;
+  }
+
+  if (reset) { state.rows = []; state.offset = 0; }
+
+  const u = new URLSearchParams({ q, limit: state.limit, offset: state.offset });
+  if (state.platform) u.set("platform", state.platform);
+  if (state.direction) u.set("direction", state.direction);
+  if (state.since) u.set("since", state.since);
+  if (state.until) u.set("until", state.until);
+  u.set("sort", state.sort || "recent");
+  if (state.hideNoise) u.set("hide_noise", "true");
+
+  let batch;
+  try {
+    batch = await api("/api/search?" + u.toString());
+  } catch(e) {
+    list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Search error: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const existing = new Set(state.rows.map(m => m.id));
+  const fresh = batch.filter(m => !existing.has(m.id));
+  state.rows = reset ? batch : [...state.rows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.rows.length
+      ? state.rows.map(m => msgRowHTML(m, m.id === state.selectedId)).join("")
+      : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No results for &ldquo;${esc(q)}&rdquo;</div>`;
+  } else {
+    list.insertAdjacentHTML("beforeend", fresh.map(m => msgRowHTML(m, m.id === state.selectedId)).join(""));
+  }
+
+  if (countEl) countEl.textContent = state.rows.length ? `${fmt(state.rows.length)} result${state.rows.length !== 1 ? "s" : ""} — showing ${reset ? "first" : "up to"} ${state.limit * (Math.floor(state.offset / state.limit) + 1)}` : "";
+
+  const moreBtn = document.getElementById("load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < state.limit);
+    moreBtn.onclick = () => {
+      state.offset += state.limit;
+      runSearch(false);
+    };
+  }
+
+  bindRowClicks();
+}
+
+// ── Stats view ──
+async function renderStats() {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-yellow text-sm tracking-wider">STATS</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Corpus overview</p>
+    </div>
+    <div class="font-mono text-xs text-gray-600">Loading stats…</div>`;
+
+  let stats, facets;
+  try {
+    [stats, facets] = await Promise.all([api("/api/stats"), api("/api/facets")]);
+  } catch(e) {
+    root.innerHTML += `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red mt-4">Error: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const byPlatform = stats.by_platform || {};
+  const platformRows = facets.platforms || [];
+  const maxCount = platformRows.reduce((m, p) => Math.max(m, p.count), 1);
+
+  const platformHTML = platformRows.map(p => {
+    const g = PLATFORM_GLYPH[p.value] || PLATFORM_GLYPH.default;
+    const pct = Math.round((p.count / maxCount) * 100);
+    return `<div class="flex items-center gap-3 py-2 border-b border-surface-border last:border-0">
+      <span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;border-radius:5px;font-size:12px;background:${g.bg};color:#fff;flex-shrink:0">${g.e}</span>
+      <span class="font-mono text-xs text-gray-300 w-20 flex-shrink-0">${esc(p.value)}</span>
+      <div class="flex-1 bg-surface-border rounded-full overflow-hidden" style="height:6px">
+        <div style="width:${pct}%;height:100%;background:${g.bg};border-radius:999px"></div>
+      </div>
+      <span class="font-mono text-xs text-gray-500 w-16 text-right">${fmt(p.count)}</span>
+    </div>`;
+  }).join("");
+
+  const dirFacets = facets.directions || [];
+  const dirHTML = dirFacets.map(d => `<div class="flex justify-between font-mono text-xs py-1 border-b border-surface-border last:border-0">
+    <span class="text-gray-400">${esc(d.value)}</span>
+    <span class="text-gray-500">${fmt(d.count)}</span>
+  </div>`).join("");
+
+  const dunbarFacets = facets.dunbar_layers || [];
+  const dunbarHTML = dunbarFacets.length ? dunbarFacets.map(d => `<div class="flex justify-between font-mono text-xs py-1 border-b border-surface-border last:border-0">
+    <span class="text-gray-400">${esc(d.value || "unknown")}</span>
+    <span class="text-gray-500">${fmt(d.count)}</span>
+  </div>`).join("") : `<div class="font-mono text-xs text-gray-600">No Dunbar data</div>`;
+
+  root.innerHTML = `
+    <div class="mb-5">
+      <h2 class="font-pixel text-accent-yellow text-sm tracking-wider">STATS</h2>
+      <p class="font-mono text-sm text-gray-500 mt-2">Corpus overview</p>
+    </div>
+    <div class="grid grid-cols-2 gap-3 mb-5">
+      <div class="metric-card rounded-xl border border-surface-border bg-surface-card p-4 transition">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-1">Messages</div>
+        <div class="font-pixel text-accent-green text-lg">${fmt(stats.total_messages)}</div>
+      </div>
+      <div class="metric-card rounded-xl border border-surface-border bg-surface-card p-4 transition">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-1">Threads</div>
+        <div class="font-pixel text-accent-blue text-lg">${fmt(stats.total_threads)}</div>
+      </div>
+    </div>
+    <div class="rounded-xl border border-surface-border bg-surface-card p-5 mb-4">
+      <h3 class="font-pixel text-accent-purple text-[10px] tracking-wider mb-4">BY PLATFORM</h3>
+      ${platformHTML || `<div class="font-mono text-xs text-gray-600">No platform data</div>`}
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      <div class="rounded-xl border border-surface-border bg-surface-card p-5">
+        <h3 class="font-pixel text-accent-yellow text-[10px] tracking-wider mb-4">DIRECTION</h3>
+        ${dirHTML || `<div class="font-mono text-xs text-gray-600">No data</div>`}
+      </div>
+      <div class="rounded-xl border border-surface-border bg-surface-card p-5">
+        <h3 class="font-pixel text-accent-blue text-[10px] tracking-wider mb-4">DUNBAR LAYER</h3>
+        ${dunbarHTML}
+      </div>
+    </div>`;
+}
+
+// ── Detail panel ──
+async function openDetail(id, push = true) {
+  // URL fragment
+  const fragUrl = location.pathname + location.search + "#m/" + id;
+  if (push) history.pushState({ detail: id }, "", fragUrl);
+  else history.replaceState({ detail: id }, "", fragUrl);
+
+  // Mark selected row
+  document.querySelectorAll(".msg-row").forEach(el => {
+    el.classList.toggle("selected", el.dataset.id === id);
+  });
+  state.selectedId = id;
+
+  const panel = document.getElementById("detail-body");
+  const ctx = document.getElementById("detail-context");
+  if (panel) panel.innerHTML = `<div class="font-mono text-xs text-gray-600 animate-pulse">Loading…</div>`;
+  if (ctx) ctx.textContent = "Loading…";
+
+  let m;
+  try {
+    m = await api("/api/detail/" + encodeURIComponent(id));
+  } catch(e) {
+    if (panel) panel.innerHTML = `<div class="text-accent-red font-mono text-xs">${esc(e.message)}</div>`;
+    return;
+  }
+
+  const from = m.sender_name || m.sender_id || "unknown";
+  const conn = m.connectedness != null ? Math.round(m.connectedness * 100) : null;
+  const pc = m.priority_tier ? (PRIORITY_COLOR[m.priority_tier] || "#a6adc8") : null;
+
+  if (ctx) ctx.textContent = esc(m.platform);
+
+  if (panel) panel.innerHTML = `
+    <div class="slide-in space-y-3">
+      <div class="flex items-center gap-2">
+        ${glyphHTML(m.platform)}
+        ${identiconHTML(from)}
+        <div class="min-w-0">
+          <div class="font-mono text-xs font-semibold text-gray-200 truncate">${esc(from)}</div>
+          <div class="font-mono text-[10px] text-gray-600">${esc(m.direction || "")}</div>
+        </div>
+      </div>
+      <div class="border-t border-surface-border pt-3 space-y-2">
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Thread</div>
+          <div class="font-mono text-xs text-gray-300 mt-1">${esc(m.thread_title || "—")}</div>
+        </div>
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">Time</div>
+          <div class="font-mono text-xs text-gray-300 mt-1">${esc(m.timestamp || "")}</div>
+        </div>
+      </div>
+      ${m.reply_context ? `
+      <div class="rounded-lg border border-surface-border bg-surface p-3">
+        <div class="font-mono text-[10px] text-gray-600 mb-1">↩ replying to</div>
+        <div class="font-mono text-xs text-gray-400">${esc(m.reply_context.content || "")}</div>
+      </div>` : ""}
+      <div class="border-t border-surface-border pt-3">
+        <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Content</div>
+        <div class="font-mono text-xs text-gray-200 whitespace-pre-wrap leading-relaxed">${esc(m.content || "")}</div>
+      </div>
+      <div class="border-t border-surface-border pt-3 space-y-2">
+        ${conn != null ? `<div class="flex items-center gap-2">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider w-24">Connectedness</div>
+          <span class="conn-bar" style="width:60px"><i style="width:${conn}%"></i></span>
+          <span class="font-mono text-[10px] text-gray-400">${conn}%</span>
+        </div>` : ""}
+        ${pc ? `<div class="flex items-center gap-2">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider w-24">Priority</div>
+          <span class="inline-block rounded-full px-2 py-0.5 font-mono text-[10px] border" style="border-color:${pc}66;color:${pc}">${esc(m.priority_tier)}</span>
+        </div>` : ""}
+        <div>
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider">ID</div>
+          <div class="font-mono text-[10px] text-gray-500 mt-1 break-all">${esc(m.id)}</div>
+        </div>
+      </div>
+      ${m.salience != null ? (() => {
+        const salPct = Math.round(m.salience * 100);
+        const salColor = salienceColor(m.salience);
+        const reasonRows = Array.isArray(m.salience_reasons) && m.salience_reasons.length
+          ? m.salience_reasons.map(r => `<div class="flex items-start gap-2 py-0.5 border-b border-surface-border last:border-0">
+              <span class="font-mono text-[9px] w-28 flex-shrink-0" style="color:#6c7086">${esc(r.signal || "")}</span>
+              <span class="font-mono text-[9px] w-10 flex-shrink-0 text-right" style="color:${salienceColor(r.contribution > 0 ? 0.7 : 0.2)}">${esc(String(typeof r.value === "number" ? r.value.toFixed(2) : (r.value || "")))}</span>
+              <span class="font-mono text-[9px] flex-1" style="color:#6c7086">${esc(r.reason || "")}</span>
+            </div>`).join("")
+          : `<div class="font-mono text-[9px] text-gray-600">No breakdown available</div>`;
+        return `<div class="border-t border-surface-border pt-3">
+          <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Signal</div>
+          <div class="flex items-center gap-2 mb-3">
+            <span style="color:${salColor};font-size:14px">◆</span>
+            <span class="salience-bar" style="flex:1"><i style="width:${salPct}%;background:${salColor}"></i></span>
+            <span class="font-mono text-[11px]" style="color:${salColor}">${salPct}%</span>
+          </div>
+          <div class="space-y-0">${reasonRows}</div>
+        </div>`;
+      })() : ""}
+    </div>`;
+}
+
+function closeDetail() {
+  state.selectedId = null;
+  document.querySelectorAll(".msg-row").forEach(el => el.classList.remove("selected"));
+  const panel = document.getElementById("detail-body");
+  const ctx = document.getElementById("detail-context");
+  if (panel) panel.innerHTML = "Click any message row to view the full content here.";
+  if (ctx) ctx.textContent = "Select a message";
+  if (location.hash) history.pushState({}, "", location.pathname + location.search);
+}
+
+// ── Threads view ──
+
+const THREAD_TYPES = ["dm", "group", "supergroup", "channel"];
+
+function threadCardHTML(t) {
+  const titleText = t.title || t.id;
+  const safeId = esc(t.id);
+  const salienceId = "tsr-" + esc(t.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+  // Build salience-like object from thread salience field (scalar)
+  const tMock = { id: t.id, salience: t.salience != null ? t.salience : null, salience_reasons: t.salience_reasons || [] };
+
+  return `<div class="msg-row rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer thread-card" data-thread-id="${safeId}">
+    <div class="flex items-start gap-2">
+      ${glyphHTML(t.platform)}
+      ${identiconHTML(titleText)}
+      <div class="min-w-0 flex-1">
+        <div class="font-mono text-xs truncate font-semibold text-gray-200">${esc(titleText)}</div>
+        <div class="font-mono text-gray-500" style="font-size:10px">${esc(t.thread_type || "—")} · ${fmt(t.participant_count || 0)} participants · ${fmt(t.message_count || 0)} msgs · ${rel(t.last_ts || t.updated_at)}</div>
+      </div>
+      <div class="flex flex-col items-end gap-1 flex-shrink-0">
+        ${saliencePillHTML(tMock)}
+      </div>
+    </div>
+    ${t.last_content ? `<div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(t.last_content)}</div>` : ""}
+    ${salienceReasonsHTML(tMock, salienceId)}
+  </div>`;
+}
+
+function renderThreads() {
+  // If openThreadId is set, show timeline instead
+  if (state.openThreadId) {
+    renderThreadTimeline(state.openThreadId);
+    return;
+  }
+
+  const root = document.getElementById("view-root");
+  const platformOpts = state.facets
+    ? state.facets.platforms.map(p => `<option value="${esc(p.value)}" ${state.threadsPlatform === p.value ? "selected" : ""}>${esc(p.value)}</option>`).join("")
+    : "";
+  const typeOpts = THREAD_TYPES.map(tt => `<option value="${esc(tt)}" ${state.threadsType === tt ? "selected" : ""}>${esc(tt)}</option>`).join("");
+
+  root.innerHTML = `
+    <div class="mb-5 flex items-end justify-between gap-4">
+      <div>
+        <h2 class="font-pixel text-accent-purple text-sm tracking-wider">THREADS</h2>
+        <p class="font-mono text-sm text-gray-500 mt-2">Conversations, ranked by recency</p>
+      </div>
+    </div>
+    <div class="rounded-xl border border-surface-border bg-surface-card p-3 mb-4">
+      <div class="flex gap-2 flex-wrap">
+        <input id="threads-q" type="text" class="input-field flex-1 min-w-[180px]" placeholder="Search threads…" value="${esc(state.threadsQ)}" />
+        <select id="threads-platform" class="input-field">
+          <option value="" ${!state.threadsPlatform ? "selected" : ""}>all platforms</option>
+          ${platformOpts}
+        </select>
+        <select id="threads-type" class="input-field">
+          <option value="" ${!state.threadsType ? "selected" : ""}>any type</option>
+          ${typeOpts}
+        </select>
+        <button id="threads-clear" class="input-field cursor-pointer hover:border-accent-red/60 hover:text-accent-red">clear</button>
+      </div>
+    </div>
+    <div id="threads-list" class="space-y-2"></div>
+    <div class="flex justify-center mt-4">
+      <button id="threads-load-more" class="input-field cursor-pointer px-6 py-2 hidden hover:border-accent-blue/60 hover:text-accent-blue">Load more</button>
+    </div>`;
+
+  // Bind filter controls
+  const qEl = document.getElementById("threads-q");
+  const platEl = document.getElementById("threads-platform");
+  const typeEl = document.getElementById("threads-type");
+  const clearEl = document.getElementById("threads-clear");
+
+  let debounce;
+  function threadsChanged() {
+    state.threadsQ = qEl ? qEl.value : state.threadsQ;
+    state.threadsPlatform = platEl ? platEl.value : state.threadsPlatform;
+    state.threadsType = typeEl ? typeEl.value : state.threadsType;
+    persistFilters();
+    clearTimeout(debounce);
+    debounce = setTimeout(() => {
+      state.threadsOffset = 0;
+      state.threadsRows = [];
+      loadThreads(true);
+    }, 200);
+  }
+
+  if (qEl) qEl.oninput = threadsChanged;
+  if (platEl) platEl.onchange = threadsChanged;
+  if (typeEl) typeEl.onchange = threadsChanged;
+  if (clearEl) clearEl.onclick = () => {
+    state.threadsQ = "";
+    state.threadsPlatform = "";
+    state.threadsType = "";
+    if (qEl) qEl.value = "";
+    if (platEl) platEl.value = "";
+    if (typeEl) typeEl.value = "";
+    persistFilters();
+    state.threadsOffset = 0;
+    state.threadsRows = [];
+    loadThreads(true);
+  };
+
+  state.threadsOffset = 0;
+  state.threadsRows = [];
+  loadThreads(true);
+}
+
+async function loadThreads(reset = false) {
+  if (reset) {
+    state.threadsRows = [];
+    state.threadsOffset = 0;
+  }
+  const list = document.getElementById("threads-list");
+  if (!list) return;
+
+  const u = new URLSearchParams({ limit: 50, offset: state.threadsOffset });
+  if (state.threadsQ) u.set("q", state.threadsQ);
+  if (state.threadsPlatform) u.set("platform", state.threadsPlatform);
+  if (state.threadsType) u.set("thread_type", state.threadsType);
+
+  let batch;
+  try {
+    batch = await api("/api/threads?" + u.toString());
+  } catch(e) {
+    if (list) list.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading threads: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  // Dedupe by id
+  const existing = new Set(state.threadsRows.map(t => t.id));
+  const fresh = batch.filter(t => !existing.has(t.id));
+  state.threadsRows = reset ? batch : [...state.threadsRows, ...fresh];
+
+  if (reset) {
+    list.innerHTML = state.threadsRows.length
+      ? state.threadsRows.map(threadCardHTML).join("")
+      : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No threads found</div>`;
+  } else {
+    if (fresh.length) list.insertAdjacentHTML("beforeend", fresh.map(threadCardHTML).join(""));
+  }
+
+  const moreBtn = document.getElementById("threads-load-more");
+  if (moreBtn) {
+    moreBtn.classList.toggle("hidden", batch.length < 50);
+    moreBtn.onclick = () => {
+      state.threadsOffset += 50;
+      loadThreads(false);
+    };
+  }
+
+  // Bind card clicks
+  list.querySelectorAll(".thread-card").forEach(el => {
+    el.onclick = () => openThreadDetail(el.dataset.threadId);
+  });
+}
+
+async function openThreadDetail(id) {
+  state.openThreadId = id;
+  const fragUrl = location.pathname + location.search + "#t/" + encodeURIComponent(id);
+  history.pushState({ threadDetail: id }, "", fragUrl);
+  renderThreadTimeline(id);
+}
+
+async function renderThreadTimeline(id) {
+  const root = document.getElementById("view-root");
+  root.innerHTML = `
+    <div class="mb-4 flex items-center gap-3">
+      <button id="threads-back" class="input-field cursor-pointer hover:border-accent-purple/60 hover:text-accent-purple px-3 py-1.5">← threads</button>
+      <div>
+        <h2 class="font-pixel text-accent-purple text-sm tracking-wider">THREAD</h2>
+      </div>
+    </div>
+    <div id="thread-timeline-content">
+      <div class="font-mono text-xs text-gray-600 animate-pulse">Loading thread…</div>
+    </div>`;
+
+  document.getElementById("threads-back").onclick = () => {
+    state.openThreadId = null;
+    history.pushState({ view: "threads" }, "", location.pathname + location.search.replace(/#.*$/, ""));
+    // Strip hash from URL cleanly
+    const noHash = location.pathname + location.search;
+    history.replaceState({ view: "threads" }, "", noHash);
+    renderThreads();
+  };
+
+  let thread;
+  try {
+    thread = await api("/api/thread/" + encodeURIComponent(id));
+  } catch(e) {
+    const content = document.getElementById("thread-timeline-content");
+    if (content) content.innerHTML = `<div class="rounded-xl border border-accent-red/40 bg-surface-card p-4 font-mono text-sm text-accent-red">Error loading thread: ${esc(e.message)}</div>`;
+    return;
+  }
+
+  const title = thread.title || thread.id;
+  const msgs = Array.isArray(thread.messages) ? thread.messages : [];
+  const participants = Array.isArray(thread.participants) ? thread.participants : [];
+  const sum = thread.summary;
+
+  const summaryHTML = sum && sum.summary ? `
+    <div class="rounded-xl border border-surface-border bg-surface-card p-4 mb-4">
+      <div class="font-mono text-[10px] text-gray-600 uppercase tracking-wider mb-2">Summary · ${esc(sum.message_count || "")} msgs · ${rel(sum.last_message_ts)}</div>
+      <div class="font-mono text-xs text-gray-300 leading-relaxed">${esc(sum.summary)}</div>
+    </div>` : "";
+
+  const participantsHTML = participants.length ? `
+    <div class="font-mono text-[10px] text-gray-600 mb-1">Participants: ${participants.map(p => esc(p.display_name || p.id || p)).join(", ")}</div>` : "";
+
+  const msgsHTML = msgs.length ? msgs.map(m => {
+    const from = m.sender_name || m.sender_id || "unknown";
+    const salienceId = "tmsr-" + esc(m.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    return `<div class="msg-row rounded-xl border border-surface-border bg-surface-card px-4 py-3 cursor-pointer" data-id="${esc(m.id)}">
+      <div class="flex items-center gap-2">
+        ${glyphHTML(m.platform || thread.platform)}
+        ${identiconHTML(from)}
+        <div class="min-w-0 flex-1">
+          <div class="font-mono text-xs truncate"><b class="text-gray-200">${esc(from)}</b></div>
+          <div class="font-mono text-gray-600" style="font-size:10px">${esc(m.timestamp || "")}</div>
+        </div>
+        <div class="flex items-center gap-2 flex-shrink-0">
+          ${saliencePillHTML(m)}
+          <span class="font-mono text-gray-600 text-[10px]">${rel(m.timestamp)}</span>
+        </div>
+      </div>
+      <div class="font-mono text-gray-400 text-xs line-clamp-2 mt-2">${esc(m.content || "")}</div>
+      ${salienceReasonsHTML(m, salienceId)}
+    </div>`;
+  }).join("") : `<div class="rounded-xl border border-surface-border bg-surface-card p-8 font-mono text-sm text-gray-600 text-center">No messages in this thread</div>`;
+
+  const content = document.getElementById("thread-timeline-content");
+  if (!content) return;
+  content.innerHTML = `
+    <div class="rounded-xl border border-surface-border bg-surface-card p-4 mb-4">
+      <div class="flex items-center gap-3 mb-2">
+        ${glyphHTML(thread.platform)}
+        ${identiconHTML(title)}
+        <div>
+          <div class="font-mono text-sm font-semibold text-gray-100">${esc(title)}</div>
+          <div class="font-mono text-[10px] text-gray-600">${esc(thread.thread_type || "—")} · ${fmt(participants.length)} participants · ${fmt(msgs.length)} msgs shown · updated ${rel(thread.updated_at)}</div>
+        </div>
+      </div>
+      ${participantsHTML}
+    </div>
+    ${summaryHTML}
+    <div class="space-y-2">${msgsHTML}</div>`;
+
+  // Bind message row clicks to open in right detail panel
+  content.querySelectorAll(".msg-row[data-id]").forEach(el => {
+    el.onclick = () => openDetail(el.dataset.id, true);
+  });
+}
+
+// ── SSE ──
+function startSSE() {
+  const ind = document.getElementById("sse-indicator");
+  try {
+    const es = new EventSource(apiPath("/api/events"));
+    es.addEventListener("corpus-changed", async () => {
+      // Only prepend if on messages view, no active search, no offset, and in recent mode
+      if (state.view !== "messages" || state.q.trim() || state.offset > 0 || state.sort === "signal") return;
+      const u = new URLSearchParams({ limit: state.limit, offset: 0 });
+      if (state.platform) u.set("platform", state.platform);
+      if (state.direction) u.set("direction", state.direction);
+      if (state.since) u.set("since", state.since);
+      if (state.until) u.set("until", state.until);
+      u.set("sort", "recent");
+      if (state.hideNoise) u.set("hide_noise", "true");
+      let fresh;
+      try { fresh = await api("/api/list?" + u.toString()); } catch(e) { return; }
+      const list = document.getElementById("msg-list");
+      if (!list) return;
+      const existing = new Set(state.rows.map(m => m.id));
+      const newOnes = fresh.filter(m => !existing.has(m.id));
+      if (newOnes.length) {
+        list.insertAdjacentHTML("afterbegin", newOnes.map(m => msgRowHTML(m)).join(""));
+        state.rows = [...newOnes, ...state.rows];
+        bindRowClicks();
+        const ind2 = document.getElementById("sse-indicator");
+        if (ind2) { ind2.textContent = "● +" + newOnes.length; ind2.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+        setTimeout(() => {
+          const i = document.getElementById("sse-indicator");
+          if (i) { i.textContent = "● live"; i.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+        }, 2500);
+      }
+    });
+    es.onerror = () => {
+      if (ind) { ind.textContent = "○ offline"; ind.className = "font-mono text-xs text-gray-600 mt-1"; }
+    };
+    es.onopen = () => {
+      if (ind) { ind.textContent = "● live"; ind.className = "font-mono text-xs text-accent-green mt-1 live-on"; }
+    };
+  } catch(e) {
+    if (ind) { ind.textContent = "○ no sse"; ind.className = "font-mono text-xs text-gray-600 mt-1"; }
+  }
+}
+
+// ── popstate (back closes detail / thread) ──
+window.onpopstate = (e) => {
+  if (location.hash.startsWith("#t/")) {
+    const tid = decodeURIComponent(location.hash.slice(3));
+    state.openThreadId = tid;
+    if (state.view !== "threads") setView("threads", false);
+    else renderThreadTimeline(tid);
+  } else if (!location.hash) {
+    if (state.openThreadId) {
+      state.openThreadId = null;
+      if (state.view === "threads") renderThreads();
+    } else {
+      closeDetail();
+    }
+  } else if (e.state && e.state.detail) {
+    openDetail(e.state.detail, false);
+  }
+};
+
+// ── Boot ──
+async function boot() {
+  loadFilters();
+
+  // Wire nav
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    if (!btn.classList.contains("disabled")) {
+      btn.addEventListener("click", () => setView(btn.dataset.view));
+    }
+  });
+
+  // Load facets + stats concurrently
+  try {
+    const [facets, stats] = await Promise.all([api("/api/facets"), api("/api/stats")]);
+    state.facets = facets;
+    state.stats = stats;
+    const hc = document.getElementById("header-counts");
+    if (hc) hc.textContent = `${fmt(stats.total_messages)} messages · ${fmt(stats.total_threads)} threads`;
+  } catch(e) {
+    const hc = document.getElementById("header-counts");
+    if (hc) hc.textContent = "Error loading stats";
+  }
+
+  // Restore view from state
+  const view = state.view;
+  document.querySelectorAll(".nav-tab").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.view === view);
+  });
+
+  renderView();
+
+  // Deep-link: #m/<id> or #t/<id>
+  if (location.hash.startsWith("#m/")) {
+    openDetail(decodeURIComponent(location.hash.slice(3)), false);
+  } else if (location.hash.startsWith("#t/")) {
+    const tid = decodeURIComponent(location.hash.slice(3));
+    state.openThreadId = tid;
+    if (state.view !== "threads") setView("threads", false);
+    else renderThreadTimeline(tid);
+  }
+
+  startSSE();
+}
+
+boot();
+</script>
+  <!-- Mandatory Legion hub-bar standard: no-op in Mode A, injects "← Legion Webui Hub" bar in Mode B. -->
+  <script src="static/embedded-bar.js"></script>
+</body>
+</html>

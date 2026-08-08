@@ -10,6 +10,7 @@ import { SlackAdapter } from './adapters/slack.js';
 import { WhatsAppAdapter } from './adapters/whatsapp.js';
 import type { Adapter } from './adapters/base.js';
 import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent, AdapterHealth, AdapterTier, DaemonHealth } from './types.js';
+import { AwarenessEmitter, DesktopSink, StatuslineSink } from './awareness.js';
 
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
@@ -29,6 +30,7 @@ class Daemon {
   private startedAt: string = '';
   private cycleCount: number = 0;
   private adapterHealth: Map<string, AdapterHealth> = new Map();
+  private awareness: AwarenessEmitter;
 
   constructor() {
     const configPath = resolveHome('~/.claude/local/messages/config.yml');
@@ -39,6 +41,11 @@ class Daemon {
     fs.mkdirSync(path.join(dataDir, 'logs'), { recursive: true });
 
     this.db = new MessageDB(path.join(dataDir, 'messages.db'));
+    this.awareness = new AwarenessEmitter(this.db, {
+      config: this.config.awareness,
+      desktop: new DesktopSink(),
+      statusline: new StatuslineSink(path.join(dataDir, 'awareness.json')),
+    });
     this.eventLog = new EventLog(path.join(dataDir, 'events'));
     this.logFile = fs.createWriteStream(path.join(dataDir, 'logs', 'daemon.log'), { flags: 'a' });
   }
@@ -259,6 +266,11 @@ class Daemon {
     }
     this.cycleCount++;
     this.writeHealth(Date.now() - cycleStart);
+    try {
+      this.awareness.emit();
+    } catch (err) {
+      this.log(`awareness emit error: ${err}`);  // must never break the sync loop
+    }
   }
 
   private writeHealth(cycleDurationMs: number): void {
