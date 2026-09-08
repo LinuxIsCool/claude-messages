@@ -104,8 +104,22 @@ export class TelegramAdapter implements Adapter {
     this.log('[telegram] Connected');
   }
 
-  async *sync(cursorStr: string | null): AsyncGenerator<SyncEvent> {
+  /**
+   * The daemon keeps one TelegramClient for its whole life. When gramjs exhausts
+   * its reconnect retries the sender is dead and every request hangs until the
+   * daemon's sync timeout fires (27 consecutive 1800 s timeouts, 2026-09-05 to
+   * 09-08). Reconnect before every sync/backfill instead of trusting init().
+   */
+  private async ensureConnected(): Promise<void> {
     if (!this.client) throw new Error('Telegram adapter not initialized');
+    if (this.client.connected) return;
+    this.log('[telegram] Client disconnected; reconnecting');
+    await this.client.connect();
+    this.log('[telegram] Reconnected');
+  }
+
+  async *sync(cursorStr: string | null): AsyncGenerator<SyncEvent> {
+    await this.ensureConnected();
 
     this.currentCursor = cursorStr ? JSON.parse(cursorStr) : { dialogs: {} };
     const now = new Date();
@@ -270,7 +284,7 @@ export class TelegramAdapter implements Adapter {
    * Safe to run repeatedly — message IDs are unique, DB upserts ignore duplicates.
    */
   async *backfill(dialogIds?: string[], maxPerDialog?: number): AsyncGenerator<SyncEvent & { _backfill_progress?: { dialog: string; fetched: number } }> {
-    if (!this.client) throw new Error('Telegram adapter not initialized');
+    await this.ensureConnected();
 
     const now = new Date();
 
