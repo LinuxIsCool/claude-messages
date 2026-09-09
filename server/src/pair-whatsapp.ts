@@ -41,21 +41,41 @@ const CREDS = path.join(AUTH_DIR, 'creds.json');
 /**
  * Whether the phone is actually linked.
  *
- * Not the same question as whether `creds.json` exists. `useMultiFileAuthState`
- * writes that file the moment it loads, before any QR has been shown, so an
- * existence check calls an unpaired directory paired and then refuses every
- * retry. `registered` is the flag WhatsApp sets once the link completes; `me`
- * and `account` appear earlier, partway through the handshake.
+ * Three wrong answers were tried before this one, in order:
+ *
+ * - **Does `creds.json` exist?** No: `useMultiFileAuthState` writes it the
+ *   moment it loads, before any QR is shown, so an unpaired directory looks
+ *   paired and every retry is refused.
+ * - **Is `creds.registered` true?** Also no, and this is the subtle one.
+ *   `registered` belongs to the pairing-*code* flow, where a phone number is
+ *   registered directly. A QR multi-device link leaves it false forever. Using
+ *   it as the test reported a working session as a failure and advised
+ *   archiving it, which would have destroyed a good pairing for a third time.
+ * - **Did the socket say 'open'?** Necessary, and not sufficient on its own,
+ *   because it says nothing about what survived to disk.
+ *
+ * What a linked QR session actually leaves behind is `me` (the device jid) and
+ * `account` (the signed identity from the phone). That pair is what
+ * `adapters/whatsapp.ts` needs to connect, and its own test for a live session
+ * is `connection === 'open'`, never `registered`.
  */
-function credsState(): { exists: boolean; registered: boolean; broken: boolean; me: string | null } {
-  if (!fs.existsSync(CREDS)) return { exists: false, registered: false, broken: false, me: null };
+function credsState(): { exists: boolean; linked: boolean; registered: boolean; broken: boolean; me: string | null } {
+  const empty = { exists: false, linked: false, registered: false, broken: false, me: null };
+  if (!fs.existsSync(CREDS)) return empty;
   const raw = fs.readFileSync(CREDS, 'utf-8');
-  if (!raw.trim()) return { exists: true, registered: false, broken: true, me: null };
+  if (!raw.trim()) return { ...empty, exists: true, broken: true };
   try {
     const c = JSON.parse(raw);
-    return { exists: true, registered: c?.registered === true, broken: false, me: c?.me?.id ?? null };
+    const me = c?.me?.id ?? null;
+    return {
+      exists: true,
+      linked: Boolean(me) && Boolean(c?.account),
+      registered: c?.registered === true,
+      broken: false,
+      me,
+    };
   } catch {
-    return { exists: true, registered: false, broken: true, me: null };
+    return { ...empty, exists: true, broken: true };
   }
 }
 
@@ -156,14 +176,14 @@ async function main(): Promise<void> {
   }
 
   if (process.argv.includes('--status')) {
-    if (before.registered) {
+    if (before.linked) {
       console.log(`paired as ${before.me ?? 'unknown'}`);
       console.log('Set adapters.whatsapp.enabled: true in config.yml and restart legion-messages.');
     } else if (before.broken) {
       console.log(`unusable: ${CREDS} is empty or unparseable`);
       console.log('Run this command with no arguments; it will archive the directory and ask for a new scan.');
     } else if (before.exists) {
-      console.log(`half-paired: ${CREDS} exists but registered=false` + (before.me ? ` (scanned as ${before.me})` : ''));
+      console.log(`half-paired: ${CREDS} has no linked account yet` + (before.me ? ` (scanned as ${before.me})` : ''));
       console.log('Run this command with no arguments to finish; no new scan is needed.');
     } else {
       console.log(`not paired: no ${CREDS}`);
@@ -172,7 +192,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (before.registered) {
+  if (before.linked) {
     console.log(`Already paired as ${before.me ?? 'unknown'}.`);
     console.log(`Delete ${AUTH_DIR} first if you want to pair a different phone.`);
     return;
@@ -187,24 +207,31 @@ async function main(): Promise<void> {
   for (let i = 0; i < 4; i++) {
     const outcome = await attempt(i === 0 && !credsState().me);
     const now = credsState();
-    // Success is what the file says, never what the socket said. A connection
-    // that opened and left `registered: false` behind is not a pairing.
-    if (now.registered) {
+    // Both halves have to agree: the socket reached 'open' at least once, and
+    // the credentials that survived to disk carry a linked account. Either one
+    // alone has already been wrong here.
+    if (now.linked && (outcome === 'paired' || i > 0)) {
       console.log(`\nPaired as ${now.me ?? 'unknown'}.`);
       console.log('Next: set adapters.whatsapp.enabled: true in ~/.claude/local/messages/config.yml');
       console.log('      systemctl --user restart legion-messages');
       return;
     }
     if (outcome === 'paired') {
-      console.log('Connected, but the stored credentials still say registered=false; reconnecting...');
+      console.log('Connected, but no linked account has been written yet; reconnecting...');
     }
     console.log('WhatsApp asked for a reconnect (this is normal right after a scan); reconnecting...');
     await new Promise(r => setTimeout(r, 1500));
   }
 
   const end = credsState();
-  if (end.registered) { console.log(`\nPaired as ${end.me}.`); return; }
-  throw new Error(`Did not complete after four attempts (registered=${end.registered}). Re-run to archive and start over.`);
+  if (end.linked) { console.log(`\nPaired as ${end.me}.`); return; }
+  // Deliberately does not suggest archiving. Credentials carrying a `me` are a
+  // real scan, and telling someone to delete them because a flag looked wrong
+  // is how the first pairing was lost.
+  throw new Error(
+    `Did not complete after four attempts. creds.json ${end.me ? `carries ${end.me} but no account` : 'carries no device'}. ` +
+    `The credentials are intact; try again before considering a fresh scan.`
+  );
 }
 
 main().catch(err => { console.error(String(err?.message ?? err)); process.exit(1); });
