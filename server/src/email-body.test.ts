@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { decodeBodyPart, parseMimeHeaders, decodeQuotedPrintable, repairStoredBody } from './email-body.js';
+import { decodeBodyPart, parseMimeHeaders, decodeQuotedPrintable, repairStoredBody, extractTextFromMultipart } from './email-body.js';
 
 const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
 
@@ -93,5 +93,102 @@ describe('repairStoredBody — the headers are gone, so read the text', () => {
   it('leaves a URL containing = alone', () => {
     const url = 'http://link.empwr.ai/ls/click?upn=abcdef and please read it';
     expect(repairStoredBody(url)).toBeNull();
+  });
+});
+
+describe('extractTextFromMultipart', () => {
+  const alt = [
+    '--000000000000b135ce0654cdc288',
+    'Content-Type: text/plain; charset="UTF-8"',
+    'Content-Transfer-Encoding: quoted-printable',
+    '',
+    'Hi Shawn,=0A=0AIt sounds like you are one busy man.',
+    '--000000000000b135ce0654cdc288',
+    'Content-Type: text/html; charset="UTF-8"',
+    '',
+    '<div>Hi Shawn</div>',
+    '--000000000000b135ce0654cdc288--',
+  ].join('\r\n');
+
+  it('prefers the plain-text alternative and decodes it', () => {
+    expect(extractTextFromMultipart(alt)).toBe('Hi Shawn,\n\nIt sounds like you are one busy man.');
+  });
+
+  it('falls back to html when there is no plain alternative', () => {
+    const htmlOnly = [
+      '--bnd', 'Content-Type: text/html; charset="UTF-8"', '', '<p>only html here</p>', '--bnd--',
+    ].join('\r\n');
+    expect(extractTextFromMultipart(htmlOnly)).toBe('<p>only html here</p>');
+  });
+
+  it('reaches through a mixed container wrapping an alternative one', () => {
+    const nested = [
+      '--outer', 'Content-Type: multipart/alternative; boundary="inner"', '',
+      '--inner', 'Content-Type: text/plain', '', 'the actual words', '--inner--',
+      '--outer--',
+    ].join('\r\n');
+    expect(extractTextFromMultipart(nested)).toBe('the actual words');
+  });
+
+  it('says nothing about ordinary prose', () => {
+    expect(extractTextFromMultipart('Great Grandpa, I will do that.')).toBeNull();
+  });
+
+  it('says nothing about a line that merely starts with dashes', () => {
+    expect(extractTextFromMultipart('---\nsigned, Shawn\n')).toBeNull();
+  });
+
+  it('says nothing about a signature marker followed by prose', () => {
+    expect(extractTextFromMultipart('--\r\nShawn Anderson\r\n\r\nSent from my phone')).toBeNull();
+  });
+
+  it('accepts a boundary that itself begins with dashes', () => {
+    // `------=_Part_477901_1432188472` is what JavaMail writes, and 1,155 rows
+    // stayed unreadable because a rule excluded a leading dash.
+    const javamail = [
+      '------=_Part_477902_460623857.1780302420269',
+      'Content-Type: text/plain; charset=utf-8',
+      '',
+      'Need a recap? Review the agenda.',
+      '------=_Part_477902_460623857.1780302420269--',
+    ].join('\r\n');
+    expect(extractTextFromMultipart(javamail)).toBe('Need a recap? Review the agenda.');
+  });
+
+  it('repairs a stored multipart body end to end', () => {
+    const out = repairStoredBody(alt);
+    expect(out).toBe('Hi Shawn,\n\nIt sounds like you are one busy man.');
+  });
+});
+
+describe('a string is characters, a buffer is bytes', () => {
+  it('keeps a non-ASCII character that is already decoded', () => {
+    // Round-tripping through latin1 truncated this to one invalid byte and the
+    // clean-text guard then refused the whole repair, leaving 622 multipart
+    // bodies unreadable because one of them mentioned Keyser Smöze.
+    const part = 'Good luck on the tractor - Dad\r\n\r\nOn Sun, Keyser Smöze <k@example.com> wrote:';
+    expect(decodeBodyPart(part, 'Content-Transfer-Encoding: quoted-printable\r\ncharset=UTF-8'))
+      .toContain('Keyser Smöze');
+  });
+
+  it('still joins a multi-byte escape written across two hex pairs', () => {
+    expect(decodeBodyPart('caf=C3=A9 and Sm=C3=B6ze', 'Content-Transfer-Encoding: quoted-printable\r\ncharset=UTF-8'))
+      .toBe('café and Smöze');
+  });
+
+  it('repairs a multipart body carrying an accented name', () => {
+    const body = [
+      '--0000000000000cf2b00654df9dd4',
+      'Content-Type: text/plain; charset="UTF-8"',
+      'Content-Transfer-Encoding: quoted-printable',
+      '',
+      'Good luck on the tractor. Your back yard looks nicely mowed - Dad',
+      '',
+      'On Sun, Jun 21, 2026 at 6:42 PM Keyser Smöze <k@example.com> wrote:',
+      '--0000000000000cf2b00654df9dd4--',
+    ].join('\r\n');
+    const out = repairStoredBody(body);
+    expect(out).toContain('Good luck on the tractor');
+    expect(out).toContain('Keyser Smöze');
   });
 });
