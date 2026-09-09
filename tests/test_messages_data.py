@@ -182,3 +182,66 @@ def test_filters_thread_id(fixture_db: Path) -> None:
     conn = md.connect_ro(fixture_db)
     rows = md.list_messages(conn, {"thread": "t2", "limit": 10})
     assert [r["id"] for r in rows] == ["m3"]
+
+
+# ── Cohort filter (task-885 N5) ──────────────────────────────────────
+
+
+def test_cohort_filter_returns_what_a_member_sent(cohort_db):
+    conn = md.connect_ro(cohort_db)
+    rows = md.list_messages(conn, {"cohort": "Family", "limit": 50})
+    ids = {r["id"] for r in rows}
+    assert "m1" in ids and "m2" in ids       # Darren sent these
+    assert "m3" not in ids                    # a stranger's message
+
+
+def test_cohort_filter_returns_the_other_half_of_the_conversation(cohort_db):
+    # m4 is Shawn's own reply in Darren's telegram thread, and t1's participants
+    # list is empty, as every telegram thread's is. Reached only because Darren
+    # has spoken in that thread; a participants-only filter makes the view a
+    # monologue on the one platform Shawn uses most.
+    conn = md.connect_ro(cohort_db)
+    ids = {r["id"] for r in md.list_messages(conn, {"cohort": "Family", "limit": 50})}
+    assert "m4" in ids
+
+
+def test_cohort_filter_reaches_a_thread_a_member_only_participates_in(cohort_db):
+    # t3 lists Darren as a participant and holds only a message Shawn sent.
+    # Without the participants arm the thread is invisible in a view about him.
+    conn = md.connect_ro(cohort_db)
+    ids = {r["id"] for r in md.list_messages(conn, {"cohort": "Family", "limit": 50})}
+    assert "m5" in ids
+
+
+def test_a_cohort_with_no_ingested_channel_returns_nothing_not_everything(cohort_db):
+    # Grandpa Gary is known and has never been read. The dangerous failure is
+    # an unmatched filter silently degrading to "all messages".
+    conn = md.connect_ro(cohort_db)
+    assert md.list_messages(conn, {"cohort": "Silent", "limit": 50}) == []
+
+
+def test_an_unknown_cohort_name_returns_nothing(cohort_db):
+    conn = md.connect_ro(cohort_db)
+    assert md.list_messages(conn, {"cohort": "NoSuchCohort", "limit": 50}) == []
+
+
+def test_cohort_filter_applies_to_search_too(cohort_db):
+    conn = md.connect_ro(cohort_db)
+    hits = md.search_messages(conn, {"q": "multisig", "cohort": "Family", "limit": 50})
+    assert {h["id"] for h in hits} == {"m1", "m2"}
+    assert md.search_messages(conn, {"q": "multisig", "cohort": "Silent", "limit": 50}) == []
+
+
+def test_facets_count_cohort_members_not_messages(cohort_db):
+    conn = md.connect_ro(cohort_db)
+    cohorts = {c["value"]: c["count"] for c in md.get_facets(conn)["cohorts"]}
+    assert cohorts == {"Family": 1, "Silent": 1}
+
+
+def test_threads_can_be_filtered_by_cohort(cohort_db):
+    # The threads list has no sender of its own, so it matches on participation
+    # only. t1 is invisible here for the same reason it needs the speech arm in
+    # the message list: telegram writes no participants.
+    conn = md.connect_ro(cohort_db)
+    ids = {t["id"] for t in md.list_threads(conn, {"cohort": "Family", "limit": 50})}
+    assert ids == {"t3"}

@@ -50,6 +50,90 @@ LEFT JOIN contact_scores cs ON cs.identity_id = il.identity_id
 """
 
 
+# A cohort is a set of people, and "show me my family" means the conversation,
+# not only their half of it. So a message qualifies two ways: a member sent it,
+# or a member is on the thread. Without the second arm, an email Shawn wrote to
+# his grandfather is invisible in a view about his grandfather, and a thread
+# where a member has not replied yet disappears entirely.
+_COHORT_HANDLES = """
+SELECT il2.platform || ':' || il2.platform_id
+  FROM identity_links il2
+  JOIN cohort_members cm ON cm.identity_id = il2.identity_id
+  JOIN cohorts co        ON co.id = cm.cohort_id
+ WHERE co.name = :cohort
+"""
+
+# Resolved to literal id lists rather than left as a correlated subquery.
+# Written as a subquery the planner cannot use idx_messages_ts and the cohort
+# predicate together, so it walks all 76,000 messages in timestamp order testing
+# each one: 1.24 s for a six-person cohort. Resolving first makes both arms
+# index lookups.
+_COHORT_SCOPE_CAP = 20000
+
+
+def _cohort_scope(conn: sqlite3.Connection, cohort: str) -> tuple[list[str], list[str]]:
+    """(sender handles, thread ids) that a cohort reaches.
+
+    A thread counts two ways, and neither alone is enough:
+
+    - the member is listed in `threads.participants`. This is how a thread where
+      Shawn wrote and nobody has answered yet is found, and it covers every
+      email thread. It covers no Telegram thread at all: 929 of 929 carry an
+      empty participants list.
+    - the member has sent a message in it. This is the only arm that reaches
+      Telegram, and it is what makes Shawn's own replies part of a view about
+      the person he is replying to.
+    """
+    handles = [r[0] for r in conn.execute(_COHORT_HANDLES, {"cohort": cohort}).fetchall()]
+    if not handles:
+        return [], []
+    marks = ",".join("?" * len(handles))
+    by_participation = conn.execute(
+        f"SELECT DISTINCT t.id FROM threads t, json_each(t.participants) p "
+        f"WHERE p.value IN ({marks})",
+        handles,
+    ).fetchall()
+    by_speech = conn.execute(
+        f"SELECT DISTINCT m.thread_id FROM messages m "
+        f"WHERE m.sender_id IN ({marks}) AND m.thread_id IS NOT NULL",
+        handles,
+    ).fetchall()
+    threads = sorted({r[0] for r in by_participation} | {r[0] for r in by_speech})
+    return handles, threads
+
+
+def _cohort_clause(conn: sqlite3.Connection, cohort: str, binds: dict[str, Any]) -> str:
+    """The WHERE fragment for a cohort, and its binds, or a fragment matching nothing.
+
+    A cohort with members but no ingested messages yields no handles and returns
+    `AND 0`. That is the honest answer and not an error: the people are known
+    and the channel they use has not been read yet.
+    """
+    handles, threads = _cohort_scope(conn, cohort)
+    if not handles:
+        return "AND 0"
+    if len(handles) + len(threads) > _COHORT_SCOPE_CAP:
+        binds["cohort"] = cohort
+        return (
+            "AND (il.identity_id IN (SELECT cm.identity_id FROM cohort_members cm "
+            "  JOIN cohorts co ON co.id = cm.cohort_id WHERE co.name = :cohort) "
+            "  OR m.thread_id IN (SELECT t2.id FROM threads t2, json_each(t2.participants) p "
+            f"    WHERE p.value IN ({_COHORT_HANDLES})))"
+        )
+    hkeys = []
+    for i, h in enumerate(handles):
+        binds[f"coh_h{i}"] = h
+        hkeys.append(f":coh_h{i}")
+    tkeys = []
+    for i, t in enumerate(threads):
+        binds[f"coh_t{i}"] = t
+        tkeys.append(f":coh_t{i}")
+    arms = [f"m.sender_id IN ({','.join(hkeys)})"]
+    if tkeys:
+        arms.append(f"m.thread_id IN ({','.join(tkeys)})")
+    return "AND (" + " OR ".join(arms) + ")"
+
+
 def connect_ro(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     """Open the messages DB strictly read-only."""
     uri = f"file:{Path(db_path)}?mode=ro"
@@ -74,7 +158,7 @@ def _offset(params: dict[str, Any]) -> int:
         return 0
 
 
-def _filters(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _filters(params: dict[str, Any], conn: sqlite3.Connection | None = None) -> tuple[str, dict[str, Any]]:
     """Build the shared WHERE fragment (excluding any FTS MATCH) + binds."""
     clauses: list[str] = []
     binds: dict[str, Any] = {}
@@ -96,6 +180,8 @@ def _filters(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if params.get("direction"):
         clauses.append("AND m.direction = :direction")
         binds["direction"] = params["direction"]
+    if params.get("cohort") and conn is not None:
+        clauses.append(_cohort_clause(conn, str(params["cohort"]), binds))
     return " ".join(clauses), binds
 
 
@@ -124,7 +210,7 @@ def _row_to_card(row: sqlite3.Row) -> dict[str, Any]:
 
 def list_messages(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[str, Any]]:
     """Reverse-chronological message list with optional filters + pagination."""
-    filt, binds = _filters(params)
+    filt, binds = _filters(params, conn)
     binds["limit"] = _clamp_limit(params)
     binds["offset"] = _offset(params)
     sql = (
@@ -140,7 +226,7 @@ def search_messages(conn: sqlite3.Connection, params: dict[str, Any]) -> list[di
     q = str(params.get("q") or "").strip()
     if not q:
         return []
-    filt, binds = _filters(params)
+    filt, binds = _filters(params, conn)
     binds["q"] = q
     binds["limit"] = _clamp_limit(params)
     binds["offset"] = _offset(params)
@@ -167,6 +253,14 @@ def get_facets(conn: sqlite3.Connection) -> dict[str, Any]:
         ),
         "dunbar_layers": _counts(
             "SELECT dunbar_layer, COUNT(*) FROM contact_scores GROUP BY dunbar_layer ORDER BY 2 DESC"
+        ),
+        # Members, not messages. A cohort with people in it and nothing to read
+        # is a true and useful answer: it says the person is known and the
+        # channel they use is not ingested yet.
+        "cohorts": _counts(
+            "SELECT co.name, COUNT(cm.identity_id) FROM cohorts co "
+            "LEFT JOIN cohort_members cm ON cm.cohort_id = co.id "
+            "GROUP BY co.id ORDER BY 2 DESC, co.name"
         ),
     }
 
@@ -252,6 +346,13 @@ def list_threads(conn: sqlite3.Connection, params: dict[str, Any]) -> list[dict[
     if params.get("q"):
         clauses.append("AND t.title LIKE :q")
         binds["q"] = f"%{params['q']}%"
+    if params.get("cohort"):
+        # Threads list by participation only: a thread has no sender of its own.
+        clauses.append(
+            "AND t.id IN (SELECT t2.id FROM threads t2, json_each(t2.participants) p "
+            f"WHERE p.value IN ({_COHORT_HANDLES}))"
+        )
+        binds["cohort"] = params["cohort"]
     binds["limit"] = _clamp_limit(params)
     binds["offset"] = _offset(params)
     where = " ".join(clauses)

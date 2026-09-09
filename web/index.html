@@ -213,6 +213,7 @@ const state = {
   q: "",
   platform: "",
   direction: "",
+  cohort: "",
   since: "",
   until: "",
   sort: "signal",
@@ -237,7 +238,7 @@ const LS_KEY = "legion.messages.filters";
 function loadFilters() {
   const params = new URLSearchParams(location.search);
   let any = false;
-  for (const k of ["q","platform","direction","since","until","view","sort"]) {
+  for (const k of ["q","platform","direction","cohort","since","until","view","sort"]) {
     if (params.has(k)) { state[k] = params.get(k); any = true; }
   }
   if (params.has("hide_noise")) { state.hideNoise = params.get("hide_noise") === "true"; any = true; }
@@ -247,7 +248,7 @@ function loadFilters() {
   if (!any) {
     try {
       const s = JSON.parse(localStorage.getItem(LS_KEY) || "{}");
-      for (const k of ["q","platform","direction","since","until","sort"]) if (s[k]) state[k] = s[k];
+      for (const k of ["q","platform","direction","cohort","since","until","sort"]) if (s[k]) state[k] = s[k];
       if (s.hideNoise != null) state.hideNoise = !!s.hideNoise;
       if (s.threadsQ) state.threadsQ = s.threadsQ;
       if (s.threadsPlatform) state.threadsPlatform = s.threadsPlatform;
@@ -258,7 +259,7 @@ function loadFilters() {
 
 function persistFilters() {
   const u = new URLSearchParams();
-  for (const k of ["q","platform","direction","since","until"]) if (state[k]) u.set(k, state[k]);
+  for (const k of ["q","platform","direction","cohort","since","until"]) if (state[k]) u.set(k, state[k]);
   if (state.view !== "messages") u.set("view", state.view);
   if (state.sort && state.sort !== "recent") u.set("sort", state.sort);
   if (state.hideNoise) u.set("hide_noise", "true");
@@ -269,7 +270,7 @@ function persistFilters() {
   try {
     localStorage.setItem(LS_KEY, JSON.stringify(
       Object.fromEntries([
-        ...["q","platform","direction","since","until","sort"].map(k => [k, state[k]]),
+        ...["q","platform","direction","cohort","since","until","sort"].map(k => [k, state[k]]),
         ["hideNoise", state.hideNoise],
         ["threadsQ", state.threadsQ],
         ["threadsPlatform", state.threadsPlatform],
@@ -382,6 +383,11 @@ function filterBarHTML(showSearch = false) {
   const platformOpts = state.facets
     ? state.facets.platforms.map(p => `<option value="${esc(p.value)}" ${state.platform === p.value ? "selected" : ""}>${esc(p.value)} (${fmt(p.count)})</option>`).join("")
     : "";
+  // The count is members, not messages. A cohort with people in it and nothing
+  // to read says the person is known and their channel is not ingested yet.
+  const cohortOpts = state.facets && state.facets.cohorts
+    ? state.facets.cohorts.map(c => `<option value="${esc(c.value)}" ${state.cohort === c.value ? "selected" : ""}>${esc(c.value)} (${fmt(c.count)})</option>`).join("")
+    : "";
   return `<div class="rounded-xl border border-surface-border bg-surface-card p-3 mb-4 space-y-2">
     <div class="flex gap-2 flex-wrap">
       <input id="filter-q" type="text" class="input-field flex-1 min-w-[180px]" placeholder="${showSearch ? "Search messages (FTS)…" : "Filter messages…"}" value="${esc(state.q)}" />
@@ -393,6 +399,10 @@ function filterBarHTML(showSearch = false) {
         <option value="" ${!state.direction ? "selected" : ""}>any direction</option>
         <option value="received" ${state.direction === "received" ? "selected" : ""}>received</option>
         <option value="sent" ${state.direction === "sent" ? "selected" : ""}>sent</option>
+      </select>
+      <select id="filter-cohort" class="input-field" title="A named group of people. Shows the whole conversation with them, both halves.">
+        <option value="" ${!state.cohort ? "selected" : ""}>everyone</option>
+        ${cohortOpts}
       </select>
     </div>
     <div class="flex gap-2 flex-wrap items-center">
@@ -417,6 +427,7 @@ function bindFilterBar(onChanged) {
   const q = document.getElementById("filter-q");
   const plat = document.getElementById("filter-platform");
   const dir = document.getElementById("filter-direction");
+  const cohort = document.getElementById("filter-cohort");
   const since = document.getElementById("filter-since");
   const until = document.getElementById("filter-until");
   const clear = document.getElementById("filter-clear");
@@ -429,6 +440,7 @@ function bindFilterBar(onChanged) {
     state.q = q ? q.value : state.q;
     state.platform = plat ? plat.value : state.platform;
     state.direction = dir ? dir.value : state.direction;
+    state.cohort = cohort ? cohort.value : state.cohort;
     state.since = since && since.value ? since.value + "T00:00:00Z" : "";
     state.until = until && until.value ? until.value + "T23:59:59Z" : "";
     persistFilters();
@@ -447,6 +459,7 @@ function bindFilterBar(onChanged) {
   if (q) q.oninput = changed;
   if (plat) plat.onchange = changed;
   if (dir) dir.onchange = changed;
+  if (cohort) cohort.onchange = changed;
   if (since) since.onchange = changed;
   if (until) until.onchange = changed;
   if (sortRecent) sortRecent.onclick = () => setSort("recent");
@@ -457,7 +470,7 @@ function bindFilterBar(onChanged) {
     onChanged();
   };
   if (clear) clear.onclick = () => {
-    for (const k of ["q","platform","direction","since","until"]) state[k] = "";
+    for (const k of ["q","platform","direction","cohort","since","until"]) state[k] = "";
     state.sort = "recent";
     state.hideNoise = false;
     persistFilters();
@@ -504,6 +517,7 @@ async function loadMessages(reset = false) {
   const u = new URLSearchParams();
   if (state.platform) u.set("platform", state.platform);
   if (state.direction) u.set("direction", state.direction);
+  if (state.cohort) u.set("cohort", state.cohort);
   if (state.since) u.set("since", state.since);
   if (state.until) u.set("until", state.until);
   u.set("limit", state.limit);
@@ -517,6 +531,7 @@ async function loadMessages(reset = false) {
       const sq = new URLSearchParams({ q: state.q, limit: state.limit, offset: state.offset });
       if (state.platform) sq.set("platform", state.platform);
       if (state.direction) sq.set("direction", state.direction);
+      if (state.cohort) sq.set("cohort", state.cohort);
       if (state.since) sq.set("since", state.since);
       if (state.until) sq.set("until", state.until);
       sq.set("sort", state.sort || "recent");
@@ -607,6 +622,7 @@ async function runSearch(reset = false) {
   const u = new URLSearchParams({ q, limit: state.limit, offset: state.offset });
   if (state.platform) u.set("platform", state.platform);
   if (state.direction) u.set("direction", state.direction);
+  if (state.cohort) u.set("cohort", state.cohort);
   if (state.since) u.set("since", state.since);
   if (state.until) u.set("until", state.until);
   u.set("sort", state.sort || "recent");
@@ -953,6 +969,7 @@ async function loadThreads(reset = false) {
   if (state.threadsQ) u.set("q", state.threadsQ);
   if (state.threadsPlatform) u.set("platform", state.threadsPlatform);
   if (state.threadsType) u.set("thread_type", state.threadsType);
+  if (state.cohort) u.set("cohort", state.cohort);
 
   let batch;
   try {
@@ -1097,6 +1114,7 @@ function startSSE() {
       const u = new URLSearchParams({ limit: state.limit, offset: 0 });
       if (state.platform) u.set("platform", state.platform);
       if (state.direction) u.set("direction", state.direction);
+  if (state.cohort) u.set("cohort", state.cohort);
       if (state.since) u.set("since", state.since);
       if (state.until) u.set("until", state.until);
       u.set("sort", "recent");

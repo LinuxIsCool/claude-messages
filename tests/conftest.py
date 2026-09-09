@@ -58,6 +58,14 @@ def _build_db(path: Path) -> None:
             composite REAL DEFAULT 0, dunbar_layer TEXT DEFAULT 'acquaintance',
             confidence REAL DEFAULT 0, computed_at TEXT NOT NULL DEFAULT ''
         );
+        CREATE TABLE cohorts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+            description TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE cohort_members (
+            cohort_id INTEGER NOT NULL, identity_id TEXT NOT NULL,
+            PRIMARY KEY (cohort_id, identity_id)
+        );
         CREATE VIRTUAL TABLE messages_fts USING fts5(content);
         CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
             INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -108,4 +116,51 @@ def fixture_db(tmp_path: Path) -> Path:
     """Path to a freshly-built fixture messages.db."""
     db = tmp_path / "messages.db"
     _build_db(db)
+    return db
+
+
+def _add_cohorts(path: Path) -> None:
+    """Cohort rows on top of the base fixture, in a fixture of their own.
+
+    Kept separate because every other test asserts the base fixture's exact
+    contents: adding one thread to it broke eleven assertions that had nothing
+    to do with cohorts.
+    """
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        INSERT INTO cohorts(name,description,created_at)
+          VALUES ('Family','test','2026-01-01T00:00:00Z'),
+                 ('Silent','nobody has written yet','2026-01-01T00:00:00Z');
+        INSERT INTO identities
+          VALUES ('id-quiet','Grandpa Gary',NULL,'{}','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+        INSERT INTO cohort_members
+          VALUES ((SELECT id FROM cohorts WHERE name='Family'),'id-darren'),
+                 ((SELECT id FROM cohorts WHERE name='Silent'),'id-quiet');
+        """
+    )
+    # t3 lists Darren as a participant and holds only a message Shawn sent: the
+    # case a sender-only filter loses. t1 is the opposite case, a telegram
+    # thread with empty participants, which is every telegram thread in the
+    # live corpus (929 of 929 on 2026-09-09).
+    conn.execute(
+        "INSERT INTO threads VALUES ('t3','email','Grandparents','dm',"
+        "'[\"telegram:user:458825601\",\"email:user:me@example.com\"]','{}',"
+        "'2026-04-01T00:00:00Z','2026-04-02T00:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO messages(id,platform,thread_id,sender_id,content,platform_ts,synced_at,direction) "
+        "VALUES ('m5','email','t3','email:user:me@example.com','sent to the grandparents thread',"
+        "'2026-04-02T09:00:00Z','2026-04-02T09:00:00Z','sent')"
+    )
+    conn.commit()
+    conn.close()
+
+
+@pytest.fixture()
+def cohort_db(tmp_path: Path) -> Path:
+    """The base fixture plus cohorts, threads and a sent-only thread."""
+    db = tmp_path / "messages-cohorts.db"
+    _build_db(db)
+    _add_cohorts(db)
     return db
