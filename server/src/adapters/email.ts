@@ -2,6 +2,7 @@ import { ImapFlow } from 'imapflow';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { decodeBodyPart } from '../email-body.js';
 import type { Adapter } from './base.js';
 import type { SyncEvent, AdapterConfig, Contact, Thread, Message } from '../types.js';
 
@@ -357,11 +358,14 @@ export class EmailAdapter implements Adapter {
       // Envelope-only fetch for speed — avoids downloading full message bodies.
       // headers returns raw buffer; we parse References from it for threading.
       // bodyParts['1'] gets the first MIME part (usually text/plain).
+      // `1.MIME` is part 1's own headers, which is where Content-Transfer-Encoding
+      // lives. Without it a base64 part is stored as `SGVsbG8gYWxs…` and indexed
+      // into FTS as gibberish: 1,038 of the first 19,376 email rows (task-885 N2).
       for await (const msg of acct.client.fetch(searchQuery, {
         uid: true,
         envelope: true,
         headers: ['references'],
-        bodyParts: ['1'],
+        bodyParts: ['1', '1.MIME'],
       })) {
         // Skip messages we've already processed (IMAP UID ranges can re-include boundary)
         if (msg.uid <= folderCursor.lastUid) continue;
@@ -431,9 +435,9 @@ export class EmailAdapter implements Adapter {
         };
         yield { type: 'thread', data: thread };
 
-        // Get text content from first body part
+        // Get text content from first body part, decoded per its own MIME headers
         const textPart = msg.bodyParts?.get('1');
-        const textContent = textPart ? textPart.toString() : null;
+        const textContent = textPart ? decodeBodyPart(textPart, msg.bodyParts?.get('1.MIME')) : null;
 
         const senderEmail = fromAddrs[0]?.address?.toLowerCase() ?? null;
         const metadata: Record<string, unknown> = {

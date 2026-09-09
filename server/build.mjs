@@ -49,6 +49,12 @@ await Promise.all([
   }),
   esbuild.build({
     ...common,
+    entryPoints: ['src/repair-email-bodies.ts'],
+    outfile: 'build/repair-email-bodies.mjs',
+    banner: { js: "// email body repair — bundled with esbuild" },
+  }),
+  esbuild.build({
+    ...common,
     entryPoints: ['src/resolve-people.ts'],
     outfile: 'build/resolve-people.mjs',
     banner: { js: "// claude-messages people pass — bundled with esbuild" },
@@ -67,4 +73,4 @@ await Promise.all([
   }),
 ]);
 
-console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, backfill-email.mjs, import-whatsapp-export.mjs, import-google-contacts.mjs, pair-whatsapp.mjs, resolve-people.mjs, and seed-priority.mjs');
+console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, backfill-email.mjs, import-whatsapp-export.mjs, import-google-contacts.mjs, pair-whatsapp.mjs, resolve-people.mjs, repair-email-bodies.mjs, and seed-priority.mjs');
