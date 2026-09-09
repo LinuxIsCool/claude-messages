@@ -2,6 +2,8 @@ import Database from 'better-sqlite3';
 import crypto from 'node:crypto';
 import type { Contact, Thread, Message, Identity, IdentityLink, IdentityEvent, IdentityCard, AutoResolveReport, IdentityHealth, IdentityRelationship, MergeSuggestion, RawMetrics, ScoringContext, ScoringFactor, ScoringConfig, ContactScore, FadingRelationship, DunbarLayer, PriorityRule, Cohort, MessagePriority, InboxEntry, AwarenessCounts } from './types.js';
 import { jaroWinkler, extractFirstName, findBestFuzzyMatch } from './fuzzy.js';
+import { normalizePhone as normalizePhoneE164, namesNobody } from './address-book.js';
+import type { AddressBookEntry } from './address-book.js';
 import type { IdentityCandidate } from './fuzzy.js';
 import { tierToImportance, importanceToTier, blendAttention, detectUrgencySignals } from './priority.js';
 import type { PriorityTier, RuleType } from './priority.js';
@@ -296,6 +298,38 @@ export class MessageDB {
       )
     `);
 
+    // --- task-885 W2c: the address book, the curated name authority (D7) ---
+    // Rows here are a projection of an export file, not an accumulating store:
+    // importing a source deletes its previous rows and writes the file again.
+    // Google's CSV carries no stable contact id, so with an upsert a rename and
+    // a new person would be indistinguishable and both would survive.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS address_book (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source TEXT NOT NULL,
+        full_name TEXT NOT NULL,
+        given_name TEXT,
+        family_name TEXT,
+        nickname TEXT,
+        organization TEXT,
+        labels TEXT,
+        imported_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS address_book_handles (
+        entry_id INTEGER NOT NULL REFERENCES address_book(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        raw_value TEXT NOT NULL,
+        label TEXT,
+        PRIMARY KEY (kind, value, entry_id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_address_book_source ON address_book(source);
+      CREATE INDEX IF NOT EXISTS idx_address_book_handles_value ON address_book_handles(kind, value);
+      CREATE INDEX IF NOT EXISTS idx_address_book_handles_entry ON address_book_handles(entry_id);
+    `);
+
     this.loadNicknames();
 
     // FTS5 virtual table (can't use IF NOT EXISTS, so check first)
@@ -410,6 +444,13 @@ export class MessageDB {
       msg.direction ?? 'unknown'
     );
     const inserted = result.changes > 0;
+    // A replay/backfill can now repair old rows created before adapters tagged
+    // direction, without making the duplicate look newly inserted to callers.
+    if (!inserted && msg.direction && msg.direction !== 'unknown') {
+      this.db.prepare(
+        "UPDATE messages SET direction = ? WHERE id = ? AND direction = 'unknown'"
+      ).run(msg.direction, msg.id);
+    }
     if (inserted) {
       try { this.scoreMessage(msg.id); } catch { /* scoring must never break ingestion */ }
     }
@@ -1747,9 +1788,19 @@ export class MessageDB {
 
   // --- Identity Helpers ---
 
+  /**
+   * Two spellings of one number compare equal.
+   *
+   * Delegates to address-book.ts so the address book and the platform contacts
+   * agree on what a number is. The behaviour changed under task-885: this used
+   * to prepend `+` to the digits and nothing else, which is right for the 1,065
+   * contacts whose number already carries a country code and wrong for the four
+   * that do not, turning a ten-digit NANP number into a foreign one that could
+   * never match. Returns the raw digits with a `+` when the shared normaliser
+   * declines, so a Telegram shortcode still gets a stable key.
+   */
   private normalizePhone(phone: string): string {
-    const digits = phone.replace(/\D/g, '');
-    return '+' + digits;
+    return normalizePhoneE164(phone) ?? '+' + phone.replace(/\D/g, '');
   }
 
   private logIdentityEvent(identityId: string, eventType: string, details: Record<string, unknown>): void {
@@ -3273,5 +3324,168 @@ export class MessageDB {
         stats: { total_messages, first_seen, last_seen },
       };
     });
+  }
+
+  // --- Address book (task-885 W2c): the curated name authority ---
+
+  /**
+   * Replace everything this source contributed with the contents of one export.
+   *
+   * A whole-source replace rather than an upsert because the export has no
+   * stable per-contact id (see address-book.ts). Under a merge, editing a
+   * contact's name in Google would leave both spellings behind and deleting a
+   * contact would leave it here forever, so the table would slowly stop being
+   * what Shawn's phone says and start being a union of every export ever run.
+   */
+  replaceAddressBook(source: string, entries: AddressBookEntry[]): { entries: number; handles: number; replaced: number } {
+    const now = new Date().toISOString();
+    const run = this.db.transaction(() => {
+      const replaced = (this.db.prepare('SELECT COUNT(*) as c FROM address_book WHERE source = ?').get(source) as { c: number }).c;
+      // Handles cascade, but foreign_keys is a connection pragma rather than a
+      // guarantee, so delete them explicitly instead of trusting it.
+      this.db.prepare('DELETE FROM address_book_handles WHERE entry_id IN (SELECT id FROM address_book WHERE source = ?)').run(source);
+      this.db.prepare('DELETE FROM address_book WHERE source = ?').run(source);
+
+      const insEntry = this.db.prepare(`
+        INSERT INTO address_book (source, full_name, given_name, family_name, nickname, organization, labels, imported_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const insHandle = this.db.prepare(`
+        INSERT OR IGNORE INTO address_book_handles (entry_id, kind, value, raw_value, label)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      let handles = 0;
+      for (const e of entries) {
+        const id = insEntry.run(source, e.full_name, e.given_name, e.family_name, e.nickname, e.organization, e.labels, now).lastInsertRowid;
+        for (const h of e.handles) {
+          insHandle.run(id, h.kind, h.value, h.raw_value, h.label);
+          handles++;
+        }
+      }
+      return { entries: entries.length, handles, replaced };
+    });
+    return run();
+  }
+
+  /**
+   * The curated name for one handle, or null.
+   *
+   * Two entries may legitimately share a handle (a shared household line, a
+   * duplicate Shawn has not merged). Returning the first by name keeps the
+   * answer stable across calls rather than depending on insertion order, and
+   * `ambiguous` tells the caller not to act on it silently.
+   */
+  addressBookLookup(kind: 'phone' | 'email', rawValue: string): { entry_id: number; full_name: string; ambiguous: boolean } | null {
+    const value = kind === 'phone' ? this.normalizePhone(rawValue) : rawValue.trim().toLowerCase();
+    if (!value) return null;
+    const rows = this.db.prepare(`
+      SELECT ab.id as entry_id, ab.full_name
+      FROM address_book_handles h JOIN address_book ab ON ab.id = h.entry_id
+      WHERE h.kind = ? AND h.value = ?
+      ORDER BY ab.full_name, ab.id
+    `).all(kind, value) as Array<{ entry_id: number; full_name: string }>;
+    if (!rows.length) return null;
+    const distinct = new Set(rows.map(r => r.full_name)).size;
+    return { entry_id: rows[0].entry_id, full_name: rows[0].full_name, ambiguous: distinct > 1 };
+  }
+
+  addressBookStats(): { entries: number; handles: number; sources: Array<{ source: string; entries: number }> } {
+    const entries = (this.db.prepare('SELECT COUNT(*) as c FROM address_book').get() as { c: number }).c;
+    const handles = (this.db.prepare('SELECT COUNT(*) as c FROM address_book_handles').get() as { c: number }).c;
+    const sources = this.db.prepare('SELECT source, COUNT(*) as entries FROM address_book GROUP BY source ORDER BY entries DESC')
+      .all() as Array<{ source: string; entries: number }>;
+    return { entries, handles, sources };
+  }
+
+  /**
+   * Give every identity the address book can name the name Shawn gave it.
+   *
+   * Two outcomes, deliberately kept apart (task-885 P7, D3):
+   *
+   * - `renamed`: the identity's display name named nobody (a bare number, a
+   *   handle) and now carries a curated name. This is safe because there is no
+   *   competing claim to lose.
+   * - `disagreements`: the identity already carried a real name and the address
+   *   book says something else. Not acted on. Two sources naming one handle
+   *   differently is exactly the signal merge review needs, and an importer
+   *   that silently picked a winner would destroy it.
+   *
+   * Every renamed identity records `name_source: 'curated:address_book'` in its
+   * metadata. Without that marker the next fuzzy-match pass would treat the
+   * curated name as just another derived string and overwrite it, which is the
+   * failure D3 exists to prevent.
+   */
+  applyAddressBookNames(opts: { dryRun?: boolean } = {}): {
+    renamed: Array<{ identity_id: string; from: string; to: string; via: string }>;
+    disagreements: Array<{ identity_id: string; current: string; address_book: string; via: string }>;
+    already_named: number;
+    protected_curated: number;
+    matched_identities: number;
+  } {
+    const links = this.db.prepare(
+      'SELECT identity_id, platform, platform_id, username FROM identity_links'
+    ).all() as Array<{ identity_id: string; platform: string; platform_id: string; username: string | null }>;
+
+    // A contact row may carry a phone the identity has no `phone` link for, so
+    // reach the number through the contact as well as through the link.
+    const contactPhones = new Map<string, string>();
+    for (const c of this.db.prepare(
+      "SELECT id, phone FROM contacts WHERE phone IS NOT NULL AND LENGTH(phone) > 0"
+    ).all() as Array<{ id: string; phone: string }>) {
+      contactPhones.set(c.id, c.phone);
+    }
+
+    const best = new Map<string, { full_name: string; via: string }>();
+    for (const l of links) {
+      const candidates: Array<{ kind: 'phone' | 'email'; value: string }> = [];
+      if (l.platform === 'phone') candidates.push({ kind: 'phone', value: l.platform_id });
+      if (l.platform === 'email') candidates.push({ kind: 'email', value: l.username || l.platform_id.replace(/^user:/, '') });
+      const phone = contactPhones.get(`${l.platform}:${l.platform_id}`);
+      if (phone) candidates.push({ kind: 'phone', value: phone });
+
+      for (const c of candidates) {
+        const hit = this.addressBookLookup(c.kind, c.value);
+        if (!hit || hit.ambiguous) continue;
+        // A phone match beats an email match only by arriving first; both are
+        // curated, so the first non-ambiguous hit per identity is the answer.
+        if (!best.has(l.identity_id)) best.set(l.identity_id, { full_name: hit.full_name, via: `${c.kind}:${c.value}` });
+      }
+    }
+
+    const renamed: Array<{ identity_id: string; from: string; to: string; via: string }> = [];
+    const disagreements: Array<{ identity_id: string; current: string; address_book: string; via: string }> = [];
+    let alreadyNamed = 0;
+    let protectedCurated = 0;
+
+    const apply = this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const upd = this.db.prepare('UPDATE identities SET display_name = ?, metadata = ?, updated_at = ? WHERE id = ?');
+      for (const [identityId, hit] of best) {
+        const row = this.db.prepare('SELECT display_name, metadata FROM identities WHERE id = ?').get(identityId) as
+          { display_name: string; metadata: string } | undefined;
+        if (!row) continue;
+        const metadata = JSON.parse(row.metadata || '{}') as Record<string, unknown>;
+        if (row.display_name === hit.full_name) { alreadyNamed++; continue; }
+        if (typeof metadata.name_source === 'string' && metadata.name_source.startsWith('curated:') && metadata.name_source !== 'curated:address_book') {
+          protectedCurated++;
+          continue;
+        }
+        if (!namesNobody(row.display_name)) {
+          disagreements.push({ identity_id: identityId, current: row.display_name, address_book: hit.full_name, via: hit.via });
+          continue;
+        }
+        renamed.push({ identity_id: identityId, from: row.display_name, to: hit.full_name, via: hit.via });
+        if (opts.dryRun) continue;
+        metadata.name_source = 'curated:address_book';
+        metadata.name_before_address_book = row.display_name;
+        upd.run(hit.full_name, JSON.stringify(metadata), now, identityId);
+        this.logIdentityEvent(identityId, 'renamed_from_address_book', {
+          from: row.display_name, to: hit.full_name, via: hit.via, claim_class: 'curated',
+        });
+      }
+    });
+    apply();
+
+    return { renamed, disagreements, already_named: alreadyNamed, protected_curated: protectedCurated, matched_identities: best.size };
   }
 }

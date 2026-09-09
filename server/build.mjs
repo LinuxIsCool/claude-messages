@@ -31,9 +31,21 @@ await Promise.all([
   }),
   esbuild.build({
     ...common,
+    entryPoints: ['src/backfill-email.ts'],
+    outfile: 'build/backfill-email.mjs',
+    banner: { js: "// claude-messages email Sent-folder backfill — bundled with esbuild" },
+  }),
+  esbuild.build({
+    ...common,
     entryPoints: ['src/import-whatsapp-export.ts'],
     outfile: 'build/import-whatsapp-export.mjs',
     banner: { js: "// WhatsApp chat export importer — bundled with esbuild" },
+  }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/import-google-contacts.ts'],
+    outfile: 'build/import-google-contacts.mjs',
+    banner: { js: "// Google Contacts address book importer — bundled with esbuild" },
   }),
   esbuild.build({
     ...common,
@@ -43,4 +55,4 @@ await Promise.all([
   }),
 ]);
 
-console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, import-whatsapp-export.mjs, and seed-priority.mjs');
+console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, backfill-email.mjs, import-whatsapp-export.mjs, import-google-contacts.mjs, and seed-priority.mjs');
