@@ -34,6 +34,15 @@ export interface Message {
   metadata: Record<string, unknown>;
   platform_ts: string;      // ISO 8601
   synced_at: string;
+  /**
+   * Identity across containers, where `id` is identity within one.
+   *
+   * One email lives in INBOX and in `[Gmail]/All Mail` under two different
+   * UIDs, so folder+UID makes it two rows. Its RFC Message-ID makes it one.
+   * Null when the platform has no such notion, and null is not a value: many
+   * rows may carry it without colliding.
+   */
+  dedupe_key?: string | null;
 }
 
 export type SyncEventType = 'contact' | 'thread' | 'message';
@@ -263,6 +272,7 @@ export interface AdapterHealth {
   timed_out: boolean;                // true if last sync was a timeout
   skipped?: boolean;                 // true if this cycle intentionally skipped the adapter
   cooldown_until?: string | null;     // ISO 8601 time before retrying a failing adapter
+  skip_reason?: string | null;        // display-only "skipped until X" message; never overwrites last_error
 }
 
 /** Top-level daemon health file — shared contract for all Legion daemons */

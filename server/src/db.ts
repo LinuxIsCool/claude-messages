@@ -298,6 +298,39 @@ export class MessageDB {
       )
     `);
 
+    // --- task-885 W2/N2: one row per message, not one per folder ---
+    // Gmail's All Mail holds a second copy of every message in INBOX and Sent
+    // under a different UID, and the message id is folder+UID, so ingesting it
+    // would have doubled all 3,404 existing rows and every count built on them.
+    try {
+      this.db.exec('ALTER TABLE messages ADD COLUMN dedupe_key TEXT');
+    } catch (e: any) {
+      if (!e.message.includes('duplicate column')) throw e;
+    }
+    {
+      // Existing rows first, so All Mail's copies collide with them rather than
+      // arriving as new messages. Verified unique before the index is built:
+      // 3,404 email rows, 3,404 distinct (account, Message-ID).
+      const backfilled = this.db.prepare("SELECT value FROM config WHERE key = 'email_dedupe_key_v1'").get();
+      if (!backfilled) {
+        this.db.exec(`
+          UPDATE messages
+             SET dedupe_key = 'email|' || json_extract(metadata, '$.account') || '|' || json_extract(metadata, '$.message_id')
+           WHERE platform = 'email'
+             AND dedupe_key IS NULL
+             AND json_extract(metadata, '$.account') IS NOT NULL
+             AND json_extract(metadata, '$.message_id') IS NOT NULL
+             AND rowid IN (
+               SELECT MIN(rowid) FROM messages
+                WHERE platform = 'email' AND json_extract(metadata, '$.message_id') IS NOT NULL
+                GROUP BY json_extract(metadata, '$.account'), json_extract(metadata, '$.message_id')
+             )
+        `);
+        this.db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('email_dedupe_key_v1', 'done')").run();
+      }
+    }
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedupe ON messages(dedupe_key) WHERE dedupe_key IS NOT NULL');
+
     // --- task-885 W2c: the address book, the curated name authority (D7) ---
     // Rows here are a projection of an export file, not an accumulating store:
     // importing a source deletes its previous rows and writes the file again.
@@ -435,21 +468,25 @@ export class MessageDB {
   insertMessage(msg: Message): boolean {
     // Returns true if actually inserted (not duplicate)
     const result = this.db.prepare(`
-      INSERT OR IGNORE INTO messages (id, platform, thread_id, sender_id, content, content_type, reply_to, metadata, platform_ts, synced_at, direction)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO messages (id, platform, thread_id, sender_id, content, content_type, reply_to, metadata, platform_ts, synced_at, direction, dedupe_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       msg.id, msg.platform, msg.thread_id, msg.sender_id,
       msg.content, msg.content_type, msg.reply_to,
       JSON.stringify(msg.metadata), msg.platform_ts, msg.synced_at,
-      msg.direction ?? 'unknown'
+      msg.direction ?? 'unknown',
+      msg.dedupe_key ?? null
     );
     const inserted = result.changes > 0;
     // A replay/backfill can now repair old rows created before adapters tagged
     // direction, without making the duplicate look newly inserted to callers.
     if (!inserted && msg.direction && msg.direction !== 'unknown') {
+      // Matched by id OR by dedupe_key: a message skipped because its twin in
+      // another folder is already stored has a different id, and repairing the
+      // twin is the whole point of having seen it again.
       this.db.prepare(
-        "UPDATE messages SET direction = ? WHERE id = ? AND direction = 'unknown'"
-      ).run(msg.direction, msg.id);
+        "UPDATE messages SET direction = ? WHERE direction = 'unknown' AND (id = ? OR (? IS NOT NULL AND dedupe_key = ?))"
+      ).run(msg.direction, msg.id, msg.dedupe_key ?? null, msg.dedupe_key ?? null);
     }
     if (inserted) {
       try { this.scoreMessage(msg.id); } catch { /* scoring must never break ingestion */ }

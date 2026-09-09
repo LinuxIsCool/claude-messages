@@ -81,6 +81,15 @@ export class EmailAdapter implements Adapter {
   private currentCursor: EmailCursor = { accounts: {} };
   private folders: string[] = ['INBOX'];
   private initialDays: number = 30;
+  /**
+   * Per-folder overrides for the initial window.
+   *
+   * `[Gmail]/All Mail` is the whole archive and wants years; INBOX wants a
+   * short window because everything past it arrives incrementally anyway. One
+   * global number cannot say both, and raising the global one would re-open
+   * every folder added later at archive depth by accident.
+   */
+  private folderInitialDays: Record<string, number> = {};
   private threadIndex: ThreadIndex = new Map();
   private knownContacts: Set<string> = new Set();
   private selfAddresses: Set<string> = new Set();
@@ -95,6 +104,7 @@ export class EmailAdapter implements Adapter {
       path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
     const secretsDir = path.join(dataDir, 'secrets');
     this.initialDays = config.initial_days ?? 30;
+    this.folderInitialDays = (config.folder_initial_days as Record<string, number>) ?? {};
 
     // Support both old `folder` (string) and new `folders` (array) config
     const configFolders = config.folders ?? config.folder;
@@ -331,8 +341,10 @@ export class EmailAdapter implements Adapter {
         // Incremental: fetch UIDs after last known
         searchQuery = { uid: `${folderCursor.lastUid + 1}:*` };
       } else {
-        // Initial sync: last N days
-        const cutoff = new Date(now.getTime() - this.initialDays * 24 * 60 * 60 * 1000);
+        // Initial sync: last N days for this folder
+        const days = this.folderInitialDays[folder] ?? this.initialDays;
+        const cutoff = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+        this.log(`[email] ${acct.id}/${folder} initial sync: since ${cutoff.toISOString().slice(0, 10)} (${days}d)`);
         searchQuery = { since: cutoff };
       }
 
@@ -464,6 +476,10 @@ export class EmailAdapter implements Adapter {
           metadata,
           platform_ts: (env.date ? new Date(env.date) : now).toISOString(),
           synced_at: now.toISOString(),
+          // One row per message, not one per folder. Only a real RFC Message-ID
+          // qualifies: the `${acct.id}-uid-${uid}` fallback above is folder-local,
+          // so using it here would claim two unrelated messages are the same one.
+          dedupe_key: env.messageId ? `email|${acct.id}|${env.messageId}` : null,
         };
         yield { type: 'message', data: message };
 
