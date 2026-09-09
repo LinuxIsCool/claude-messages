@@ -18,6 +18,12 @@ export class MessageDB {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
+    // WAL admits one writer at a time, and this corpus now has several: the
+    // daemon draining an adapter, the people pass, an importer, a backup. The
+    // default 5 s gave up mid-ingest on 2026-09-09 and cost the email adapter
+    // its cursor after 16,000 rows. Waiting is the correct behaviour for every
+    // one of these callers; failing is not.
+    this.db.pragma('busy_timeout = 60000');
     this.db.function('jaro_winkler', (a: unknown, b: unknown) =>
       (typeof a === 'string' && typeof b === 'string') ? jaroWinkler(a.toLowerCase(), b.toLowerCase()) : 0
     );
@@ -1283,7 +1289,7 @@ export class MessageDB {
 
   // --- BATCH SCORING ORCHESTRATOR ---
 
-  computeAllScores(config?: ScoringConfig): { computed: number; duration_ms: number } {
+  computeAllScores(config?: ScoringConfig): { computed: number; retracted: number; duration_ms: number } {
     const start = Date.now();
     const selfId = this.getConfig('self_identity_id');
     if (!selfId) throw new Error('self_identity_id not set in config. Call setConfig("self_identity_id", "<id>") first.');
@@ -1389,6 +1395,7 @@ export class MessageDB {
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
+    let retracted = 0;
     this.db.transaction(() => {
       for (const s of scores) {
         upsert.run(
@@ -1397,9 +1404,21 @@ export class MessageDB {
           s.composite, s.dunbar_layer, s.confidence, s.computed_at,
         );
       }
+      // A run that no longer scores someone has said something, and until now
+      // the table could not hear it. `INSERT OR REPLACE` leaves the old row
+      // standing, so on 2026-09-09 two scores computed on 2026-07-14 were still
+      // being served beside 132 fresh ones, and one of them sat at rank 15 of
+      // the live ranking on a two-month-old number. This run is the current
+      // answer; rows it did not produce are not.
+      const scored = new Set(scores.map(s => s.identity_id));
+      for (const row of this.db.prepare('SELECT identity_id FROM contact_scores').all() as Array<{ identity_id: string }>) {
+        if (scored.has(row.identity_id)) continue;
+        this.db.prepare('DELETE FROM contact_scores WHERE identity_id = ?').run(row.identity_id);
+        retracted++;
+      }
     })();
 
-    return { computed: scores.length, duration_ms: Date.now() - start };
+    return { computed: scores.length, retracted, duration_ms: Date.now() - start };
   }
 
   // --- SCORE QUERIES ---
@@ -3524,5 +3543,309 @@ export class MessageDB {
     apply();
 
     return { renamed, disagreements, already_named: alreadyNamed, protected_curated: protectedCurated, matched_identities: best.size };
+  }
+
+  // --- Admission (task-885 W3/N4): being counted stops requiring being known ---
+
+  /**
+   * Give every person the corpus has observed a row.
+   *
+   * `autoResolve` links people it can identify. Everyone it cannot stays out of
+   * the registry entirely, so the question "who writes to Shawn" has been
+   * answerable only about people who happened to carry a phone number or a name
+   * that matched across two platforms. Measured before this ran: 2,360 of the
+   * corpus's senders had no identity and carried 29,601 messages, 39% of it.
+   *
+   * Two populations, and the second is the larger one:
+   *
+   * - **Unlinked contacts.** A contacts row exists, nothing points at it. 2,456
+   *   of these, 2,137 with a display name.
+   * - **Senders with no contacts row at all.** 1,549 of these carrying 24,072
+   *   messages, the largest 7,423 on its own. Adapters create a contact for a
+   *   dialog, never for every member speaking inside a group, so a person can
+   *   write for years and leave nothing but a sender_id.
+   *
+   * Admission is not identification (P6). An admitted identity is named by
+   * whatever the corpus already calls it, which for the second population is a
+   * bare handle that `namesNobody` will recognise as naming nobody. It carries
+   * `admitted: true` in its metadata so merge review knows to look at it and so
+   * a surface can tell an observed row from a resolved person. Run merge review
+   * after this: without it, admission splits one person across their platforms
+   * (task-885 R1).
+   */
+  admitObserved(opts: { dryRun?: boolean; includeUnknownSenders?: boolean } = {}): {
+    from_contacts: number;
+    from_senders: number;
+    contacts_created: number;
+    by_platform: Record<string, number>;
+    skipped_self: number;
+  } {
+    const includeSenders = opts.includeUnknownSenders !== false;
+    const now = new Date().toISOString();
+    const selfId = this.getConfig('self_identity_id');
+    // Defence in depth. Every self sender is linked, so the unlinked filters
+    // below already exclude Shawn on the current corpus; this holds if a link
+    // is ever dropped while its contacts row survives.
+    const selfSenders = new Set(
+      (this.db.prepare(
+        "SELECT platform || ':' || platform_id AS sender_id FROM identity_links WHERE identity_id = ?"
+      ).all(selfId ?? '') as Array<{ sender_id: string }>).map(r => r.sender_id)
+    );
+
+    const byPlatform: Record<string, number> = {};
+    let fromContacts = 0, fromSenders = 0, contactsCreated = 0, skippedSelf = 0;
+
+    const run = this.db.transaction(() => {
+      const admit = (platform: string, platformId: string, name: string, from: 'contact' | 'sender',
+                     displayName?: string, username?: string) => {
+        const identity = this.createIdentity(name);
+        this.db.prepare('UPDATE identities SET metadata = ? WHERE id = ?')
+          .run(JSON.stringify({ admitted: true, admitted_at: now, admitted_from: from }), identity.id);
+        this.linkContact(identity.id, platform, platformId, 0.5, `admission:${from}`, displayName, username);
+        byPlatform[platform] = (byPlatform[platform] ?? 0) + 1;
+        return identity.id;
+      };
+
+      // 1. Contacts rows nothing points at.
+      const unlinked = this.db.prepare(`
+        SELECT c.* FROM contacts c
+        LEFT JOIN identity_links il
+          ON il.platform = c.platform AND il.platform_id = SUBSTR(c.id, LENGTH(c.platform) + 2)
+        WHERE il.id IS NULL
+      `).all() as Record<string, unknown>[];
+
+      for (const row of unlinked) {
+        const contact = this.parseContact(row);
+        if (selfSenders.has(contact.id)) { skippedSelf++; continue; }
+        const firstColon = contact.id.indexOf(':');
+        const platform = contact.id.substring(0, firstColon);
+        const platformId = contact.id.substring(firstColon + 1);
+        // The name is whatever the corpus already calls them. A handle is not a
+        // name, and stored as one it stays visible as a handle rather than
+        // becoming a fact about who this is.
+        const name = contact.display_name?.trim() || contact.username?.trim() || contact.phone?.trim() || contact.id;
+        fromContacts++;
+        if (opts.dryRun) { byPlatform[platform] = (byPlatform[platform] ?? 0) + 1; continue; }
+        admit(platform, platformId, name, 'contact', contact.display_name ?? undefined, contact.username ?? undefined);
+      }
+
+      if (!includeSenders) return;
+
+      // 2. Senders the corpus heard from and never wrote down.
+      const orphanSenders = this.db.prepare(`
+        SELECT m.sender_id AS sender_id, COUNT(*) AS n, MIN(m.platform_ts) AS first_ts, MAX(m.platform_ts) AS last_ts
+        FROM messages m
+        LEFT JOIN contacts c ON c.id = m.sender_id
+        LEFT JOIN identity_links il ON m.sender_id = il.platform || ':' || il.platform_id
+        WHERE m.sender_id IS NOT NULL AND c.id IS NULL AND il.id IS NULL
+        GROUP BY m.sender_id
+      `).all() as Array<{ sender_id: string; n: number; first_ts: string; last_ts: string }>;
+
+      for (const s of orphanSenders) {
+        if (selfSenders.has(s.sender_id)) { skippedSelf++; continue; }
+        const firstColon = s.sender_id.indexOf(':');
+        if (firstColon < 0) continue;
+        const platform = s.sender_id.substring(0, firstColon);
+        const platformId = s.sender_id.substring(firstColon + 1);
+        fromSenders++;
+        if (opts.dryRun) { byPlatform[platform] = (byPlatform[platform] ?? 0) + 1; continue; }
+        // The contacts row comes first so the store keeps one shape: every
+        // identity link points at a contact, whether or not anyone knows who it
+        // belongs to. first_seen and last_seen are the observed message range,
+        // which is the only thing about this person that is not a guess.
+        this.upsertContact({
+          id: s.sender_id, platform, display_name: null, username: null, phone: null,
+          metadata: { admitted: true, observed_messages: s.n },
+          first_seen: s.first_ts, last_seen: s.last_ts,
+        });
+        contactsCreated++;
+        admit(platform, platformId, s.sender_id, 'sender');
+      }
+    });
+    run();
+
+    return { from_contacts: fromContacts, from_senders: fromSenders, contacts_created: contactsCreated, by_platform: byPlatform, skipped_self: skippedSelf };
+  }
+
+  /**
+   * Merge candidates among identities, which is where they live after admission.
+   *
+   * `getMergeSuggestions` reads unlinked contacts, and after `admitObserved`
+   * there are none: every contact belongs to an identity, so the tool that was
+   * supposed to catch admission's splitting returns an empty list at exactly the
+   * moment it is needed. Same question, correct unit.
+   *
+   * Three evidence classes, and only the first is curated (task-885 D3, D7):
+   *
+   * - `address_book`  two identities whose handles point at the same entry in
+   *                   Shawn's own address book. He decided this when he typed
+   *                   the contact; the machine is reading it, not inferring it.
+   * - `phone`         two identities carrying the same normalised number.
+   * - `name`          two identities with the same full name on different
+   *                   platforms. Observed, not curated, and the weakest of the
+   *                   three: two people really can share a name.
+   *
+   * A single-token name never proposes, and neither do initials. 'Darren'
+   * matching 'Darren' is the failure that put Michelle Thuo's email under an
+   * identity called 'Michael H' and would have published Hash across 101
+   * transcripts. 'M D' matching 'M D' is the same failure wearing a space.
+   * Nothing fuzzy is generated at all: every wrong merge found on 2026-09-09
+   * came from a Jaro-Winkler score around 0.70.
+   */
+  identityMergeSuggestions(limit = 50): Array<{
+    kind: 'address_book' | 'phone' | 'name';
+    confidence: number;
+    evidence: string;
+    identities: Array<{ id: string; display_name: string; platforms: string[]; messages: number; admitted: boolean }>;
+  }> {
+    const rows = this.db.prepare(`
+      SELECT i.id, i.display_name, i.metadata,
+             GROUP_CONCAT(DISTINCT il.platform) AS platforms,
+             GROUP_CONCAT(il.platform || ':' || il.platform_id, char(10)) AS senders
+      FROM identities i JOIN identity_links il ON il.identity_id = i.id
+      GROUP BY i.id
+    `).all() as Array<{ id: string; display_name: string; metadata: string; platforms: string; senders: string }>;
+
+    const selfId = this.getConfig('self_identity_id');
+    const msgCounts = new Map<string, number>();
+    for (const r of this.db.prepare('SELECT sender_id, COUNT(*) AS n FROM messages WHERE sender_id IS NOT NULL GROUP BY sender_id')
+      .all() as Array<{ sender_id: string; n: number }>) msgCounts.set(r.sender_id, r.n);
+
+    const info = new Map<string, { id: string; display_name: string; platforms: string[]; messages: number; admitted: boolean; handles: string[] }>();
+    for (const r of rows) {
+      if (r.id === selfId) continue;
+      const handles = (r.senders ?? '').split('\n').filter(Boolean);
+      info.set(r.id, {
+        id: r.id,
+        display_name: r.display_name,
+        platforms: (r.platforms ?? '').split(',').filter(Boolean),
+        messages: handles.reduce((n, h) => n + (msgCounts.get(h) ?? 0), 0),
+        admitted: JSON.parse(r.metadata || '{}').admitted === true,
+        handles,
+      });
+    }
+
+    const out: ReturnType<MessageDB['identityMergeSuggestions']> = [];
+    const emitted = new Set<string>();
+    const emit = (kind: 'address_book' | 'phone' | 'name', confidence: number, evidence: string, ids: string[]) => {
+      const key = kind + '|' + [...ids].sort().join('|');
+      if (emitted.has(key) || ids.length < 2) return;
+      emitted.add(key);
+      out.push({ kind, confidence, evidence, identities: ids.map(id => {
+        const { handles, ...rest } = info.get(id)!;
+        return rest;
+      }) });
+    };
+
+    // 1. Curated: one address book entry, two identities.
+    const byEntry = new Map<number, { name: string; ids: Set<string> }>();
+    for (const [id, v] of info) {
+      for (const h of v.handles) {
+        const colon = h.indexOf(':');
+        const platform = h.slice(0, colon);
+        const value = h.slice(colon + 1);
+        const hit = platform === 'phone' ? this.addressBookLookup('phone', value)
+          : platform === 'email' ? this.addressBookLookup('email', value.replace(/^user:/, ''))
+          : null;
+        if (!hit || hit.ambiguous) continue;
+        const bucket = byEntry.get(hit.entry_id) ?? { name: hit.full_name, ids: new Set<string>() };
+        bucket.ids.add(id);
+        byEntry.set(hit.entry_id, bucket);
+      }
+    }
+    for (const [, bucket] of byEntry) {
+      if (bucket.ids.size < 2) continue;
+      emit('address_book', 1.0, `Shawn's address book names all of these '${bucket.name}'`, [...bucket.ids]);
+    }
+
+    // 2. The same phone number under two identities.
+    const byPhone = new Map<string, Set<string>>();
+    for (const [id, v] of info) {
+      for (const h of v.handles) {
+        if (!h.startsWith('phone:')) continue;
+        const value = h.slice('phone:'.length);
+        const set = byPhone.get(value) ?? new Set<string>();
+        set.add(id);
+        byPhone.set(value, set);
+      }
+    }
+    for (const [phone, ids] of byPhone) {
+      if (ids.size < 2) continue;
+      emit('phone', 0.9, `Both carry ${phone}`, [...ids]);
+    }
+
+    // 3. The same full name on different platforms.
+    const byName = new Map<string, string[]>();
+    for (const [id, v] of info) {
+      const n = v.display_name.trim().toLowerCase();
+      const tokens = n.split(/\s+/).filter(Boolean);
+      if (tokens.length < 2) continue;                       // a first name identifies nobody
+      if (tokens.some(t => t.replace(/[^a-z0-9]/g, '').length < 2)) continue;  // nor do initials: 'M D'
+      if (namesNobody(v.display_name)) continue;             // nor does a handle
+      byName.set(n, [...(byName.get(n) ?? []), id]);
+    }
+    for (const [name, ids] of byName) {
+      if (ids.length < 2) continue;
+      const platforms = new Set(ids.flatMap(id => info.get(id)!.platforms));
+      if (platforms.size < 2) continue;
+      emit('name', 0.6, `'${name}' on ${[...platforms].sort().join(' + ')}`, ids);
+    }
+
+    return out
+      .sort((a, b) => (b.confidence - a.confidence)
+        || (b.identities.reduce((n, i) => n + i.messages, 0) - a.identities.reduce((n, i) => n + i.messages, 0)))
+      .slice(0, limit);
+  }
+
+  /**
+   * Act on the evidence, and report what was acted on.
+   *
+   * P7 says a merge is confirmed and never automatic; Shawn confirms nothing by
+   * hand. Both hold at once, on two different grounds:
+   *
+   * - An `address_book` match is already his confirmation. He typed the name
+   *   beside the number, and a machine reading that is not guessing.
+   * - `phone` and `name` are the same evidence `autoResolve` already auto-links
+   *   contacts on (Pass 2 and Pass 4). Refusing to apply it between identities
+   *   while applying it between contacts would not be caution, it would be an
+   *   inconsistency that leaves Darren split four ways in the ranking.
+   *
+   * Every merge writes an `identity_events` row naming what was absorbed and
+   * why, so it is reviewable afterwards, which is the safeguard that makes
+   * acting rather than queueing the right default.
+   *
+   * The survivor is the identity with the most messages, so the merge keeps
+   * whichever row the rest of the corpus already points at.
+   */
+  applyEvidencedMerges(opts: { dryRun?: boolean; minConfidence?: number } = {}): {
+    merged: Array<{ kind: string; kept: string; absorbed: string[]; evidence: string }>;
+    held: Array<{ kind: string; confidence: number; evidence: string; names: string[] }>;
+  } {
+    const floor = opts.minConfidence ?? 0.6;
+    const suggestions = this.identityMergeSuggestions(1000);
+    const merged: Array<{ kind: string; kept: string; absorbed: string[]; evidence: string }> = [];
+
+    for (const s of suggestions.filter(x => x.confidence >= floor)) {
+      const ordered = [...s.identities].sort((a, b) => b.messages - a.messages);
+      const keep = ordered[0];
+      const absorb = ordered.slice(1);
+      merged.push({ kind: s.kind, kept: keep.display_name, absorbed: absorb.map(a => a.display_name), evidence: s.evidence });
+      if (opts.dryRun) continue;
+      for (const a of absorb) {
+        this._mergeIdentityRaw(a.id, keep.id);
+        this.logIdentityEvent(keep.id, 'merged_on_evidence', {
+          absorbed: a.id, absorbed_name: a.display_name, kind: s.kind, evidence: s.evidence,
+          claim_class: s.kind === 'address_book' ? 'curated' : 'observed',
+        });
+      }
+    }
+
+    return {
+      merged,
+      held: suggestions.filter(x => x.confidence < floor).map(s => ({
+        kind: s.kind, confidence: s.confidence, evidence: s.evidence,
+        names: s.identities.map(i => i.display_name),
+      })),
+    };
   }
 }
