@@ -24,9 +24,17 @@ function daemonHarness() {
   const updateCursor = vi.fn();
   Object.assign(daemon as unknown as Record<string, unknown>, {
     running: true,
-    config: { adapters: { email: { enabled: true, cooldown_after_failures: 0 } } },
+    config: {
+      adapters: {
+        email: { enabled: true, poll_interval: 30, cooldown_after_failures: 0 },
+        telegram: { enabled: true, poll_interval: 300, cooldown_after_failures: 0 },
+      },
+    },
     db: { getCursor: vi.fn(() => null), updateCursor },
     adapterHealth: new Map([['email', emailHealth()]]),
+    cycleCount: 0,
+    awareness: { emit: vi.fn() },
+    writeHealth: vi.fn(),
     log: vi.fn(),
     processEvent: vi.fn(),
   });
@@ -46,6 +54,53 @@ function failingEmailAdapter(): Adapter {
 }
 
 describe('Daemon email health', () => {
+  it('advances email while Telegram is still hung', async () => {
+    const { daemon, updateCursor } = daemonHarness();
+    let releaseTelegram!: () => void;
+    const telegramGate = new Promise<void>(resolve => { releaseTelegram = resolve; });
+    let telegramFinished = false;
+
+    const telegram: Adapter = {
+      platform: 'telegram',
+      init: vi.fn(async () => {}),
+      async *sync() {
+        await telegramGate;
+        telegramFinished = true;
+      },
+      getCursor: vi.fn(() => 'telegram-cursor'),
+      shutdown: vi.fn(async () => {}),
+    };
+    const email: Adapter = {
+      platform: 'email',
+      init: vi.fn(async () => {}),
+      async *sync() {
+        // Stop both loops after this first independent email pass.
+        (daemon as unknown as { running: boolean }).running = false;
+      },
+      getCursor: vi.fn(() => 'email-cursor'),
+      shutdown: vi.fn(async () => {}),
+    };
+    const health = (daemon as unknown as { adapterHealth: Map<string, AdapterHealth> }).adapterHealth;
+    health.set('telegram', { ...emailHealth(), platform: 'telegram' });
+    (daemon as unknown as { adapters: Adapter[] }).adapters = [telegram, email];
+    const pollIntervalMs = (daemon as unknown as { pollIntervalMs(adapter: Adapter): number })
+      .pollIntervalMs.bind(daemon);
+    expect(pollIntervalMs(email)).toBe(30_000);
+    expect(pollIntervalMs(telegram)).toBe(300_000);
+
+    const loops = (daemon as unknown as { startAdapterLoops(): Promise<void>[] })
+      .startAdapterLoops();
+
+    await vi.waitFor(() => {
+      expect(health.get('email')?.last_success).not.toBeNull();
+    });
+    expect(telegramFinished).toBe(false);
+    expect(updateCursor).toHaveBeenCalledWith('email', 'email-cursor');
+
+    releaseTelegram();
+    await Promise.all(loops);
+  });
+
   it('starts unhealthy when email initialization failed', () => {
     const { daemon } = daemonHarness();
     (daemon as unknown as { adapterInitErrors: Map<string, string> }).adapterInitErrors =
