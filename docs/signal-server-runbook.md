@@ -6,6 +6,10 @@ Run the already-linked Signal Desktop profile on the always-on server under a
 private Xvfb display. Keep the existing SQLCipher importer. This is smaller and
 safer than adding a second Signal client and a second message mapping.
 
+The launcher pins Electron to `--password-store=kwallet6`, matching the existing
+profile. Starting the same profile with Electron's headless `basic_text`
+fallback cannot decrypt its database key and is treated as a failed source.
+
 `signal-cli` is a viable later replacement, but it requires a new linked-device
 QR scan, stores separate credentials, and produces live envelopes that need a
 new importer. It cannot reuse Signal Desktop's linked-device state. The current
