@@ -59,6 +59,7 @@ describe('EmailAdapter connection readiness', () => {
     imapState.connectFailuresRemaining = 1;
     const adapter = new EmailAdapter(() => {});
     const config = {
+      enabled: true,
       data_dir: dataDir,
       accounts: [{
         id: 'primary',
@@ -82,7 +83,7 @@ describe('EmailAdapter connection readiness', () => {
   it('rejects an enabled adapter with zero accounts instead of disabling silently', async () => {
     const adapter = new EmailAdapter(() => {});
 
-    await expect(adapter.init({ data_dir: dataDir, accounts: [] })).rejects.toThrow(
+    await expect(adapter.init({ enabled: true, data_dir: dataDir, accounts: [] })).rejects.toThrow(
       'zero configured accounts',
     );
     await expect(drain(adapter.sync(null))).rejects.toThrow('zero configured accounts');
