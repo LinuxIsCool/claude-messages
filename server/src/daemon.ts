@@ -6,6 +6,7 @@ import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
 import { TelegramAdapter } from './adapters/telegram.js';
 import { SignalAdapter } from './adapters/signal.js';
+import { SignalCliAdapter } from './adapters/signal-cli.js';
 import { EmailAdapter } from './adapters/email.js';
 import { SlackAdapter } from './adapters/slack.js';
 import { WhatsAppAdapter } from './adapters/whatsapp.js';
@@ -73,7 +74,12 @@ export class Daemon {
     // Signal FIRST — reads from local SQLite, zero network dependency, instant sync.
     // Must run before network-dependent adapters to avoid head-of-line blocking.
     if (adapterConfigs.signal?.enabled) {
-      const adapter = new SignalAdapter((msg) => this.log(msg));
+      const signalBackend = process.env.LEGION_SIGNAL_BACKEND
+        ?? adapterConfigs.signal.backend
+        ?? 'desktop';
+      const adapter = signalBackend === 'signal-cli'
+        ? new SignalCliAdapter((msg) => this.log(msg))
+        : new SignalAdapter((msg) => this.log(msg));
       // Keep Signal visible in health even when a static dependency is absent.
       this.adapters.push(adapter);
       try {
