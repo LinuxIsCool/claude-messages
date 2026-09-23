@@ -1,0 +1,18 @@
+[Unit]
+Description=Signal Desktop always-on observation source
+Documentation=https://github.com/signalapp/Signal-Desktop
+After=network-online.target
+Wants=network-online.target
+Before=legion-messages.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/claude-messages/run-signal-desktop-headless.sh
+Environment=HOME=%h
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

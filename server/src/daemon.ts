@@ -73,12 +73,14 @@ export class Daemon {
     // Signal FIRST — reads from local SQLite, zero network dependency, instant sync.
     // Must run before network-dependent adapters to avoid head-of-line blocking.
     if (adapterConfigs.signal?.enabled) {
+      const adapter = new SignalAdapter((msg) => this.log(msg));
+      // Keep Signal visible in health even when a static dependency is absent.
+      this.adapters.push(adapter);
       try {
-        const adapter = new SignalAdapter((msg) => this.log(msg));
         await adapter.init({ ...adapterConfigs.signal, data_dir: dataDir } as AdapterConfig);
-        this.adapters.push(adapter);
         this.log('Signal adapter initialized');
       } catch (err) {
+        this.adapterInitErrors.set(adapter.platform, String(err));
         this.log(`Signal adapter failed to initialize: ${err}`);
       }
     }
@@ -182,6 +184,8 @@ export class Daemon {
       timed_out: false,
       skipped: false,
       cooldown_until: null,
+      source_observed_at: null,
+      source_evidence: null,
     };
   }
 
@@ -206,6 +210,8 @@ export class Daemon {
           timed_out: previousHealth.timed_out,
           skipped: previousHealth.skipped ?? false,
           cooldown_until: previousHealth.cooldown_until ?? null,
+          source_observed_at: previousHealth.source_observed_at ?? null,
+          source_evidence: previousHealth.source_evidence ?? null,
         });
       }
     } catch (err) {
@@ -219,6 +225,9 @@ export class Daemon {
 
   private cooldownAfterFailures(platform: string): number {
     const configured = this.adapterConfigFor(platform)?.cooldown_after_failures;
+    // Signal Desktop reconnects without intervention. Probe every cycle so a
+    // recovered source is not hidden behind the generic one-hour cooldown.
+    if (platform === 'signal' && typeof configured !== 'number') return 0;
     return typeof configured === 'number'
       ? configured
       : Daemon.DEFAULT_COOLDOWN_AFTER_FAILURES;
@@ -376,6 +385,9 @@ export class Daemon {
       // Update adapter health
       const health = this.adapterHealth.get(adapter.platform);
       if (health) {
+        const sourceObservation = adapter.getSourceObservation?.() ?? null;
+        health.source_observed_at = sourceObservation?.observed_at ?? null;
+        health.source_evidence = sourceObservation?.evidence ?? null;
         health.last_duration_ms = Date.now() - syncStartMs;
         health.last_yield = { messages: msgCount, threads: threadCount, contacts: contactCount };
         health.timed_out = timedOut;

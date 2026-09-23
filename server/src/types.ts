@@ -34,6 +34,15 @@ export interface Message {
   metadata: Record<string, unknown>;
   platform_ts: string;      // ISO 8601
   synced_at: string;
+  /**
+   * Identity across containers, where `id` is identity within one.
+   *
+   * One email lives in INBOX and in `[Gmail]/All Mail` under two different
+   * UIDs, so folder+UID makes it two rows. Its RFC Message-ID makes it one.
+   * Null when the platform has no such notion, and null is not a value: many
+   * rows may carry it without colliding.
+   */
+  dedupe_key?: string | null;
 }
 
 export type SyncEventType = 'contact' | 'thread' | 'message';
@@ -50,9 +59,16 @@ export interface AdapterConfig {
   [key: string]: unknown;
 }
 
+export interface AwarenessConfig {
+  enabled?: boolean;
+  desktop?: { enabled?: boolean; quiet_hours?: { start: string; end: string } };
+  statusline?: { enabled?: boolean };
+}
+
 export interface AppConfig {
   data_dir: string;
   adapters: Record<string, AdapterConfig>;
+  awareness?: AwarenessConfig;
 }
 
 export interface SyncCursor {
@@ -256,6 +272,9 @@ export interface AdapterHealth {
   timed_out: boolean;                // true if last sync was a timeout
   skipped?: boolean;                 // true if this cycle intentionally skipped the adapter
   cooldown_until?: string | null;     // ISO 8601 time before retrying a failing adapter
+  skip_reason?: string | null;        // display-only "skipped until X" message; never overwrites last_error
+  source_observed_at?: string | null; // direct upstream observation, not an empty local-cache poll
+  source_evidence?: string | null;    // human-readable description of the observation
 }
 
 /** Top-level daemon health file — shared contract for all Legion daemons */
@@ -268,4 +287,58 @@ export interface DaemonHealth {
   cycle_count: number;               // total sync cycles since start
   cycle_duration_ms: number;         // duration of last full syncAll()
   adapters: Record<string, AdapterHealth>;
+}
+
+export interface PriorityRule {
+  id: number;
+  rule_type: string;
+  match_value: string;
+  importance_floor: number;
+  tier_floor: string;
+  note: string | null;
+  enabled: number;
+  created_at: string;
+}
+
+export interface Cohort {
+  id: number;
+  name: string;
+  description: string | null;
+  created_at: string;
+}
+
+export interface MessagePriority {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+}
+
+export interface AwarenessCounts {
+  critical: number;
+  exceptional: number;
+}
+
+export interface InboxEntry {
+  message_id: string;
+  importance: number;
+  urgency: number;
+  attention: number;
+  tier: string;
+  source: string;
+  model_version: string | null;
+  rationale: string | null;
+  needs_llm: number;
+  seen: number;
+  scored_at: string;
+  content: string | null;
+  sender_id: string | null;
+  thread_id: string | null;
 }
