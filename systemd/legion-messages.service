@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=%h/.local/share/fnm/aliases/default/bin/node %h/.claude/plugins/local/legion-plugins/plugins/claude-messages/server/build/daemon.mjs
 Environment=HOME=%h
-Restart=on-failure
+Restart=always
 RestartSec=30
 StandardOutput=null
 StandardError=journal
