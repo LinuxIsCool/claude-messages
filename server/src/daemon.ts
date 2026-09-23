@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
@@ -16,7 +17,7 @@ function resolveHome(p: string): string {
   return p;
 }
 
-class Daemon {
+export class Daemon {
   private config: AppConfig;
   private db: MessageDB;
   private eventLog: EventLog;
@@ -29,6 +30,7 @@ class Daemon {
   private startedAt: string = '';
   private cycleCount: number = 0;
   private adapterHealth: Map<string, AdapterHealth> = new Map();
+  private adapterInitErrors: Map<string, string> = new Map();
 
   constructor() {
     const configPath = resolveHome('~/.claude/local/messages/config.yml');
@@ -83,12 +85,15 @@ class Daemon {
     }
 
     if (adapterConfigs.email?.enabled) {
+      const adapter = new EmailAdapter((msg) => this.log(msg));
+      // Keep the adapter registered even when its first network connection
+      // fails. Its next sync cycle retries the retained account definitions.
+      this.adapters.push(adapter);
       try {
-        const adapter = new EmailAdapter((msg) => this.log(msg));
         await adapter.init({ ...adapterConfigs.email, data_dir: dataDir } as AdapterConfig);
-        this.adapters.push(adapter);
         this.log('Email adapter initialized');
       } catch (err) {
+        this.adapterInitErrors.set(adapter.platform, String(err));
         this.log(`Email adapter failed to initialize: ${err}`);
       }
     }
@@ -128,19 +133,7 @@ class Daemon {
     this.startedAt = new Date().toISOString();
     this.cycleCount = 0;
     for (const adapter of this.adapters) {
-      this.adapterHealth.set(adapter.platform, {
-        platform: adapter.platform,
-        tier: Daemon.ADAPTER_TIERS[adapter.platform] ?? 2,
-        last_success: null,
-        last_failure: null,
-        last_error: null,
-        last_duration_ms: 0,
-        last_yield: { messages: 0, threads: 0, contacts: 0 },
-        consecutive_failures: 0,
-        timed_out: false,
-        skipped: false,
-        cooldown_until: null,
-      });
+      this.adapterHealth.set(adapter.platform, this.initialHealth(adapter));
     }
     this.seedHealthFromPreviousRun();
 
@@ -175,6 +168,23 @@ class Daemon {
     slack: 2,
   };
 
+  private initialHealth(adapter: Adapter): AdapterHealth {
+    const initError = this.adapterInitErrors.get(adapter.platform) ?? null;
+    return {
+      platform: adapter.platform,
+      tier: Daemon.ADAPTER_TIERS[adapter.platform] ?? 2,
+      last_success: null,
+      last_failure: initError ? new Date().toISOString() : null,
+      last_error: initError,
+      last_duration_ms: 0,
+      last_yield: { messages: 0, threads: 0, contacts: 0 },
+      consecutive_failures: initError ? 1 : 0,
+      timed_out: false,
+      skipped: false,
+      cooldown_until: null,
+    };
+  }
+
   private seedHealthFromPreviousRun(): void {
     try {
       if (!fs.existsSync(this.healthPath)) return;
@@ -182,14 +192,17 @@ class Daemon {
       for (const [platform, current] of this.adapterHealth.entries()) {
         const previousHealth = previous.adapters?.[platform];
         if (!previousHealth) continue;
+        const currentInitFailed = this.adapterInitErrors.has(platform);
         this.adapterHealth.set(platform, {
           ...current,
           last_success: previousHealth.last_success,
-          last_failure: previousHealth.last_failure,
-          last_error: previousHealth.last_error,
+          last_failure: currentInitFailed ? current.last_failure : previousHealth.last_failure,
+          last_error: currentInitFailed ? current.last_error : previousHealth.last_error,
           last_duration_ms: previousHealth.last_duration_ms,
           last_yield: previousHealth.last_yield,
-          consecutive_failures: previousHealth.consecutive_failures,
+          consecutive_failures: currentInitFailed
+            ? Math.max(1, previousHealth.consecutive_failures)
+            : previousHealth.consecutive_failures,
           timed_out: previousHealth.timed_out,
           skipped: previousHealth.skipped ?? false,
           cooldown_until: previousHealth.cooldown_until ?? null,
@@ -297,6 +310,7 @@ class Daemon {
     let contactCount = 0;
     let threadCount = 0;
     let timedOut = false;
+    let syncError: unknown = null;
 
     // Capture the generator so we can cancel it on timeout
     const gen = adapter.sync(cursor);
@@ -328,27 +342,17 @@ class Daemon {
     try {
       await Promise.race([syncWork(), timeoutPromise]);
     } catch (err) {
-      // Track health for non-timeout errors before re-throwing
-      if (!timedOut) {
-        const health = this.adapterHealth.get(adapter.platform);
-        if (health) {
-          health.last_failure = new Date().toISOString();
-          health.last_error = String(err);
-          health.consecutive_failures++;
-          health.last_duration_ms = Date.now() - syncStartMs;
-          health.skipped = false;
-          this.startFailureCooldown(adapter.platform, health);
-        }
-        throw err;
-      }
-      this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
+      syncError = err;
+      if (timedOut) this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
     } finally {
       // Clear timeout if sync finished before it fired
       if (timeoutTimer) clearTimeout(timeoutTimer);
 
-      // Always save cursor — even partial progress avoids re-processing on next cycle
+      // Save successful progress. A failed zero-yield pass must not advance the
+      // cursor timestamp and masquerade as source freshness.
       const newCursor = adapter.getCursor();
-      if (newCursor) {
+      const processedEvents = msgCount + contactCount + threadCount;
+      if (newCursor && (!syncError || processedEvents > 0)) {
         this.db.updateCursor(adapter.platform, newCursor);
       }
 
@@ -359,9 +363,11 @@ class Daemon {
         health.last_yield = { messages: msgCount, threads: threadCount, contacts: contactCount };
         health.timed_out = timedOut;
         health.skipped = false;
-        if (timedOut) {
+        if (syncError) {
           health.last_failure = new Date().toISOString();
-          health.last_error = `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`;
+          health.last_error = timedOut
+            ? `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`
+            : String(syncError);
           health.consecutive_failures++;
           this.startFailureCooldown(adapter.platform, health);
         } else {
@@ -372,9 +378,14 @@ class Daemon {
         }
       }
 
-      const suffix = timedOut ? ' (partial — timed out)' : '';
-      this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts${suffix}`);
+      if (syncError) {
+        this.log(`${adapter.platform} sync failed after ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts: ${String(syncError)}`);
+      } else {
+        this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts`);
+      }
     }
+
+    if (syncError) throw syncError;
   }
 
   private processEvent(event: SyncEvent): void {
@@ -432,19 +443,21 @@ class Daemon {
   }
 }
 
-// Main
-const daemon = new Daemon();
+// Main. The guard keeps importing Daemon in regression tests side-effect free.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const daemon = new Daemon();
 
-process.on('SIGTERM', async () => {
-  await daemon.shutdown();
-  process.exit(0);
-});
-process.on('SIGINT', async () => {
-  await daemon.shutdown();
-  process.exit(0);
-});
+  process.on('SIGTERM', async () => {
+    await daemon.shutdown();
+    process.exit(0);
+  });
+  process.on('SIGINT', async () => {
+    await daemon.shutdown();
+    process.exit(0);
+  });
 
-daemon.start().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+  daemon.start().catch(err => {
+    console.error('Fatal:', err);
+    process.exit(1);
+  });
+}
