@@ -2,57 +2,47 @@
 
 ## Decision
 
-Run the already-linked Signal Desktop profile on the always-on server under a
-private Xvfb display. Keep the existing SQLCipher importer. This is smaller and
-safer than adding a second Signal client and a second message mapping.
+Use `signal-cli` as a dedicated linked device on the always-on server. The
+message adapter invokes `receive` directly, stores every non-empty response as
+an immutable JSONL capture before parsing, and advances its cursor only after
+the database accepts the events.
 
-The launcher pins Electron to `--password-store=kwallet6`, matching the existing
-profile. Starting the same profile with Electron's headless `basic_text`
-fallback cannot decrypt its database key and is treated as a failed source.
-
-`signal-cli` is a viable later replacement, but it requires a new linked-device
-QR scan, stores separate credentials, and produces live envelopes that need a
-new importer. It cannot reuse Signal Desktop's linked-device state. The current
-server already has a linked Signal Desktop profile and its encrypted history.
+Signal Desktop under Xvfb was rejected after live proof. The server profile's
+database key is protected by KWallet6. KWallet needs an interactive unlock
+after reboot, so that design cannot provide unattended recovery. `signal-cli`
+is built for servers and keeps independent linked-device credentials without a
+desktop keyring.
 
 ## Install
 
 From this repository on the server:
 
 ```bash
-bash scripts/install-signal-headless-user.sh
+bash scripts/install-signal-cli-user.sh
 ```
 
-The installer downloads Xvfb into `~/.local/opt` when it is not installed
-system-wide. It installs user services. It does not read, replace, link, or
-unlink Signal credentials, and it does not start Signal Desktop.
+The installer downloads the current native release to `~/.local/opt`, links it
+from `~/.local/bin`, and configures the message service to select the
+`signal-cli` backend. It does not link Signal or restart the message daemon.
 
-Add these settings to the existing Signal adapter block in
-`~/.claude/local/messages/config.yml`:
+## One-time human action
 
-```yaml
-  signal:
-    enabled: true
-    poll_interval: 60
-    db_path: ~/.config/Signal/sql/db.sqlite
-    source_log_path: ~/.config/Signal/logs/app.log
-    source_max_age_seconds: 180
-    cooldown_after_failures: 0
-```
-
-Then start and enable the source:
+Run this in an interactive terminal connected to the server:
 
 ```bash
-systemctl --user enable --now claude-signal-desktop.service
+~/.local/bin/signal-cli link --name "Legion Observation"
+```
+
+The command prints a QR code. On the phone, open Signal Settings, select
+**Linked devices**, select **Link New Device**, and scan that QR code. Do not
+remove the existing laptop or desktop devices. Keep the command running until
+it reports that linking completed.
+
+## Activate and verify
+
+```bash
 systemctl --user restart legion-messages.service
-```
-
-## Verify the real source
-
-Wait up to three minutes, then run:
-
-```bash
-systemctl --user is-active claude-signal-desktop.service legion-messages.service
+sleep 10
 jq '.adapters.signal | {
   last_success,
   last_failure,
@@ -63,31 +53,35 @@ jq '.adapters.signal | {
 bash scripts/check-messages-health.sh
 ```
 
-The lane is healthy only when `source_observed_at` is recent and
-`source_evidence` says `signal-desktop authenticated websocket keepalive`.
-Reading a frozen `db.sqlite` does not count as source access.
+Healthy Signal observation requires:
 
-## Failure behavior
+```text
+source_evidence = signal-cli successful receive request
+consecutive_failures = 0
+```
 
-The Signal Desktop service restarts after a crash. The message daemon probes
-the authenticated websocket evidence every poll without a failure cooldown.
-If Signal Desktop is disconnected, Signal sync turns red while email and
-Telegram continue independently.
+A successful empty `receive` is valid source access. A readable frozen Signal
+Desktop database is not.
+
+## Recovery and custody
+
+Raw non-empty responses are retained in:
+
+```text
+~/.claude/local/messages/raw/signal-cli/
+```
+
+If the daemon stops after receiving but before storing an event, the next cycle
+replays every capture newer than the committed cursor. Message IDs are stable,
+so replay is idempotent.
+
+`signal-cli` must be updated within three months of a release because Signal
+server compatibility changes. Re-run the installer monthly and verify the
+version plus one successful source observation.
 
 ## Rollback
 
-```bash
-systemctl --user disable --now claude-signal-desktop.service
-rm ~/.config/systemd/user/legion-messages.service.d/signal-source.conf
-systemctl --user daemon-reload
-systemctl --user restart legion-messages.service
-```
-
-This leaves the Signal Desktop profile and message database unchanged.
-
-## Human action only if the existing link has expired
-
-Open Signal Desktop in a graphical session on the server. On the phone, open
-Signal Settings, select **Linked devices**, select **Link New Device**, and scan
-the QR code. Do not remove the existing laptop device. This is not required
-while the server's existing profile still authenticates.
+Remove the `LEGION_SIGNAL_BACKEND` line from the user service drop-in, reload
+the user manager, and restart `legion-messages.service`. Do not delete the
+`signal-cli` account data. Keeping it preserves queued messages and makes
+rollback reversible.
