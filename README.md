@@ -110,7 +110,7 @@ After=network-online.target
 [Service]
 Type=simple
 ExecStart=/path/to/node /path/to/claude-messages/server/build/daemon.mjs
-Restart=on-failure
+Restart=always
 RestartSec=10
 Environment=HOME=%h
 
