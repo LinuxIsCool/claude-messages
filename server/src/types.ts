@@ -273,6 +273,8 @@ export interface AdapterHealth {
   skipped?: boolean;                 // true if this cycle intentionally skipped the adapter
   cooldown_until?: string | null;     // ISO 8601 time before retrying a failing adapter
   skip_reason?: string | null;        // display-only "skipped until X" message; never overwrites last_error
+  source_observed_at?: string | null; // direct upstream observation, not an empty local-cache poll
+  source_evidence?: string | null;    // human-readable description of the observation
 }
 
 /** Top-level daemon health file — shared contract for all Legion daemons */

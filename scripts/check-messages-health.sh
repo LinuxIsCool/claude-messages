@@ -28,6 +28,7 @@ DAEMON_THRESHOLD=1200   # 20 min (cycle ~8min + poll ~60s + generous margin)
 # Failure escalation: how many consecutive failures before declaring the adapter dead
 # (independent of staleness). A single fresh cycle that fails is noise; 2+ is a pattern.
 FAILURE_THRESHOLD=1
+SIGNAL_SOURCE_THRESHOLD=300  # authenticated websocket evidence must be recent
 
 NOW_EPOCH=$(date +%s)
 
@@ -74,6 +75,27 @@ for PLATFORM in $(echo "$HEALTH" | jq -r '.adapters | keys[]'); do
   CONSECUTIVE_FAILURES=$(echo "$ADAPTER" | jq -r '.consecutive_failures')
   LAST_ERROR=$(echo "$ADAPTER" | jq -r '.last_error')
   TIMED_OUT=$(echo "$ADAPTER" | jq -r '.timed_out')
+
+  # Signal's local database remains readable when Signal Desktop is offline.
+  # Require independent evidence from its authenticated websocket, so an empty
+  # poll against a frozen cache cannot make the lane green.
+  if [[ "$PLATFORM" == "signal" ]]; then
+    SOURCE_OBSERVED_AT=$(echo "$ADAPTER" | jq -r '.source_observed_at // "null"')
+    SOURCE_ERROR=""
+    if [[ "$SOURCE_OBSERVED_AT" == "null" ]]; then
+      SOURCE_ERROR="no source observation"
+    else
+      SOURCE_EPOCH=$(date -d "$SOURCE_OBSERVED_AT" +%s 2>/dev/null || echo 0)
+      SOURCE_AGE=$((NOW_EPOCH - SOURCE_EPOCH))
+      if [[ $SOURCE_AGE -gt $SIGNAL_SOURCE_THRESHOLD ]]; then
+        SOURCE_ERROR="source observation ${SOURCE_AGE}s old"
+      fi
+    fi
+    if [[ -n "$SOURCE_ERROR" && "$CONSECUTIVE_FAILURES" -lt "$FAILURE_THRESHOLD" ]]; then
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      FAIL_ADAPTERS="${FAIL_ADAPTERS} signal(${SOURCE_ERROR})"
+    fi
+  fi
 
   # Determine staleness threshold
   if [[ "$TIER" -eq 0 ]]; then

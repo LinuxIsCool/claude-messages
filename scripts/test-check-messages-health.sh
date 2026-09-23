@@ -113,6 +113,8 @@ cat > "$TMPDIR/t3/.claude/local/messages/health.json" <<EOF
       "last_duration_ms": 16,
       "last_yield": {"messages":2,"threads":0,"contacts":0},
       "consecutive_failures": 0, "timed_out": false,
+      "source_observed_at": "$NOW",
+      "source_evidence": "signal-desktop authenticated websocket keepalive",
       "skipped": false, "cooldown_until": null, "skip_reason": null
     }
   }
@@ -147,6 +149,8 @@ cat > "$TMPDIR/t4/.claude/local/messages/health.json" <<EOF
       "last_duration_ms": 16,
       "last_yield": {"messages":2,"threads":0,"contacts":0},
       "consecutive_failures": 0, "timed_out": false,
+      "source_observed_at": "$NOW",
+      "source_evidence": "signal-desktop authenticated websocket keepalive",
       "skipped": false, "cooldown_until": null, "skip_reason": null
     }
   }
@@ -179,6 +183,34 @@ cat > "$TMPDIR/t5/.claude/local/messages/health.json" <<EOF
 }
 EOF
 check "$TMPDIR/t5" 1 "stale + consecutive_failures=27"
+
+# Test 6: a recent empty poll against a frozen local DB must not mask a dead
+# Signal Desktop websocket.
+echo ""
+echo "=== Test 6: stale Signal source with fresh empty poll -> exit 1 ==="
+mkdir -p "$TMPDIR/t6/.claude/local/messages"
+cat > "$TMPDIR/t6/.claude/local/messages/health.json" <<EOF
+{
+  "daemon": "test", "version": "1.0", "pid": 1,
+  "started_at": "$NOW",
+  "last_cycle": "$FIVE_M",
+  "cycle_count": 42, "cycle_duration_ms": 20,
+  "adapters": {
+    "signal": {
+      "platform": "signal", "tier": 0,
+      "last_success": "$NOW",
+      "last_failure": null, "last_error": null,
+      "last_duration_ms": 16,
+      "last_yield": {"messages":0,"threads":0,"contacts":0},
+      "consecutive_failures": 0, "timed_out": false,
+      "source_observed_at": "$ONE_H",
+      "source_evidence": "signal-desktop authenticated websocket keepalive",
+      "skipped": false, "cooldown_until": null, "skip_reason": null
+    }
+  }
+}
+EOF
+check "$TMPDIR/t6" 1 "fresh empty poll cannot hide stale Signal source"
 
 echo ""
 echo "=== SUMMARY ==="
