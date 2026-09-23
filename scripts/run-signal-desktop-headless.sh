@@ -57,6 +57,12 @@ if [[ ! -S "/tmp/.X11-unix/X${DISPLAY_NUMBER}" ]]; then
   exit 4
 fi
 
+# KWallet is D-Bus activated outside this process tree. Publish the private
+# display to the user bus before Electron requests kwalletd6, otherwise the
+# wallet daemon starts without DISPLAY and the existing encrypted key is
+# unreadable.
+dbus-update-activation-environment --systemd DISPLAY
+
 "$SIGNAL_DESKTOP_BIN" \
   --password-store=kwallet6 \
   --disable-gpu \
