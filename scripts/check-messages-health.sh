@@ -37,7 +37,7 @@ if [[ ! -f "$HEALTH_FILE" ]]; then
   MSG="legion-messages health.json missing — daemon may not be running"
   mkdir -p "$(dirname "$ALERT_LOG")" 2>/dev/null || true
   echo "$(date -Iseconds) CRITICAL $MSG" >> "$ALERT_LOG"
-  notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
+  timeout 5s notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
   exit 2
 fi
 
@@ -54,7 +54,7 @@ DAEMON_AGE=$((NOW_EPOCH - LAST_CYCLE_EPOCH))
 if [[ $DAEMON_AGE -gt $DAEMON_THRESHOLD ]]; then
   MSG="${DAEMON_NAME} last cycle ${DAEMON_AGE}s ago (threshold: ${DAEMON_THRESHOLD}s) — daemon may be stuck"
   echo "$(date -Iseconds) CRITICAL $MSG" >> "$ALERT_LOG"
-  notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
+  timeout 5s notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
   exit 1
 fi
 
@@ -145,7 +145,7 @@ done
 if [[ $FAIL_COUNT -gt 0 ]]; then
   MSG="FAIL_COUNT=${FAIL_COUNT} adapter(s) with consecutive failures:${FAIL_ADAPTERS}"
   echo "$(date -Iseconds) CRITICAL $MSG" >> "$ALERT_LOG"
-  notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
+  timeout 5s notify-send -u critical "Messages Daemon" "$MSG" 2>/dev/null || true
   exit 1
 fi
 
@@ -153,7 +153,7 @@ fi
 if [[ $STALE_COUNT -gt 0 ]]; then
   MSG="${STALE_COUNT} stale adapter(s):${STALE_ADAPTERS}"
   echo "$(date -Iseconds) WARNING $MSG" >> "$ALERT_LOG"
-  notify-send -u normal "Messages Sync" "$MSG" 2>/dev/null || true
+  timeout 5s notify-send -u normal "Messages Sync" "$MSG" 2>/dev/null || true
   exit 1
 fi
 
