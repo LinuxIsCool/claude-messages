@@ -13,3 +13,4 @@ const receipt = projectGmailSchedule({
 });
 
 console.log(JSON.stringify(receipt));
+if (receipt.status !== 'ok') process.exitCode = 1;

@@ -15,6 +15,8 @@ set -euo pipefail
 
 HEALTH_FILE="${HOME}/.claude/local/messages/health.json"
 ALERT_LOG="${HOME}/.claude/local/messages/health-alerts.log"
+GMAIL_SCHEDULE_RECEIPT="${HOME}/.claude/local/calendar/gmail-schedule-observation.json"
+REQUIRE_GMAIL_SCHEDULE="${REQUIRE_GMAIL_SCHEDULE:-1}"
 
 # Staleness thresholds per tier (seconds)
 # Tier-0 adapters sync in <1s but the full cycle takes ~8 min (Telegram scans 881 dialogs).
@@ -29,6 +31,7 @@ DAEMON_THRESHOLD=1200   # 20 min (cycle ~8min + poll ~60s + generous margin)
 # (independent of staleness). A single fresh cycle that fails is noise; 2+ is a pattern.
 FAILURE_THRESHOLD=1
 SIGNAL_SOURCE_THRESHOLD=300  # authenticated websocket evidence must be recent
+GMAIL_SCHEDULE_THRESHOLD=600
 
 NOW_EPOCH=$(date +%s)
 
@@ -143,6 +146,39 @@ for PLATFORM in $(echo "$HEALTH" | jq -r '.adapters | keys[]'); do
     FAIL_ADAPTERS="${FAIL_ADAPTERS} ${PLATFORM}(failures=${CONSECUTIVE_FAILURES}${TIMEOUT_FLAG}${ERROR_SNIPPET})"
   fi
 done
+
+# Gmail is the authoritative mailbox for invitation and cancellation messages.
+# Its derived schedule is a separate observation lane and must not inherit green
+# status from email ingestion unless the projection is also fresh and complete.
+if [[ "$REQUIRE_GMAIL_SCHEDULE" == "1" ]]; then
+  SCHEDULE_ERROR=""
+  if [[ ! -f "$GMAIL_SCHEDULE_RECEIPT" ]]; then
+    SCHEDULE_ERROR="missing receipt"
+  else
+    SCHEDULE_STATUS=$(jq -r '.status // "unknown"' "$GMAIL_SCHEDULE_RECEIPT" 2>/dev/null || echo "invalid")
+    SCHEDULE_PROJECTED_AT=$(jq -r '.projection_at // "null"' "$GMAIL_SCHEDULE_RECEIPT" 2>/dev/null || echo "null")
+    SCHEDULE_SOURCE_AT=$(jq -r '.source_contact_at // "null"' "$GMAIL_SCHEDULE_RECEIPT" 2>/dev/null || echo "null")
+    if [[ "$SCHEDULE_STATUS" != "ok" ]]; then
+      SCHEDULE_ERROR="status=${SCHEDULE_STATUS}"
+    elif [[ "$SCHEDULE_PROJECTED_AT" == "null" || "$SCHEDULE_SOURCE_AT" == "null" ]]; then
+      SCHEDULE_ERROR="missing projection or source evidence"
+    else
+      SCHEDULE_EPOCH=$(date -d "$SCHEDULE_PROJECTED_AT" +%s 2>/dev/null || echo 0)
+      SCHEDULE_SOURCE_EPOCH=$(date -d "$SCHEDULE_SOURCE_AT" +%s 2>/dev/null || echo 0)
+      SCHEDULE_AGE=$((NOW_EPOCH - SCHEDULE_EPOCH))
+      SCHEDULE_SOURCE_AGE=$((NOW_EPOCH - SCHEDULE_SOURCE_EPOCH))
+      if [[ $SCHEDULE_AGE -gt $GMAIL_SCHEDULE_THRESHOLD ]]; then
+        SCHEDULE_ERROR="projection ${SCHEDULE_AGE}s old"
+      elif [[ $SCHEDULE_SOURCE_AGE -gt $GMAIL_SCHEDULE_THRESHOLD ]]; then
+        SCHEDULE_ERROR="source observation ${SCHEDULE_SOURCE_AGE}s old"
+      fi
+    fi
+  fi
+  if [[ -n "$SCHEDULE_ERROR" ]]; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    FAIL_ADAPTERS="${FAIL_ADAPTERS} gmail-schedule(${SCHEDULE_ERROR})"
+  fi
+fi
 
 # --- Report failures first (they are more urgent than staleness) ---
 if [[ $FAIL_COUNT -gt 0 ]]; then
