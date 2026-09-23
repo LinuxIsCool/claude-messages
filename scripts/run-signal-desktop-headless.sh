@@ -57,6 +57,9 @@ if [[ ! -S "/tmp/.X11-unix/X${DISPLAY_NUMBER}" ]]; then
   exit 4
 fi
 
-"$SIGNAL_DESKTOP_BIN" --disable-gpu --disable-dev-shm-usage &
+"$SIGNAL_DESKTOP_BIN" \
+  --password-store=kwallet6 \
+  --disable-gpu \
+  --disable-dev-shm-usage &
 signal_pid=$!
 wait "$signal_pid"
