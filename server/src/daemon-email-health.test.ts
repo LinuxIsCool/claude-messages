@@ -1,5 +1,9 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { Daemon } from './daemon.js';
+import { Daemon, isMainModule } from './daemon.js';
 import type { Adapter } from './adapters/base.js';
 import type { AdapterHealth } from './types.js';
 
@@ -54,6 +58,20 @@ function failingEmailAdapter(): Adapter {
 }
 
 describe('Daemon email health', () => {
+  it('recognizes a bundled entrypoint reached through a plugin symlink', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daemon-main-test-'));
+    const realPath = path.join(tempDir, 'daemon.mjs');
+    const linkedPath = path.join(tempDir, 'plugin-daemon.mjs');
+    fs.writeFileSync(realPath, '');
+    fs.symlinkSync(realPath, linkedPath);
+
+    try {
+      expect(isMainModule(linkedPath, pathToFileURL(realPath).href)).toBe(true);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('advances email while Telegram is still hung', async () => {
     const { daemon, updateCursor } = daemonHarness();
     let releaseTelegram!: () => void;

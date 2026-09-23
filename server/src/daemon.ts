@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
@@ -461,8 +461,17 @@ export class Daemon {
   }
 }
 
-// Main. The guard keeps importing Daemon in regression tests side-effect free.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+export function isMainModule(argvPath: string | undefined, moduleUrl: string): boolean {
+  if (!argvPath) return false;
+  try {
+    return fs.realpathSync(argvPath) === fs.realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+// The realpath comparison supports systemd entrypoints reached through plugin symlinks.
+if (isMainModule(process.argv[1], import.meta.url)) {
   const daemon = new Daemon();
 
   process.on('SIGTERM', async () => {
