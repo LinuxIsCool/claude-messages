@@ -32,7 +32,7 @@ interface AccountConfig {
 interface AccountConnection {
   id: string;
   name: string;
-  client: ImapFlow;
+  client: ImapFlow | null;
   host: string;
   user: string;
   password: string;
@@ -122,18 +122,17 @@ export class EmailAdapter implements Adapter {
 
     const envPath = path.join(secretsDir, 'email.env');
     if (!fs.existsSync(envPath)) {
-      this.log('[email] No email.env found — adapter disabled');
-      return;
+      throw new Error(`Email adapter is not ready: missing ${envPath}`);
     }
 
     const env = loadEnv(envPath);
     const accountConfigs = (config.accounts as AccountConfig[]) ?? [];
 
     if (!accountConfigs.length) {
-      this.log('[email] No accounts configured — adapter disabled');
-      return;
+      throw new Error('Email adapter is not ready: zero configured accounts');
     }
 
+    const connectionErrors: string[] = [];
     for (const acct of accountConfigs) {
       const prefix = acct.id.toUpperCase();
       const host = acct.host ?? env[`IMAP_${prefix}_HOST`];
@@ -141,60 +140,68 @@ export class EmailAdapter implements Adapter {
       const password = acct.password ?? env[`IMAP_${prefix}_PASSWORD`];
 
       if (!host || !user || !password) {
-        this.log(`[email] Missing credentials for account ${acct.id} — skipping`);
+        connectionErrors.push(`${acct.id}: missing credentials`);
+        this.log(`[email] Missing credentials for account ${acct.id}`);
         continue;
       }
 
-      try {
-        const client = new ImapFlow({
-          host,
-          port: 993,
-          secure: true,
-          auth: { user, pass: password },
-          logger: false,
-          socketTimeout: 300_000,  // 5 min — large mailbox fetches need time
-        });
+      const conn: AccountConnection = {
+        id: acct.id,
+        name: acct.name ?? acct.id,
+        client: null,
+        host,
+        user,
+        password,
+        idleTimer: null,
+        hasNewMail: false,
+        resolvedFolders: [],
+      };
+      this.accounts.push(conn);
+      this.selfAddresses.add(user.toLowerCase());
 
-        await client.connect();
-        this.log(`[email] Connected to ${acct.id} (${user}@${host})`);
-
-        // Track self addresses for direction tagging
-        this.selfAddresses.add(user.toLowerCase());
-
-        // Discover which configured folders actually exist on this server
-        const resolvedFolders = await this.resolveFolders(client, this.folders);
-        this.log(`[email] ${acct.id} resolved folders: ${resolvedFolders.join(', ')}`);
-
-        const conn: AccountConnection = {
-          id: acct.id,
-          name: acct.name ?? acct.id,
-          client,
-          host,
-          user,
-          password,
-          idleTimer: null,
-          hasNewMail: false,
-          resolvedFolders,
-        };
-
-        // Listen for new mail events
-        client.on('exists', () => {
-          conn.hasNewMail = true;
-        });
-
-        // Prevent unhandled 'error' event crash
-        client.on('error', (err: Error) => {
-          this.log(`[email] ${acct.id} socket error: ${err.message}`);
-        });
-
-        this.accounts.push(conn);
-      } catch (err) {
-        this.log(`[email] Failed to connect account ${acct.id}: ${err}`);
+      if (!await this.connectAccount(conn)) {
+        connectionErrors.push(`${acct.id}: connection failed`);
       }
     }
 
     if (!this.accounts.length) {
-      this.log('[email] No accounts connected — adapter effectively disabled');
+      throw new Error('Email adapter has zero configured accounts with complete credentials');
+    }
+    if (!this.accounts.some(account => account.client)) {
+      throw new Error(`Email adapter initialization failed: ${connectionErrors.join('; ')}`);
+    }
+  }
+
+  private async connectAccount(acct: AccountConnection): Promise<boolean> {
+    let client: ImapFlow | null = null;
+    try {
+      client = new ImapFlow({
+        host: acct.host,
+        port: 993,
+        secure: true,
+        auth: { user: acct.user, pass: acct.password },
+        logger: false,
+        socketTimeout: 300_000,
+      });
+      await client.connect();
+
+      acct.client = client;
+      acct.resolvedFolders = await this.resolveFolders(client, this.folders);
+      client.on('exists', () => { acct.hasNewMail = true; });
+      client.on('error', (err: Error) => {
+        this.log(`[email] ${acct.id} socket error: ${err.message}`);
+      });
+      this.log(`[email] Connected to ${acct.id} (${acct.user}@${acct.host})`);
+      this.log(`[email] ${acct.id} resolved folders: ${acct.resolvedFolders.join(', ')}`);
+      return true;
+    } catch (err) {
+      try {
+        await client?.close();
+      } catch { /* ignore cleanup failure */ }
+      acct.client = null;
+      acct.resolvedFolders = [];
+      this.log(`[email] Failed to connect account ${acct.id}: ${err}`);
+      return false;
     }
   }
 
@@ -264,57 +271,66 @@ export class EmailAdapter implements Adapter {
     if (!this.currentCursor.version) {
       this.currentCursor = this.migrateCursor(this.currentCursor);
     }
+    if (!this.accounts.length) {
+      throw new Error('Email adapter is not ready: zero configured accounts');
+    }
+
+    const disconnected = this.accounts.filter(account => !account.client);
+    for (const acct of disconnected) {
+      await this.connectAccount(acct);
+    }
+
+    const unavailable = this.accounts.filter(account => !account.client);
+    if (unavailable.length === this.accounts.length) {
+      throw new Error(`Email adapter is not ready: zero connected accounts (${unavailable.map(a => a.id).join(', ')})`);
+    }
+
     const now = new Date();
+    const syncErrors: string[] = unavailable.map(account => `${account.id}: disconnected`);
 
     for (const acct of this.accounts) {
+      if (!acct.client) continue;
       try {
         yield* this.syncAccount(acct, now);
       } catch (err) {
         this.log(`[email] Error syncing account ${acct.id}: ${err}`);
         await this.reconnectAccount(acct);
+        syncErrors.push(`${acct.id}: ${String(err)}`);
       }
+    }
+
+    if (syncErrors.length) {
+      throw new Error(`Email sync incomplete: ${syncErrors.join('; ')}`);
     }
   }
 
   private async reconnectAccount(acct: AccountConnection): Promise<boolean> {
     try {
-      await acct.client.close();
+      await acct.client?.close();
     } catch { /* ignore */ }
-    try {
-      const client = new ImapFlow({
-        host: acct.host,
-        port: 993,
-        secure: true,
-        auth: { user: acct.user, pass: acct.password },
-        logger: false,
-        socketTimeout: 300_000,
-      });
-      await client.connect();
-      client.on('exists', () => { acct.hasNewMail = true; });
-      client.on('error', (err: Error) => {
-        this.log(`[email] ${acct.id} socket error: ${err.message}`);
-      });
-      acct.client = client;
-      // Re-resolve folders after reconnect
-      acct.resolvedFolders = await this.resolveFolders(client, this.folders);
+    acct.client = null;
+    const connected = await this.connectAccount(acct);
+    if (connected) {
       this.log(`[email] Reconnected ${acct.id}`);
-      return true;
-    } catch (err) {
-      this.log(`[email] Reconnect failed for ${acct.id}: ${err}`);
-      return false;
     }
+    return connected;
   }
 
   /**
    * Sync all resolved folders for an account.
    */
   private async *syncAccount(acct: AccountConnection, now: Date): AsyncGenerator<SyncEvent> {
+    const folderErrors: string[] = [];
     for (const folder of acct.resolvedFolders) {
       try {
         yield* this.syncAccountFolder(acct, folder, now);
       } catch (err) {
         this.log(`[email] Error syncing ${acct.id}/${folder}: ${err}`);
+        folderErrors.push(`${folder}: ${String(err)}`);
       }
+    }
+    if (folderErrors.length) {
+      throw new Error(folderErrors.join('; '));
     }
   }
 
@@ -322,6 +338,7 @@ export class EmailAdapter implements Adapter {
    * Sync a single folder for an account. Extracted from the old single-folder syncAccount().
    */
   private async *syncAccountFolder(acct: AccountConnection, folder: string, now: Date): AsyncGenerator<SyncEvent> {
+    if (!acct.client) throw new Error(`Account ${acct.id} is disconnected`);
     const acctCursor = this.currentCursor.accounts[acct.id] as AccountCursorV2 | undefined;
     const folderCursor = acctCursor?.folders?.[folder] ?? { lastUid: 0 };
 
@@ -331,12 +348,13 @@ export class EmailAdapter implements Adapter {
     } catch {
       // Connection likely died — try to reconnect once
       this.log(`[email] Connection lost for ${acct.id}/${folder}, reconnecting...`);
-      if (!await this.reconnectAccount(acct)) return;
+      if (!await this.reconnectAccount(acct)) {
+        throw new Error(`Could not reconnect ${acct.id} while opening ${folder}`);
+      }
       try {
-        lock = await acct.client.getMailboxLock(folder);
+        lock = await acct.client!.getMailboxLock(folder);
       } catch (err) {
-        this.log(`[email] Could not open ${folder} for ${acct.id} after reconnect: ${err}`);
-        return;
+        throw new Error(`Could not open ${folder} for ${acct.id} after reconnect: ${err}`);
       }
     }
 
@@ -361,7 +379,7 @@ export class EmailAdapter implements Adapter {
       // Envelope-only fetch for speed — avoids downloading full message bodies.
       // headers returns raw buffer; we parse References from it for threading.
       // bodyParts['1'] gets the first MIME part (usually text/plain).
-      for await (const msg of acct.client.fetch(searchQuery, {
+      for await (const msg of acct.client!.fetch(searchQuery, {
         uid: true,
         envelope: true,
         headers: ['references'],
@@ -576,7 +594,7 @@ export class EmailAdapter implements Adapter {
         clearTimeout(acct.idleTimer);
       }
       try {
-        await acct.client.logout();
+        await acct.client?.logout();
         this.log(`[email] Disconnected ${acct.id}`);
       } catch {
         // Connection may already be dead
