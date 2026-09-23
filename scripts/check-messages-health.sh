@@ -44,11 +44,14 @@ fi
 # --- Parse with jq ---
 HEALTH=$(cat "$HEALTH_FILE")
 LAST_CYCLE=$(echo "$HEALTH" | jq -r '.last_cycle')
+STARTED_AT=$(echo "$HEALTH" | jq -r '.started_at')
 DAEMON_NAME=$(echo "$HEALTH" | jq -r '.daemon')
 
 # Convert last_cycle to epoch
 LAST_CYCLE_EPOCH=$(date -d "$LAST_CYCLE" +%s 2>/dev/null || echo 0)
 DAEMON_AGE=$((NOW_EPOCH - LAST_CYCLE_EPOCH))
+STARTED_EPOCH=$(date -d "$STARTED_AT" +%s 2>/dev/null || echo 0)
+DAEMON_UPTIME=$((NOW_EPOCH - STARTED_EPOCH))
 
 # --- Check daemon-level staleness ---
 if [[ $DAEMON_AGE -gt $DAEMON_THRESHOLD ]]; then
@@ -107,7 +110,7 @@ for PLATFORM in $(echo "$HEALTH" | jq -r '.adapters | keys[]'); do
   # --- Staleness check: adapter hasn't succeeded within threshold ---
   if [[ "$LAST_SUCCESS" == "null" ]]; then
     # Never succeeded — alert if daemon has been up long enough
-    if [[ $DAEMON_AGE -gt $THRESHOLD ]]; then
+    if [[ $DAEMON_UPTIME -gt $THRESHOLD ]]; then
       STALE_COUNT=$((STALE_COUNT + 1))
       STALE_ADAPTERS="${STALE_ADAPTERS} ${PLATFORM}(never-synced)"
     fi

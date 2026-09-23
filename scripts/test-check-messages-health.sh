@@ -212,6 +212,32 @@ cat > "$TMPDIR/t6/.claude/local/messages/health.json" <<EOF
 EOF
 check "$TMPDIR/t6" 1 "fresh empty poll cannot hide stale Signal source"
 
+# Test 7: last_cycle is a liveness timestamp, not daemon uptime. A daemon that
+# has polled for hours without one successful source observation must be red.
+echo ""
+echo "=== Test 7: never-synced adapter after threshold -> exit 1 ==="
+mkdir -p "$TMPDIR/t7/.claude/local/messages"
+cat > "$TMPDIR/t7/.claude/local/messages/health.json" <<EOF
+{
+  "daemon": "test", "version": "1.0", "pid": 1,
+  "started_at": "$FIVE_H",
+  "last_cycle": "$NOW",
+  "cycle_count": 42, "cycle_duration_ms": 20,
+  "adapters": {
+    "email": {
+      "platform": "email", "tier": 2,
+      "last_success": null,
+      "last_failure": null, "last_error": null,
+      "last_duration_ms": 0,
+      "last_yield": {"messages":0,"threads":0,"contacts":0},
+      "consecutive_failures": 0, "timed_out": false,
+      "skipped": false, "cooldown_until": null, "skip_reason": null
+    }
+  }
+}
+EOF
+check "$TMPDIR/t7" 1 "fresh cycle cannot hide a never-synced adapter"
+
 echo ""
 echo "=== SUMMARY ==="
 echo "  Passed: $PASS"
