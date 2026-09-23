@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
@@ -15,6 +15,17 @@ import type { AppConfig, AdapterConfig, Contact, Thread, Message, SyncEvent, Ada
 function resolveHome(p: string): string {
   if (p.startsWith('~/')) return path.join(process.env.HOME ?? '', p.slice(2));
   return p;
+}
+
+export function isMainModule(metaUrl: string, argvPath: string | undefined): boolean {
+  if (!argvPath) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(argvPath);
+  } catch {
+    // Preserve normal direct execution behavior if either path disappears
+    // between process startup and this check.
+    return metaUrl === pathToFileURL(argvPath).href;
+  }
 }
 
 export class Daemon {
@@ -450,7 +461,7 @@ export class Daemon {
 }
 
 // Main. The guard keeps importing Daemon in regression tests side-effect free.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   const daemon = new Daemon();
 
   process.on('SIGTERM', async () => {
