@@ -137,20 +137,9 @@ export class Daemon {
     }
     this.seedHealthFromPreviousRun();
 
-    // Initial sync
-    await this.syncAll();
-
-    // Poll loop — use shortest enabled adapter interval
-    const intervals = Object.values(adapterConfigs)
-      .filter(c => c?.enabled)
-      .map(c => (c?.poll_interval ?? 60) * 1000);
-    const pollInterval = Math.min(...intervals, 60000);
-
-    while (this.running) {
-      await this.sleep(pollInterval);
-      if (!this.running) break;
-      await this.syncAll();
-    }
+    // Each adapter owns its polling loop. A slow network adapter must never
+    // delay a local source or another network source.
+    await Promise.all(this.startAdapterLoops());
   }
 
   // Per-adapter sync timeout (ms). Prevents one slow/hung adapter from blocking others.
@@ -261,17 +250,34 @@ export class Daemon {
     return true;
   }
 
-  private async syncAll(): Promise<void> {
-    const cycleStart = Date.now();
-    for (const adapter of this.adapters) {
+  private pollIntervalMs(adapter: Adapter): number {
+    const seconds = this.adapterConfigFor(adapter.platform)?.poll_interval ?? 60;
+    return Math.max(1, seconds) * 1000;
+  }
+
+  private startAdapterLoops(): Promise<void>[] {
+    return this.adapters.map(adapter => this.runAdapterLoop(adapter));
+  }
+
+  private async runAdapterLoop(adapter: Adapter): Promise<void> {
+    const pollInterval = this.pollIntervalMs(adapter);
+    while (this.running) {
+      const attemptStart = Date.now();
       try {
         await this.syncOneAdapter(adapter);
       } catch (err) {
         this.log(`Error syncing ${adapter.platform}: ${err}`);
       }
+
+      // SQLite operations above are synchronous and execute atomically on the
+      // single Node event loop. Health writes are synchronous and atomically
+      // renamed, so independently completing adapters cannot overlap a write.
+      this.cycleCount++;
+      this.writeHealth(Date.now() - attemptStart);
+
+      if (!this.running) break;
+      await this.sleep(pollInterval);
     }
-    this.cycleCount++;
-    this.writeHealth(Date.now() - cycleStart);
   }
 
   private writeHealth(cycleDurationMs: number): void {
