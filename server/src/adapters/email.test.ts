@@ -5,9 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const imapState = vi.hoisted(() => ({
   connectFailuresRemaining: 0,
+  probeResults: [] as any[],
+  messageResults: [] as any[],
+  rawByUid: new Map<number, Buffer>(),
   instances: [] as Array<{
     connect: ReturnType<typeof vi.fn>;
     getMailboxLock: ReturnType<typeof vi.fn>;
+    fetchOne: ReturnType<typeof vi.fn>;
   }>,
 }));
 
@@ -24,7 +28,14 @@ vi.mock('imapflow', () => ({
     close = vi.fn(async () => {});
     logout = vi.fn(async () => {});
     getMailboxLock = vi.fn(async () => ({ release: vi.fn() }));
-    async *fetch() {}
+    fetchOne = vi.fn(async (uid: string) => {
+      const source = imapState.rawByUid.get(Number(uid));
+      return source ? { uid: Number(uid), source } : false;
+    });
+    async *fetch(_range: unknown, query: Record<string, unknown>) {
+      const rows = query.bodyStructure ? imapState.probeResults : imapState.messageResults;
+      for (const row of rows) yield row;
+    }
 
     constructor() {
       imapState.instances.push(this);
@@ -45,6 +56,9 @@ describe('EmailAdapter connection readiness', () => {
 
   beforeEach(() => {
     imapState.connectFailuresRemaining = 0;
+    imapState.probeResults.length = 0;
+    imapState.messageResults.length = 0;
+    imapState.rawByUid.clear();
     imapState.instances.length = 0;
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'email-adapter-test-'));
     fs.mkdirSync(path.join(dataDir, 'secrets'));
@@ -78,6 +92,9 @@ describe('EmailAdapter connection readiness', () => {
     expect(imapState.instances).toHaveLength(2);
     expect(imapState.instances[1].connect).toHaveBeenCalledTimes(1);
     expect(imapState.instances[1].getMailboxLock).toHaveBeenCalledWith('INBOX');
+    expect(adapter.getSourceObservation()).toMatchObject({
+      evidence: 'IMAP successful folder scan',
+    });
   });
 
   it('rejects an enabled adapter with zero accounts instead of disabling silently', async () => {
@@ -87,6 +104,79 @@ describe('EmailAdapter connection readiness', () => {
       'zero configured accounts',
     );
     await expect(drain(adapter.sync(null))).rejects.toThrow('zero configured accounts');
+  });
+
+  it('preserves calendar MIME and attaches parsed events before advancing the cursor', async () => {
+    const calendar = [
+      'BEGIN:VCALENDAR',
+      'METHOD:REQUEST',
+      'BEGIN:VEVENT',
+      'UID:event-42',
+      'SEQUENCE:1',
+      'DTSTART:20260924T180000Z',
+      'DTEND:20260924T183000Z',
+      'SUMMARY:Team meeting',
+      'END:VEVENT',
+      'END:VCALENDAR',
+    ].join('\r\n');
+    const boundary = 'fixture-boundary';
+    const source = Buffer.from([
+      'Subject: Team meeting',
+      `Content-Type: multipart/alternative; boundary="${boundary}"`,
+      '',
+      `--${boundary}`,
+      'Content-Type: text/plain',
+      '',
+      'Join us.',
+      `--${boundary}`,
+      'Content-Type: text/calendar; method=REQUEST',
+      '',
+      calendar,
+      `--${boundary}--`,
+    ].join('\r\n'));
+    imapState.probeResults.push({
+      uid: 42,
+      bodyStructure: { type: 'multipart/alternative', childNodes: [
+        { part: '1', type: 'text/plain' },
+        { part: '2', type: 'text/calendar' },
+      ] },
+    });
+    imapState.messageResults.push({
+      uid: 42,
+      envelope: {
+        from: [{ address: 'organizer@example.test', name: 'Organizer' }],
+        to: [{ address: 'person@example.test', name: 'Person' }],
+        subject: 'Team meeting',
+        messageId: '<event-42@example.test>',
+        date: new Date('2026-09-24T17:00:00.000Z'),
+      },
+      headers: Buffer.from(''),
+      bodyParts: new Map([['1', Buffer.from('Join us.')]]),
+    });
+    imapState.rawByUid.set(42, source);
+
+    const adapter = new EmailAdapter(() => {});
+    await adapter.init({
+      enabled: true,
+      data_dir: dataDir,
+      accounts: [{
+        id: 'primary',
+        name: 'Primary',
+        host: 'imap.example.test',
+        user: 'person@example.test',
+        password: 'test-password',
+      }],
+    });
+    const events: any[] = [];
+    for await (const event of adapter.sync(null)) events.push(event);
+    const message = events.find(event => event.type === 'message')?.data;
+
+    expect(message.metadata.calendar_events).toMatchObject([{ uid: 'event-42', method: 'REQUEST' }]);
+    expect(message.metadata.calendar_capture.raw_ref).toMatch(/^raw\/email-calendar\/primary\/inbox\/42-/);
+    expect(fs.existsSync(path.join(dataDir, ...message.metadata.calendar_capture.raw_ref.split('/')))).toBe(true);
+    expect(JSON.parse(adapter.getCursor()!)).toMatchObject({
+      accounts: { primary: { folders: { INBOX: { lastUid: 42 } } } },
+    });
   });
 });
 

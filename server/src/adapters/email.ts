@@ -3,8 +3,9 @@ import { simpleParser } from 'mailparser';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { Adapter } from './base.js';
+import type { Adapter, SourceObservation } from './base.js';
 import type { SyncEvent, AdapterConfig, Contact, Thread, Message } from '../types.js';
+import { calendarPartNumbers, captureCalendarSource, type CalendarCapture } from './email-calendar.js';
 
 /** Decode a raw MIME body part (or whole message) to plain text.
  * Handles base64 / quoted-printable transfer-encodings + multipart trees.
@@ -100,6 +101,8 @@ export class EmailAdapter implements Adapter {
   private threadIndex: ThreadIndex = new Map();
   private knownContacts: Set<string> = new Set();
   private selfAddresses: Set<string> = new Set();
+  private dataDir: string = path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
+  private lastSourceObservation: SourceObservation | null = null;
   private log: (msg: string) => void;
 
   constructor(log: (msg: string) => void = console.log) {
@@ -109,6 +112,7 @@ export class EmailAdapter implements Adapter {
   async init(config: AdapterConfig): Promise<void> {
     const dataDir = (config as unknown as { data_dir?: string }).data_dir ??
       path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
+    this.dataDir = dataDir;
     const secretsDir = path.join(dataDir, 'secrets');
     this.initialDays = config.initial_days ?? 30;
 
@@ -302,6 +306,14 @@ export class EmailAdapter implements Adapter {
     if (syncErrors.length) {
       throw new Error(`Email sync incomplete: ${syncErrors.join('; ')}`);
     }
+    this.lastSourceObservation = {
+      observed_at: new Date().toISOString(),
+      evidence: 'IMAP successful folder scan',
+    };
+  }
+
+  getSourceObservation(): SourceObservation | null {
+    return this.lastSourceObservation;
   }
 
   private async reconnectAccount(acct: AccountConnection): Promise<boolean> {
@@ -376,15 +388,43 @@ export class EmailAdapter implements Adapter {
       // Determine direction for this folder
       const folderIsSent = isSentFolder(folder);
 
-      // Envelope-only fetch for speed — avoids downloading full message bodies.
-      // headers returns raw buffer; we parse References from it for threading.
-      // bodyParts['1'] gets the first MIME part (usually text/plain).
-      for await (const msg of acct.client!.fetch(searchQuery, {
+      // Freeze one UID snapshot before fetching content. Calendar MIME messages get
+      // a second, exact raw-source fetch before any event or cursor is emitted.
+      const observedUids: number[] = [];
+      const calendarUids: number[] = [];
+      for await (const probe of acct.client!.fetch(searchQuery, {
+        uid: true,
+        bodyStructure: true,
+      })) {
+        if (probe.uid <= folderCursor.lastUid) continue;
+        observedUids.push(probe.uid);
+        if (calendarPartNumbers(probe.bodyStructure).length) calendarUids.push(probe.uid);
+      }
+
+      if (!observedUids.length) {
+        acct.hasNewMail = false;
+        return;
+      }
+
+      const calendarCaptures = new Map<number, CalendarCapture>();
+      for (const uid of calendarUids) {
+        const rawMessage = await acct.client!.fetchOne(`${uid}`, { uid: true, source: true }, { uid: true });
+        if (!rawMessage || !rawMessage.source) {
+          throw new Error(`Calendar source fetch returned no data for ${acct.id}/${folder} UID ${uid}`);
+        }
+        const capture = await captureCalendarSource(this.dataDir, acct.id, folder, uid, rawMessage.source);
+        calendarCaptures.set(uid, capture);
+        this.log(`[email] Preserved calendar source ${capture.raw_ref} with ${capture.calendar_events.length} event(s)`);
+      }
+
+      // Envelope and first text part remain the normal message path. Calendar raw
+      // source is fetched only for the UIDs identified above.
+      for await (const msg of acct.client!.fetch(observedUids, {
         uid: true,
         envelope: true,
         headers: ['references'],
         bodyParts: ['1'],
-      })) {
+      }, { uid: true })) {
         // Skip messages we've already processed (IMAP UID ranges can re-include boundary)
         if (msg.uid <= folderCursor.lastUid) continue;
 
@@ -470,6 +510,18 @@ export class EmailAdapter implements Adapter {
 
         const ccAddrs = (env.cc ?? []).map((a: { address?: string }) => a.address).filter(Boolean);
         if (ccAddrs.length) metadata.cc = ccAddrs;
+
+        const calendarCapture = calendarCaptures.get(msg.uid);
+        if (calendarCapture) {
+          metadata.calendar_capture = {
+            raw_ref: calendarCapture.raw_ref,
+            raw_sha256: calendarCapture.raw_sha256,
+            raw_bytes: calendarCapture.raw_bytes,
+            calendar_attachments: calendarCapture.calendar_attachments,
+            parse_issues: calendarCapture.parse_issues,
+          };
+          metadata.calendar_events = calendarCapture.calendar_events;
+        }
 
         // Determine direction: sent folder -> sent, inbox from self -> sent, otherwise received
         let direction: 'sent' | 'received' | 'unknown' = 'unknown';

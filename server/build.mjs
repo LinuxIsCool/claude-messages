@@ -35,6 +35,18 @@ await Promise.all([
     outfile: 'build/import-whatsapp-export.mjs',
     banner: { js: "// WhatsApp chat export importer — bundled with esbuild" },
   }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/gmail-schedule.ts'],
+    outfile: 'build/gmail-schedule.mjs',
+    banner: { js: "// Gmail scheduling-mail projection — bundled with esbuild" },
+  }),
+  esbuild.build({
+    ...common,
+    entryPoints: ['src/backfill-email-calendar.ts'],
+    outfile: 'build/backfill-email-calendar.mjs',
+    banner: { js: "// Gmail calendar MIME backfill — bundled with esbuild" },
+  }),
 ]);
 
-console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, and import-whatsapp-export.mjs');
+console.log('Built daemon.mjs, mcp.mjs, backfill.mjs, import-whatsapp-export.mjs, gmail-schedule.mjs, and backfill-email-calendar.mjs');
