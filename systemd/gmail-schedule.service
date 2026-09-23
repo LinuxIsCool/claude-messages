@@ -1,0 +1,12 @@
+[Unit]
+Description=Project Gmail scheduling mail into the local calendar store
+After=legion-messages.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/node %h/.claude/plugins/local/legion-plugins/plugins/claude-messages/server/build/gmail-schedule.mjs
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.claude/local/calendar

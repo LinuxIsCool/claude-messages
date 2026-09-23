@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Gmail scheduling-mail projection every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=gmail-schedule.service
+
+[Install]
+WantedBy=timers.target
