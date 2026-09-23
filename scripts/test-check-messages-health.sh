@@ -24,8 +24,8 @@ report() {
 }
 
 check() {
-  local home="$1" expected="$2" label="$3"
-  HOME="$home" bash "$SCRIPT_PATH" > /dev/null 2>&1; echo $? > "$TMPDIR/exit"
+  local home="$1" expected="$2" label="$3" require_schedule="${4:-0}"
+  HOME="$home" REQUIRE_GMAIL_SCHEDULE="$require_schedule" bash "$SCRIPT_PATH" > /dev/null 2>&1; echo $? > "$TMPDIR/exit"
   local actual
   actual=$(cat "$TMPDIR/exit")
   report "$actual" "$expected" "$label"
@@ -237,6 +237,35 @@ cat > "$TMPDIR/t7/.claude/local/messages/health.json" <<EOF
 }
 EOF
 check "$TMPDIR/t7" 1 "fresh cycle cannot hide a never-synced adapter"
+
+# Test 8: the Gmail schedule lane is healthy only with both a fresh projection
+# and fresh source contact inherited from the IMAP collector.
+echo ""
+echo "=== Test 8: fresh Gmail schedule projection -> exit 0 ==="
+mkdir -p "$TMPDIR/t8/.claude/local/messages" "$TMPDIR/t8/.claude/local/calendar"
+cp "$TMPDIR/t4/.claude/local/messages/health.json" "$TMPDIR/t8/.claude/local/messages/health.json"
+cat > "$TMPDIR/t8/.claude/local/calendar/gmail-schedule-observation.json" <<EOF
+{
+  "status": "ok",
+  "projection_at": "$NOW",
+  "source_contact_at": "$NOW",
+  "source_evidence": "IMAP successful folder scan"
+}
+EOF
+check "$TMPDIR/t8" 0 "fresh Gmail schedule projection" 1
+
+# Test 9: a recent projection cannot hide stale Gmail source contact.
+echo ""
+echo "=== Test 9: Gmail schedule with stale source -> exit 1 ==="
+cat > "$TMPDIR/t8/.claude/local/calendar/gmail-schedule-observation.json" <<EOF
+{
+  "status": "ok",
+  "projection_at": "$NOW",
+  "source_contact_at": "$ONE_H",
+  "source_evidence": "IMAP successful folder scan"
+}
+EOF
+check "$TMPDIR/t8" 1 "Gmail schedule rejects stale source contact" 1
 
 echo ""
 echo "=== SUMMARY ==="
