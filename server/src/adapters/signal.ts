@@ -2,7 +2,9 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Adapter } from './base.js';
+import type { SourceObservation } from './base.js';
 import type { SyncEvent, AdapterConfig, Contact, Thread, Message } from '../types.js';
+import { assertSignalSourceFresh } from './signal-source-health.js';
 
 interface SignalCursor {
   lastSentAt: number;  // epoch ms from messages.sent_at
@@ -81,6 +83,9 @@ export class SignalAdapter implements Adapter {
   private currentCursor: SignalCursor = { lastSentAt: 0 };
   private log: (msg: string) => void;
   private ready = false;
+  private sourceLogPath: string = '';
+  private sourceMaxAgeMs = 180_000;
+  private sourceObservation: SourceObservation | null = null;
 
   constructor(log: (msg: string) => void = console.log) {
     this.log = log;
@@ -94,33 +99,35 @@ export class SignalAdapter implements Adapter {
     this.dbPath = resolveHome(
       (config as unknown as { db_path?: string }).db_path ?? '~/.config/Signal/sql/db.sqlite'
     );
+    this.sourceLogPath = resolveHome(
+      (config as unknown as { source_log_path?: string }).source_log_path ?? '~/.config/Signal/logs/app.log'
+    );
+    const sourceMaxAgeSeconds =
+      (config as unknown as { source_max_age_seconds?: number }).source_max_age_seconds ?? 180;
+    this.sourceMaxAgeMs = Math.max(30, sourceMaxAgeSeconds) * 1000;
 
     // Check sqlcipher is available
     try {
       execFileSync('sqlcipher', ['--version'], { timeout: 5000, stdio: 'pipe' });
     } catch {
-      this.log('[signal] sqlcipher not installed — run: sudo pacman -S sqlcipher');
-      return;
+      throw new Error('[signal] sqlcipher not installed');
     }
 
     // Check DB exists
     if (!fs.existsSync(this.dbPath)) {
-      this.log(`[signal] Database not found at ${this.dbPath} — is Signal Desktop installed?`);
-      return;
+      throw new Error(`[signal] Database not found at ${this.dbPath}`);
     }
 
     // Load encryption key from signal.env
     const envPath = path.join(dataDir, 'secrets', 'signal.env');
     if (!fs.existsSync(envPath)) {
-      this.log('[signal] No signal.env found — run: electron --no-sandbox ~/.claude/local/scripts/extract-signal-key.js');
-      return;
+      throw new Error(`[signal] Encryption-key environment not found at ${envPath}`);
     }
 
     const env = loadEnv(envPath);
     this.dbKey = env.SIGNAL_DB_KEY ?? '';
     if (!this.dbKey) {
-      this.log('[signal] SIGNAL_DB_KEY not set in signal.env — adapter disabled');
-      return;
+      throw new Error('[signal] SIGNAL_DB_KEY not set in signal.env');
     }
 
     // Verify key works by running a test query
@@ -130,8 +137,7 @@ export class SignalAdapter implements Adapter {
       this.log(`[signal] DB access verified — ${count} messages in Signal Desktop`);
       this.ready = true;
     } catch (err) {
-      this.log(`[signal] DB access failed (wrong key?): ${err}`);
-      return;
+      throw new Error(`[signal] DB access failed: ${String(err)}`);
     }
   }
 
@@ -176,13 +182,23 @@ export class SignalAdapter implements Adapter {
     const jsonStr = lines.slice(dataStart).join('\n').trim();
     try {
       return JSON.parse(jsonStr);
-    } catch {
-      return [];
+    } catch (err) {
+      throw new Error(`[signal] SQLCipher returned invalid JSON: ${String(err)}`);
     }
   }
 
   async *sync(cursorStr: string | null): AsyncGenerator<SyncEvent> {
-    if (!this.ready) return;
+    if (!this.ready) {
+      throw new Error('[signal] Adapter is not ready');
+    }
+
+    // A readable SQLCipher database can be a frozen cache. Only an observed,
+    // recent authenticated websocket keepalive proves the upstream source was
+    // reachable during this poll.
+    this.sourceObservation = assertSignalSourceFresh(
+      this.sourceLogPath,
+      this.sourceMaxAgeMs,
+    );
 
     this.currentCursor = cursorStr ? JSON.parse(cursorStr) : { lastSentAt: 0 };
     const now = new Date();
@@ -426,6 +442,10 @@ export class SignalAdapter implements Adapter {
 
   getCursor(): string | null {
     return JSON.stringify(this.currentCursor);
+  }
+
+  getSourceObservation(): SourceObservation | null {
+    return this.sourceObservation;
   }
 
   async shutdown(): Promise<void> {

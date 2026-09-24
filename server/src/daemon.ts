@@ -1,10 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { MessageDB } from './db.js';
 import { EventLog } from './events.js';
 import { TelegramAdapter } from './adapters/telegram.js';
 import { SignalAdapter } from './adapters/signal.js';
+import { SignalCliAdapter } from './adapters/signal-cli.js';
 import { EmailAdapter } from './adapters/email.js';
 import { SlackAdapter } from './adapters/slack.js';
 import { WhatsAppAdapter } from './adapters/whatsapp.js';
@@ -16,7 +18,18 @@ function resolveHome(p: string): string {
   return p;
 }
 
-class Daemon {
+export function isMainModule(metaUrl: string, argvPath: string | undefined): boolean {
+  if (!argvPath) return false;
+  try {
+    return fs.realpathSync(fileURLToPath(metaUrl)) === fs.realpathSync(argvPath);
+  } catch {
+    // Preserve normal direct execution behavior if either path disappears
+    // between process startup and this check.
+    return metaUrl === pathToFileURL(argvPath).href;
+  }
+}
+
+export class Daemon {
   private config: AppConfig;
   private db: MessageDB;
   private eventLog: EventLog;
@@ -29,6 +42,7 @@ class Daemon {
   private startedAt: string = '';
   private cycleCount: number = 0;
   private adapterHealth: Map<string, AdapterHealth> = new Map();
+  private adapterInitErrors: Map<string, string> = new Map();
 
   constructor() {
     const configPath = resolveHome('~/.claude/local/messages/config.yml');
@@ -60,12 +74,19 @@ class Daemon {
     // Signal FIRST — reads from local SQLite, zero network dependency, instant sync.
     // Must run before network-dependent adapters to avoid head-of-line blocking.
     if (adapterConfigs.signal?.enabled) {
+      const signalBackend = process.env.LEGION_SIGNAL_BACKEND
+        ?? adapterConfigs.signal.backend
+        ?? 'desktop';
+      const adapter = signalBackend === 'signal-cli'
+        ? new SignalCliAdapter((msg) => this.log(msg))
+        : new SignalAdapter((msg) => this.log(msg));
+      // Keep Signal visible in health even when a static dependency is absent.
+      this.adapters.push(adapter);
       try {
-        const adapter = new SignalAdapter((msg) => this.log(msg));
         await adapter.init({ ...adapterConfigs.signal, data_dir: dataDir } as AdapterConfig);
-        this.adapters.push(adapter);
         this.log('Signal adapter initialized');
       } catch (err) {
+        this.adapterInitErrors.set(adapter.platform, String(err));
         this.log(`Signal adapter failed to initialize: ${err}`);
       }
     }
@@ -83,12 +104,15 @@ class Daemon {
     }
 
     if (adapterConfigs.email?.enabled) {
+      const adapter = new EmailAdapter((msg) => this.log(msg));
+      // Keep the adapter registered even when its first network connection
+      // fails. Its next sync cycle retries the retained account definitions.
+      this.adapters.push(adapter);
       try {
-        const adapter = new EmailAdapter((msg) => this.log(msg));
         await adapter.init({ ...adapterConfigs.email, data_dir: dataDir } as AdapterConfig);
-        this.adapters.push(adapter);
         this.log('Email adapter initialized');
       } catch (err) {
+        this.adapterInitErrors.set(adapter.platform, String(err));
         this.log(`Email adapter failed to initialize: ${err}`);
       }
     }
@@ -128,36 +152,13 @@ class Daemon {
     this.startedAt = new Date().toISOString();
     this.cycleCount = 0;
     for (const adapter of this.adapters) {
-      this.adapterHealth.set(adapter.platform, {
-        platform: adapter.platform,
-        tier: Daemon.ADAPTER_TIERS[adapter.platform] ?? 2,
-        last_success: null,
-        last_failure: null,
-        last_error: null,
-        last_duration_ms: 0,
-        last_yield: { messages: 0, threads: 0, contacts: 0 },
-        consecutive_failures: 0,
-        timed_out: false,
-        skipped: false,
-        cooldown_until: null,
-      });
+      this.adapterHealth.set(adapter.platform, this.initialHealth(adapter));
     }
     this.seedHealthFromPreviousRun();
 
-    // Initial sync
-    await this.syncAll();
-
-    // Poll loop — use shortest enabled adapter interval
-    const intervals = Object.values(adapterConfigs)
-      .filter(c => c?.enabled)
-      .map(c => (c?.poll_interval ?? 60) * 1000);
-    const pollInterval = Math.min(...intervals, 60000);
-
-    while (this.running) {
-      await this.sleep(pollInterval);
-      if (!this.running) break;
-      await this.syncAll();
-    }
+    // Each adapter owns its polling loop. A slow network adapter must never
+    // delay a local source or another network source.
+    await Promise.all(this.startAdapterLoops());
   }
 
   // Per-adapter sync timeout (ms). Prevents one slow/hung adapter from blocking others.
@@ -175,6 +176,25 @@ class Daemon {
     slack: 2,
   };
 
+  private initialHealth(adapter: Adapter): AdapterHealth {
+    const initError = this.adapterInitErrors.get(adapter.platform) ?? null;
+    return {
+      platform: adapter.platform,
+      tier: Daemon.ADAPTER_TIERS[adapter.platform] ?? 2,
+      last_success: null,
+      last_failure: initError ? new Date().toISOString() : null,
+      last_error: initError,
+      last_duration_ms: 0,
+      last_yield: { messages: 0, threads: 0, contacts: 0 },
+      consecutive_failures: initError ? 1 : 0,
+      timed_out: false,
+      skipped: false,
+      cooldown_until: null,
+      source_observed_at: null,
+      source_evidence: null,
+    };
+  }
+
   private seedHealthFromPreviousRun(): void {
     try {
       if (!fs.existsSync(this.healthPath)) return;
@@ -182,17 +202,22 @@ class Daemon {
       for (const [platform, current] of this.adapterHealth.entries()) {
         const previousHealth = previous.adapters?.[platform];
         if (!previousHealth) continue;
+        const currentInitFailed = this.adapterInitErrors.has(platform);
         this.adapterHealth.set(platform, {
           ...current,
           last_success: previousHealth.last_success,
-          last_failure: previousHealth.last_failure,
-          last_error: previousHealth.last_error,
+          last_failure: currentInitFailed ? current.last_failure : previousHealth.last_failure,
+          last_error: currentInitFailed ? current.last_error : previousHealth.last_error,
           last_duration_ms: previousHealth.last_duration_ms,
           last_yield: previousHealth.last_yield,
-          consecutive_failures: previousHealth.consecutive_failures,
+          consecutive_failures: currentInitFailed
+            ? Math.max(1, previousHealth.consecutive_failures)
+            : previousHealth.consecutive_failures,
           timed_out: previousHealth.timed_out,
           skipped: previousHealth.skipped ?? false,
           cooldown_until: previousHealth.cooldown_until ?? null,
+          source_observed_at: previousHealth.source_observed_at ?? null,
+          source_evidence: previousHealth.source_evidence ?? null,
         });
       }
     } catch (err) {
@@ -206,6 +231,9 @@ class Daemon {
 
   private cooldownAfterFailures(platform: string): number {
     const configured = this.adapterConfigFor(platform)?.cooldown_after_failures;
+    // Signal Desktop reconnects without intervention. Probe every cycle so a
+    // recovered source is not hidden behind the generic one-hour cooldown.
+    if (platform === 'signal' && typeof configured !== 'number') return 0;
     return typeof configured === 'number'
       ? configured
       : Daemon.DEFAULT_COOLDOWN_AFTER_FAILURES;
@@ -248,17 +276,34 @@ class Daemon {
     return true;
   }
 
-  private async syncAll(): Promise<void> {
-    const cycleStart = Date.now();
-    for (const adapter of this.adapters) {
+  private pollIntervalMs(adapter: Adapter): number {
+    const seconds = this.adapterConfigFor(adapter.platform)?.poll_interval ?? 60;
+    return Math.max(1, seconds) * 1000;
+  }
+
+  private startAdapterLoops(): Promise<void>[] {
+    return this.adapters.map(adapter => this.runAdapterLoop(adapter));
+  }
+
+  private async runAdapterLoop(adapter: Adapter): Promise<void> {
+    const pollInterval = this.pollIntervalMs(adapter);
+    while (this.running) {
+      const attemptStart = Date.now();
       try {
         await this.syncOneAdapter(adapter);
       } catch (err) {
         this.log(`Error syncing ${adapter.platform}: ${err}`);
       }
+
+      // SQLite operations above are synchronous and execute atomically on the
+      // single Node event loop. Health writes are synchronous and atomically
+      // renamed, so independently completing adapters cannot overlap a write.
+      this.cycleCount++;
+      this.writeHealth(Date.now() - attemptStart);
+
+      if (!this.running) break;
+      await this.sleep(pollInterval);
     }
-    this.cycleCount++;
-    this.writeHealth(Date.now() - cycleStart);
   }
 
   private writeHealth(cycleDurationMs: number): void {
@@ -297,6 +342,7 @@ class Daemon {
     let contactCount = 0;
     let threadCount = 0;
     let timedOut = false;
+    let syncError: unknown = null;
 
     // Capture the generator so we can cancel it on timeout
     const gen = adapter.sync(cursor);
@@ -328,40 +374,35 @@ class Daemon {
     try {
       await Promise.race([syncWork(), timeoutPromise]);
     } catch (err) {
-      // Track health for non-timeout errors before re-throwing
-      if (!timedOut) {
-        const health = this.adapterHealth.get(adapter.platform);
-        if (health) {
-          health.last_failure = new Date().toISOString();
-          health.last_error = String(err);
-          health.consecutive_failures++;
-          health.last_duration_ms = Date.now() - syncStartMs;
-          health.skipped = false;
-          this.startFailureCooldown(adapter.platform, health);
-        }
-        throw err;
-      }
-      this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
+      syncError = err;
+      if (timedOut) this.log(`${adapter.platform} sync timed out after processing ${msgCount} msgs`);
     } finally {
       // Clear timeout if sync finished before it fired
       if (timeoutTimer) clearTimeout(timeoutTimer);
 
-      // Always save cursor — even partial progress avoids re-processing on next cycle
+      // Save successful progress. A failed zero-yield pass must not advance the
+      // cursor timestamp and masquerade as source freshness.
       const newCursor = adapter.getCursor();
-      if (newCursor) {
+      const processedEvents = msgCount + contactCount + threadCount;
+      if (newCursor && (!syncError || processedEvents > 0)) {
         this.db.updateCursor(adapter.platform, newCursor);
       }
 
       // Update adapter health
       const health = this.adapterHealth.get(adapter.platform);
       if (health) {
+        const sourceObservation = adapter.getSourceObservation?.() ?? null;
+        health.source_observed_at = sourceObservation?.observed_at ?? null;
+        health.source_evidence = sourceObservation?.evidence ?? null;
         health.last_duration_ms = Date.now() - syncStartMs;
         health.last_yield = { messages: msgCount, threads: threadCount, contacts: contactCount };
         health.timed_out = timedOut;
         health.skipped = false;
-        if (timedOut) {
+        if (syncError) {
           health.last_failure = new Date().toISOString();
-          health.last_error = `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`;
+          health.last_error = timedOut
+            ? `Timed out after ${Daemon.ADAPTER_SYNC_TIMEOUT_MS / 1000}s`
+            : String(syncError);
           health.consecutive_failures++;
           this.startFailureCooldown(adapter.platform, health);
         } else {
@@ -372,9 +413,14 @@ class Daemon {
         }
       }
 
-      const suffix = timedOut ? ' (partial — timed out)' : '';
-      this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts${suffix}`);
+      if (syncError) {
+        this.log(`${adapter.platform} sync failed after ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts: ${String(syncError)}`);
+      } else {
+        this.log(`${adapter.platform} sync complete: ${msgCount} msgs, ${threadCount} threads, ${contactCount} contacts`);
+      }
     }
+
+    if (syncError) throw syncError;
   }
 
   private processEvent(event: SyncEvent): void {
@@ -432,19 +478,21 @@ class Daemon {
   }
 }
 
-// Main
-const daemon = new Daemon();
+// Main. The guard keeps importing Daemon in regression tests side-effect free.
+if (isMainModule(import.meta.url, process.argv[1])) {
+  const daemon = new Daemon();
 
-process.on('SIGTERM', async () => {
-  await daemon.shutdown();
-  process.exit(0);
-});
-process.on('SIGINT', async () => {
-  await daemon.shutdown();
-  process.exit(0);
-});
+  process.on('SIGTERM', async () => {
+    await daemon.shutdown();
+    process.exit(0);
+  });
+  process.on('SIGINT', async () => {
+    await daemon.shutdown();
+    process.exit(0);
+  });
 
-daemon.start().catch(err => {
-  console.error('Fatal:', err);
-  process.exit(1);
-});
+  daemon.start().catch(err => {
+    console.error('Fatal:', err);
+    process.exit(1);
+  });
+}

@@ -1,9 +1,26 @@
 import { ImapFlow } from 'imapflow';
+import { simpleParser } from 'mailparser';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import type { Adapter } from './base.js';
+import type { Adapter, SourceObservation } from './base.js';
 import type { SyncEvent, AdapterConfig, Contact, Thread, Message } from '../types.js';
+import { calendarPartNumbers, captureCalendarSource, type CalendarCapture } from './email-calendar.js';
+
+/** Decode a raw MIME body part (or whole message) to plain text.
+ * Handles base64 / quoted-printable transfer-encodings + multipart trees.
+ * Falls back to the raw string if it isn't MIME. */
+export async function decodeEmailBody(raw: string): Promise<string> {
+  if (!raw) return '';
+  const looksMime = /content-transfer-encoding:/i.test(raw) || /^content-type:/im.test(raw);
+  if (!looksMime) return raw;
+  try {
+    const parsed = await simpleParser(Buffer.from(raw));
+    return (parsed.text || parsed.html || raw).toString();
+  } catch {
+    return raw;
+  }
+}
 
 interface AccountConfig {
   id: string;
@@ -16,7 +33,7 @@ interface AccountConfig {
 interface AccountConnection {
   id: string;
   name: string;
-  client: ImapFlow;
+  client: ImapFlow | null;
   host: string;
   user: string;
   password: string;
@@ -84,6 +101,8 @@ export class EmailAdapter implements Adapter {
   private threadIndex: ThreadIndex = new Map();
   private knownContacts: Set<string> = new Set();
   private selfAddresses: Set<string> = new Set();
+  private dataDir: string = path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
+  private lastSourceObservation: SourceObservation | null = null;
   private log: (msg: string) => void;
 
   constructor(log: (msg: string) => void = console.log) {
@@ -93,6 +112,7 @@ export class EmailAdapter implements Adapter {
   async init(config: AdapterConfig): Promise<void> {
     const dataDir = (config as unknown as { data_dir?: string }).data_dir ??
       path.join(process.env.HOME ?? '', '.claude', 'local', 'messages');
+    this.dataDir = dataDir;
     const secretsDir = path.join(dataDir, 'secrets');
     this.initialDays = config.initial_days ?? 30;
 
@@ -106,18 +126,17 @@ export class EmailAdapter implements Adapter {
 
     const envPath = path.join(secretsDir, 'email.env');
     if (!fs.existsSync(envPath)) {
-      this.log('[email] No email.env found — adapter disabled');
-      return;
+      throw new Error(`Email adapter is not ready: missing ${envPath}`);
     }
 
     const env = loadEnv(envPath);
     const accountConfigs = (config.accounts as AccountConfig[]) ?? [];
 
     if (!accountConfigs.length) {
-      this.log('[email] No accounts configured — adapter disabled');
-      return;
+      throw new Error('Email adapter is not ready: zero configured accounts');
     }
 
+    const connectionErrors: string[] = [];
     for (const acct of accountConfigs) {
       const prefix = acct.id.toUpperCase();
       const host = acct.host ?? env[`IMAP_${prefix}_HOST`];
@@ -125,60 +144,68 @@ export class EmailAdapter implements Adapter {
       const password = acct.password ?? env[`IMAP_${prefix}_PASSWORD`];
 
       if (!host || !user || !password) {
-        this.log(`[email] Missing credentials for account ${acct.id} — skipping`);
+        connectionErrors.push(`${acct.id}: missing credentials`);
+        this.log(`[email] Missing credentials for account ${acct.id}`);
         continue;
       }
 
-      try {
-        const client = new ImapFlow({
-          host,
-          port: 993,
-          secure: true,
-          auth: { user, pass: password },
-          logger: false,
-          socketTimeout: 300_000,  // 5 min — large mailbox fetches need time
-        });
+      const conn: AccountConnection = {
+        id: acct.id,
+        name: acct.name ?? acct.id,
+        client: null,
+        host,
+        user,
+        password,
+        idleTimer: null,
+        hasNewMail: false,
+        resolvedFolders: [],
+      };
+      this.accounts.push(conn);
+      this.selfAddresses.add(user.toLowerCase());
 
-        await client.connect();
-        this.log(`[email] Connected to ${acct.id} (${user}@${host})`);
-
-        // Track self addresses for direction tagging
-        this.selfAddresses.add(user.toLowerCase());
-
-        // Discover which configured folders actually exist on this server
-        const resolvedFolders = await this.resolveFolders(client, this.folders);
-        this.log(`[email] ${acct.id} resolved folders: ${resolvedFolders.join(', ')}`);
-
-        const conn: AccountConnection = {
-          id: acct.id,
-          name: acct.name ?? acct.id,
-          client,
-          host,
-          user,
-          password,
-          idleTimer: null,
-          hasNewMail: false,
-          resolvedFolders,
-        };
-
-        // Listen for new mail events
-        client.on('exists', () => {
-          conn.hasNewMail = true;
-        });
-
-        // Prevent unhandled 'error' event crash
-        client.on('error', (err: Error) => {
-          this.log(`[email] ${acct.id} socket error: ${err.message}`);
-        });
-
-        this.accounts.push(conn);
-      } catch (err) {
-        this.log(`[email] Failed to connect account ${acct.id}: ${err}`);
+      if (!await this.connectAccount(conn)) {
+        connectionErrors.push(`${acct.id}: connection failed`);
       }
     }
 
     if (!this.accounts.length) {
-      this.log('[email] No accounts connected — adapter effectively disabled');
+      throw new Error('Email adapter has zero configured accounts with complete credentials');
+    }
+    if (!this.accounts.some(account => account.client)) {
+      throw new Error(`Email adapter initialization failed: ${connectionErrors.join('; ')}`);
+    }
+  }
+
+  private async connectAccount(acct: AccountConnection): Promise<boolean> {
+    let client: ImapFlow | null = null;
+    try {
+      client = new ImapFlow({
+        host: acct.host,
+        port: 993,
+        secure: true,
+        auth: { user: acct.user, pass: acct.password },
+        logger: false,
+        socketTimeout: 300_000,
+      });
+      await client.connect();
+
+      acct.client = client;
+      acct.resolvedFolders = await this.resolveFolders(client, this.folders);
+      client.on('exists', () => { acct.hasNewMail = true; });
+      client.on('error', (err: Error) => {
+        this.log(`[email] ${acct.id} socket error: ${err.message}`);
+      });
+      this.log(`[email] Connected to ${acct.id} (${acct.user}@${acct.host})`);
+      this.log(`[email] ${acct.id} resolved folders: ${acct.resolvedFolders.join(', ')}`);
+      return true;
+    } catch (err) {
+      try {
+        await client?.close();
+      } catch { /* ignore cleanup failure */ }
+      acct.client = null;
+      acct.resolvedFolders = [];
+      this.log(`[email] Failed to connect account ${acct.id}: ${err}`);
+      return false;
     }
   }
 
@@ -248,57 +275,74 @@ export class EmailAdapter implements Adapter {
     if (!this.currentCursor.version) {
       this.currentCursor = this.migrateCursor(this.currentCursor);
     }
+    if (!this.accounts.length) {
+      throw new Error('Email adapter is not ready: zero configured accounts');
+    }
+
+    const disconnected = this.accounts.filter(account => !account.client);
+    for (const acct of disconnected) {
+      await this.connectAccount(acct);
+    }
+
+    const unavailable = this.accounts.filter(account => !account.client);
+    if (unavailable.length === this.accounts.length) {
+      throw new Error(`Email adapter is not ready: zero connected accounts (${unavailable.map(a => a.id).join(', ')})`);
+    }
+
     const now = new Date();
+    const syncErrors: string[] = unavailable.map(account => `${account.id}: disconnected`);
 
     for (const acct of this.accounts) {
+      if (!acct.client) continue;
       try {
         yield* this.syncAccount(acct, now);
       } catch (err) {
         this.log(`[email] Error syncing account ${acct.id}: ${err}`);
         await this.reconnectAccount(acct);
+        syncErrors.push(`${acct.id}: ${String(err)}`);
       }
     }
+
+    if (syncErrors.length) {
+      throw new Error(`Email sync incomplete: ${syncErrors.join('; ')}`);
+    }
+    this.lastSourceObservation = {
+      observed_at: new Date().toISOString(),
+      evidence: 'IMAP successful folder scan',
+    };
+  }
+
+  getSourceObservation(): SourceObservation | null {
+    return this.lastSourceObservation;
   }
 
   private async reconnectAccount(acct: AccountConnection): Promise<boolean> {
     try {
-      await acct.client.close();
+      await acct.client?.close();
     } catch { /* ignore */ }
-    try {
-      const client = new ImapFlow({
-        host: acct.host,
-        port: 993,
-        secure: true,
-        auth: { user: acct.user, pass: acct.password },
-        logger: false,
-        socketTimeout: 300_000,
-      });
-      await client.connect();
-      client.on('exists', () => { acct.hasNewMail = true; });
-      client.on('error', (err: Error) => {
-        this.log(`[email] ${acct.id} socket error: ${err.message}`);
-      });
-      acct.client = client;
-      // Re-resolve folders after reconnect
-      acct.resolvedFolders = await this.resolveFolders(client, this.folders);
+    acct.client = null;
+    const connected = await this.connectAccount(acct);
+    if (connected) {
       this.log(`[email] Reconnected ${acct.id}`);
-      return true;
-    } catch (err) {
-      this.log(`[email] Reconnect failed for ${acct.id}: ${err}`);
-      return false;
     }
+    return connected;
   }
 
   /**
    * Sync all resolved folders for an account.
    */
   private async *syncAccount(acct: AccountConnection, now: Date): AsyncGenerator<SyncEvent> {
+    const folderErrors: string[] = [];
     for (const folder of acct.resolvedFolders) {
       try {
         yield* this.syncAccountFolder(acct, folder, now);
       } catch (err) {
         this.log(`[email] Error syncing ${acct.id}/${folder}: ${err}`);
+        folderErrors.push(`${folder}: ${String(err)}`);
       }
+    }
+    if (folderErrors.length) {
+      throw new Error(folderErrors.join('; '));
     }
   }
 
@@ -306,6 +350,7 @@ export class EmailAdapter implements Adapter {
    * Sync a single folder for an account. Extracted from the old single-folder syncAccount().
    */
   private async *syncAccountFolder(acct: AccountConnection, folder: string, now: Date): AsyncGenerator<SyncEvent> {
+    if (!acct.client) throw new Error(`Account ${acct.id} is disconnected`);
     const acctCursor = this.currentCursor.accounts[acct.id] as AccountCursorV2 | undefined;
     const folderCursor = acctCursor?.folders?.[folder] ?? { lastUid: 0 };
 
@@ -315,12 +360,13 @@ export class EmailAdapter implements Adapter {
     } catch {
       // Connection likely died — try to reconnect once
       this.log(`[email] Connection lost for ${acct.id}/${folder}, reconnecting...`);
-      if (!await this.reconnectAccount(acct)) return;
+      if (!await this.reconnectAccount(acct)) {
+        throw new Error(`Could not reconnect ${acct.id} while opening ${folder}`);
+      }
       try {
-        lock = await acct.client.getMailboxLock(folder);
+        lock = await acct.client!.getMailboxLock(folder);
       } catch (err) {
-        this.log(`[email] Could not open ${folder} for ${acct.id} after reconnect: ${err}`);
-        return;
+        throw new Error(`Could not open ${folder} for ${acct.id} after reconnect: ${err}`);
       }
     }
 
@@ -342,15 +388,43 @@ export class EmailAdapter implements Adapter {
       // Determine direction for this folder
       const folderIsSent = isSentFolder(folder);
 
-      // Envelope-only fetch for speed — avoids downloading full message bodies.
-      // headers returns raw buffer; we parse References from it for threading.
-      // bodyParts['1'] gets the first MIME part (usually text/plain).
-      for await (const msg of acct.client.fetch(searchQuery, {
+      // Freeze one UID snapshot before fetching content. Calendar MIME messages get
+      // a second, exact raw-source fetch before any event or cursor is emitted.
+      const observedUids: number[] = [];
+      const calendarUids: number[] = [];
+      for await (const probe of acct.client!.fetch(searchQuery, {
+        uid: true,
+        bodyStructure: true,
+      })) {
+        if (probe.uid <= folderCursor.lastUid) continue;
+        observedUids.push(probe.uid);
+        if (calendarPartNumbers(probe.bodyStructure).length) calendarUids.push(probe.uid);
+      }
+
+      if (!observedUids.length) {
+        acct.hasNewMail = false;
+        return;
+      }
+
+      const calendarCaptures = new Map<number, CalendarCapture>();
+      for (const uid of calendarUids) {
+        const rawMessage = await acct.client!.fetchOne(`${uid}`, { uid: true, source: true }, { uid: true });
+        if (!rawMessage || !rawMessage.source) {
+          throw new Error(`Calendar source fetch returned no data for ${acct.id}/${folder} UID ${uid}`);
+        }
+        const capture = await captureCalendarSource(this.dataDir, acct.id, folder, uid, rawMessage.source);
+        calendarCaptures.set(uid, capture);
+        this.log(`[email] Preserved calendar source ${capture.raw_ref} with ${capture.calendar_events.length} event(s)`);
+      }
+
+      // Envelope and first text part remain the normal message path. Calendar raw
+      // source is fetched only for the UIDs identified above.
+      for await (const msg of acct.client!.fetch(observedUids, {
         uid: true,
         envelope: true,
         headers: ['references'],
         bodyParts: ['1'],
-      })) {
+      }, { uid: true })) {
         // Skip messages we've already processed (IMAP UID ranges can re-include boundary)
         if (msg.uid <= folderCursor.lastUid) continue;
 
@@ -419,9 +493,9 @@ export class EmailAdapter implements Adapter {
         };
         yield { type: 'thread', data: thread };
 
-        // Get text content from first body part
+        // Get text content from first body part, decoded via mailparser
         const textPart = msg.bodyParts?.get('1');
-        const textContent = textPart ? textPart.toString() : null;
+        const textContent = textPart ? await decodeEmailBody(textPart.toString()) : null;
 
         const senderEmail = fromAddrs[0]?.address?.toLowerCase() ?? null;
         const metadata: Record<string, unknown> = {
@@ -436,6 +510,18 @@ export class EmailAdapter implements Adapter {
 
         const ccAddrs = (env.cc ?? []).map((a: { address?: string }) => a.address).filter(Boolean);
         if (ccAddrs.length) metadata.cc = ccAddrs;
+
+        const calendarCapture = calendarCaptures.get(msg.uid);
+        if (calendarCapture) {
+          metadata.calendar_capture = {
+            raw_ref: calendarCapture.raw_ref,
+            raw_sha256: calendarCapture.raw_sha256,
+            raw_bytes: calendarCapture.raw_bytes,
+            calendar_attachments: calendarCapture.calendar_attachments,
+            parse_issues: calendarCapture.parse_issues,
+          };
+          metadata.calendar_events = calendarCapture.calendar_events;
+        }
 
         // Determine direction: sent folder -> sent, inbox from self -> sent, otherwise received
         let direction: 'sent' | 'received' | 'unknown' = 'unknown';
@@ -560,7 +646,7 @@ export class EmailAdapter implements Adapter {
         clearTimeout(acct.idleTimer);
       }
       try {
-        await acct.client.logout();
+        await acct.client?.logout();
         this.log(`[email] Disconnected ${acct.id}`);
       } catch {
         // Connection may already be dead

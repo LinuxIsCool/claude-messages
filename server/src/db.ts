@@ -74,9 +74,18 @@ export class MessageDB {
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
+      -- composite (thread_id, platform_ts): turns the webui's per-thread
+      -- "last message" lookup + message_count into an index seek instead of a
+      -- per-thread full scan + sort (threads API was 10s → 0.09s over 889K rows).
+      -- See web/messages_data.py list_threads().
+      CREATE INDEX IF NOT EXISTS idx_messages_thread_ts ON messages(thread_id, platform_ts);
       CREATE INDEX IF NOT EXISTS idx_messages_platform ON messages(platform);
       CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
       CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(platform_ts);
+      -- covering (direction, thread_id): the webui's engaged-threads reciprocity
+      -- signal does SELECT DISTINCT thread_id WHERE direction='sent' on first
+      -- paint — this makes it index-only (~1.5s → 3ms).
+      CREATE INDEX IF NOT EXISTS idx_messages_dir_thread ON messages(direction, thread_id);
       CREATE INDEX IF NOT EXISTS idx_contacts_platform ON contacts(platform);
       CREATE INDEX IF NOT EXISTS idx_threads_platform ON threads(platform);
 
